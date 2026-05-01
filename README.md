@@ -15,6 +15,8 @@ used in [vLLM-Ascend](https://github.com/vllm-project/vllm-ascend).
 
 ¹ Triton `chunk_o` with H=64, BT=64 fails (known aicore incompatibility); PTO works fine.
 
+vLLM prefill TTFT speedup (megakernel vs Triton, all 4 models): **1.07–1.25×** depending on model and prompt length.
+
 Accuracy: PTO outputs match CPU fp64 reference within 5e-3 RMSE and R²>0.999.
 
 ---

@@ -22,3 +22,7 @@ profiling/traces/
 # Editor
 .vscode/
 *.swp
+
+# NPU artifacts
+fusion_result.json
+kernel_meta
