@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "megagdn-pto"
+version = "0.1.0"
+description = "Fast PTO kernels for chunk GatedDeltaNet (GDN) on Ascend NPU"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy",
+]
+
+[project.optional-dependencies]
+eval = ["lm_eval"]
+plot = ["matplotlib"]
+
+[tool.setuptools.packages.find]
+include = ["megagdn_pto*"]
