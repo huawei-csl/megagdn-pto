@@ -99,12 +99,6 @@ def _load(
     return ctypes.CDLL(os.path.abspath(lib_path))
 
 
-def _load_kernel(name: str, argtypes: list) -> ctypes.CDLL:
-    """Load a compiled kernel and set its ``call_kernel`` argtypes."""
-    lib = _load.__wrapped__  # type: ignore[attr-defined]
-    return lib
-
-
 # ---------------------------------------------------------------------------
 # scaled_dot_kkt  — K @ K^T with gated causal mask → A  [B,T,H,C]
 # ---------------------------------------------------------------------------
@@ -136,7 +130,6 @@ def run_scaled_dot_kkt(
     beta: torch.Tensor,
     g_sum: torch.Tensor,
     mask: torch.Tensor,
-    workspace: None,            # unused (allocated internally)
     A_out: torch.Tensor,
     *,
     stream,

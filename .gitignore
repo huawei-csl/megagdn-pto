@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+*.so
+
+# Compiled kernel binaries (rebuilt on demand)
+kernels/pto/compiled_lib/*.so
+
+# Benchmark outputs (tracked separately after generation)
+outputs/data/smoke_*/
+profiling/traces/
+
+# Logs
+*.log
+/tmp/
+
+# Editor
+.vscode/
+*.swp
