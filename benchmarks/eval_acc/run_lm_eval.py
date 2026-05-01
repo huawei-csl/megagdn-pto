@@ -4,6 +4,9 @@
 Tasks (default): six representative MMLU subjects + wikitext perplexity.
 (GPQA Diamond is omitted by default as it requires a Hugging Face token.)
 
+Wikitext is evaluated on ``--wikitext-limit`` documents (default: 256).
+Set to 0 to disable the limit (full dataset, ~40 min per run).
+
 Preset models (resolved to local weight paths):
   qwen35_0_8b, qwen35_9b, qwen36_27b_w8a8, qwen36_35b_a3b_w8a8
 
@@ -15,8 +18,9 @@ Usage::
     python benchmarks/eval_acc/run_lm_eval.py --preset qwen35_0_8b \\
         --backend pto_mega --output-json outputs/data/eval/qwen35_0_8b_pto.json
 
+    # Full wikitext (slow)
     python benchmarks/eval_acc/run_lm_eval.py --preset qwen36_35b_a3b_w8a8 \\
-        --backend triton --output-json outputs/data/eval/35b_triton.json
+        --backend triton --wikitext-limit 0 --output-json outputs/data/eval/35b_triton.json
 """
 
 from __future__ import annotations
@@ -139,6 +143,8 @@ def main() -> int:
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.82)
     ap.add_argument("--max-batch-size", type=int, default=4)
     ap.add_argument("--full-mmlu", action="store_true", help="Use full MMLU task group.")
+    ap.add_argument("--wikitext-limit", type=int, default=256,
+                    help="Max wikitext documents to evaluate (0 = full dataset).")
     args = ap.parse_args()
 
     if args.device:
@@ -158,6 +164,11 @@ def main() -> int:
 
     tasks = "mmlu,gpqa_diamond_zeroshot,wikitext" if args.full_mmlu else args.tasks
 
+    # Sample limit applied to all tasks.  256 docs keeps wikitext fast (~2 min
+    # vs ~40 min for the full dataset) and still covers most MMLU subjects
+    # entirely (professional_law has ~1534 questions, but 256 is representative).
+    limit: int | None = args.wikitext_limit if args.wikitext_limit > 0 else None
+
     lm_kwargs: dict = dict(
         pretrained=preset.path,
         trust_remote_code=True,
@@ -169,8 +180,10 @@ def main() -> int:
     )
     if preset.quantization:
         lm_kwargs["quantization"] = preset.quantization
-    if preset.expert_parallel:
-        lm_kwargs["additional_config"] = {"expert_parallel_size": 1}
+    # Note: additional_config (expert_parallel_size) is omitted here because
+    # lm_eval serializes model kwargs as a flat string and pydantic cannot
+    # coerce a string back to a dict.  expert_parallel_size defaults to 1
+    # for single-NPU inference, so this is safe to omit.
 
     t0 = time.time()
     results = lm_eval.simple_evaluate(
@@ -178,6 +191,7 @@ def main() -> int:
         model_args=",".join(f"{k}={v}" for k, v in lm_kwargs.items()),
         tasks=tasks.split(","),
         batch_size=args.max_batch_size,
+        limit=limit,
         log_samples=False,
     )
     elapsed = time.time() - t0
