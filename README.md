@@ -117,8 +117,18 @@ git submodule update --init --recursive
 Install this package in editable mode so all scripts can import `megagdn_pto`:
 
 ```bash
-pip install -e .
+pip install -e .                  # core (torch, numpy)
+pip install -e '.[eval]'          # add lm-eval (required for §5 accuracy benchmarks)
+pip install -e '.[plot]'          # add matplotlib (required for §6 plotting)
+pip install -e '.[eval,plot]'     # both at once
 ```
+
+> **Dependency note:** `lm-eval` pulls in a broad set of NLP packages that may
+> conflict with the pinned versions inside the `vllm-ascend` Docker image
+> (e.g. `fsspec`, `opencv-python-headless`). These conflicts are harmless for
+> the evaluation itself, but if `pip` reports errors, install `lm-eval` with
+> `--no-deps` and add missing packages manually, or run evaluations in a
+> separate virtual environment.
 
 Check available NPU devices before running benchmarks:
 
@@ -130,15 +140,16 @@ npu-smi info
 
 ## Model weights
 
-Four models are evaluated. Download instructions are in
-[`scripts/download_weights.md`](scripts/download_weights.md).
+Four models are evaluated. See [`scripts/download_weights.md`](scripts/download_weights.md)
+for download commands.
 
-Expected weight paths (already present on this server):
+The benchmark scripts expect weights at these paths (edit `run_lm_eval.py` and
+`benchmark_prefill.py` to point to your local copies):
 
-| Model | Path |
+| Model | Default path |
 |-------|------|
-| Qwen3.5-0.8B | `/scratch/model_weights/models--Qwen--Qwen3.5-0.8B/...` |
-| Qwen3.5-9B   | `/scratch/model_weights/models--Qwen--Qwen3.5-9B/...` |
+| Qwen3.5-0.8B | `/scratch/model_weights/models--Qwen--Qwen3.5-0.8B/snapshots/<hash>/` |
+| Qwen3.5-9B   | `/scratch/model_weights/models--Qwen--Qwen3.5-9B/snapshots/<hash>/` |
 | Qwen3.6-27B-w8a8 | `/scratch/model_weights/Qwen3.6-27B-w8a8` |
 | Qwen3.6-35B-A3B-w8a8 | `/scratch/model_weights/Qwen3.6-35B-A3B-w8a8` |
 
@@ -149,14 +160,22 @@ Expected weight paths (already present on this server):
 ### 1 – Unit tests (single kernels + E2E)
 
 ```bash
-# Single-kernel accuracy (all 4 head counts, ~3 min)
+# Single-kernel accuracy — all 6 stages, all 4 head counts (~5 min)
 GDN_NPU_DEVICE=npu:0 python tests/test_single_kernels.py --device npu:0 --H-list 16,32,48,64
 
-# End-to-end pipeline (PTO vs CPU fp64 reference)
+# End-to-end pipeline — PTO vs CPU fp64 reference, optional Triton cross-check
 GDN_NPU_DEVICE=npu:0 python tests/test_e2e.py --device npu:0
+GDN_NPU_DEVICE=npu:0 python tests/test_e2e.py --device npu:0 --no-triton  # skip cross-check
 ```
 
 Expected output: `ALL PASS` for every test case.
+
+> **Triton cross-check in `test_e2e.py`:** when Triton is available, each shape
+> is also run through the Triton pipeline and compared with PTO. If Triton
+> raises an exception for a particular shape (e.g. grid-size limits at long
+> sequences), that shape's cross-check is skipped with a `[Triton skipped: …]`
+> message and the test still passes — PTO correctness is determined solely by
+> the CPU fp64 reference.
 
 ### 2 – Kernel benchmarks
 
@@ -196,17 +215,25 @@ bash benchmarks/vllm_prefill/run_prefill_sweep.sh
 
 ### 5 – Accuracy evaluation (lm-eval)
 
+Requires `lm-eval` — install with `pip install -e '.[eval]'` first.
+
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0
-# Single model, wikitext subset (default: 256 docs, ~10 min)
+
+# Single model, wikitext 256-doc subset (default, ~10 min)
 python benchmarks/eval_acc/run_lm_eval.py \
     --preset qwen35_0_8b --backend pto_mega \
     --output-json outputs/data/eval/qwen35_0_8b_pto.json
 
+# Single model, full wikitext (~40 min)
+python benchmarks/eval_acc/run_lm_eval.py \
+    --preset qwen35_0_8b --backend pto_mega --wikitext-limit 0 \
+    --output-json outputs/data/eval/qwen35_0_8b_pto_full.json
+
 # Full sweep: all 4 models × 2 backends, wikitext 256-doc subset (~3 h total)
 bash benchmarks/eval_acc/run_eval_suite.sh
 
-# Full wikitext (40 min per run)
+# Full wikitext sweep
 WIKITEXT_LIMIT=0 bash benchmarks/eval_acc/run_eval_suite.sh
 ```
 
@@ -223,6 +250,44 @@ python scripts/plot_results.py \
 ```
 
 Figures are saved under `outputs/figure/`.
+
+---
+
+## Known warnings and log noise
+
+The following messages are harmless; they appear on every run and can be ignored.
+
+**Bisheng JIT — `MEMORY_BASE` macro redefined**
+
+```
+warning: 'MEMORY_BASE' macro redefined [-Wmacro-redefined]
+```
+
+Emitted by the `bisheng` C++ compiler when building `tri_inverse.cpp`. The
+macro is redefined by a compiler command-line flag; the duplicate definition is
+intentional in the kernel build system and does not affect correctness.
+
+**vLLM — unknown environment variables**
+
+```
+Unknown key in environment variable: VLLM_PTO_PATCH_DIR
+Unknown key in environment variable: VLLM_PTO_MEGAKERNEL
+```
+
+vLLM-Ascend logs unrecognised `VLLM_*` keys at startup. The variables
+are read by the injected hook before vLLM's config validation runs, so the
+warnings are safe to ignore.
+
+**vLLM — "Using Triton/FLA GDN prefill kernel"**
+
+```
+Using Triton/FLA GDN prefill kernel
+```
+
+This line comes from the patched `patch_qwen3_5.py`/`patch_qwen3_next.py`
+before the PTO override is applied. Even for `pto_mega`, the PTO megakernel
+subsequently replaces the Triton function at runtime. The log line is an
+artefact of the patch ordering and does not mean Triton is being used.
 
 ---
 

@@ -210,8 +210,7 @@ def triton_pipeline(q, k, v, g_in, beta, cu_long, H, Hg, scale=1.0):
     A_tri = chunk_scaled_dot_kkt_fwd(k=k_bf, beta=beta_bf, g_cumsum=g_cs,
                                      cu_seqlens=cu_long, chunk_indices=chunk_indices,
                                      chunk_size=C_TRITON, output_dtype=torch.float32)
-    A_inv_tri = triton_solve_tril(A_tri.half(), cu_seqlens=cu_long,
-                                  chunk_indices=chunk_indices, chunk_size=C_TRITON)
+    A_inv_tri = triton_solve_tril(A_tri.half(), cu_seqlens=cu_long)
     w_tri, u_tri = recompute_w_u_fwd(k=k_bf, v=v_bf, beta=beta_bf, g_cumsum=g_cs,
                                      A=A_inv_tri.bfloat16(), cu_seqlens=cu_long,
                                      chunk_indices=chunk_indices)

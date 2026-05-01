@@ -58,12 +58,15 @@ def plot_prefill_model(model_dir: Path, out_dir: Path) -> None:
         p = model_dir / f"{c}.jsonl"
         if not p.is_file():
             if c in required:
-                print(f"  [skip] {p} not found")
+                print(f"  [skip] missing {p.name} — run: "
+                      f"bash benchmarks/vllm_prefill/run_prefill_sweep.sh "
+                      f"  (or set CASES={c} to run only this backend)")
                 return
             continue
         rows = _load_jsonl(p)
         if not rows:
             if c in required:
+                print(f"  [skip] {p.name} is empty — re-run the prefill sweep")
                 return
             continue
         data[c] = _by_seq_len(rows)
@@ -220,13 +223,17 @@ def main() -> None:
 
     if prefill_dir is not None and prefill_dir.is_dir():
         plot_all_prefill(prefill_dir, args.out_dir)
+    elif prefill_dir is not None:
+        print(f"Prefill directory not found: {prefill_dir}")
     else:
-        print("No prefill data directory found. Run run_prefill_sweep.sh first.")
+        print("No prefill data — run:  bash benchmarks/vllm_prefill/run_prefill_sweep.sh")
 
     if eval_dir is not None and eval_dir.is_dir():
         plot_eval_accuracy(eval_dir, args.out_dir)
+    elif eval_dir is not None:
+        print(f"Eval directory not found: {eval_dir}")
     else:
-        print("No eval data directory found. Run run_eval_suite.sh first.")
+        print("No eval data — run:     bash benchmarks/eval_acc/run_eval_suite.sh")
 
 
 if __name__ == "__main__":
