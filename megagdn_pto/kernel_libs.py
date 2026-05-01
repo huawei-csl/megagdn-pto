@@ -100,6 +100,59 @@ def _load(
 
 
 # ---------------------------------------------------------------------------
+# chunk_cumsum  — chunk-local prefix sum of log-gate values G
+# ---------------------------------------------------------------------------
+
+def load_chunk_cumsum(
+    num_heads: int,
+    hidden_size: int = 128,
+    chunk_size: int = 128,
+) -> ctypes.CDLL:
+    """Compile + load the standalone chunk_cumsum kernel.
+
+    Signature::
+        void call_kernel(uint32_t block_dim, void *stream,
+                         uint8_t *g, uint8_t *g_sum,
+                         uint8_t *cu_seqlens,
+                         int64_t batch_size, int64_t seq_len)
+    """
+    lib = _load(
+        "chunk_cumsum.cpp", "chunk_cumsum",
+        num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
+    )
+    lib.call_kernel.argtypes = (
+        [ctypes.c_uint32, ctypes.c_void_p]
+        + [ctypes.c_void_p] * 3
+        + [ctypes.c_int64, ctypes.c_int64]
+    )
+    lib.call_kernel.restype = None
+    return lib
+
+
+def run_chunk_cumsum(
+    g: torch.Tensor,
+    g_sum: torch.Tensor,
+    *,
+    stream,
+    chunk_size: int = 128,
+    cu_seqlens: torch.Tensor | None = None,
+    batch_size_override: int | None = None,
+    block_dim: int | None = None,
+) -> None:
+    """Compute chunk-local cumulative sum of gate logits in-place into ``g_sum``.
+
+    ``g``, ``g_sum``: ``[B, T, H]`` float32.
+    """
+    H = g.shape[2]
+    bd = block_dim or BLOCK_DIM
+    batch = g.shape[0] if batch_size_override is None else batch_size_override
+    T = g.shape[1]
+    cu32 = _ensure_int32(cu_seqlens)
+    lib = load_chunk_cumsum(H, g.shape[2], chunk_size)
+    lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T)
+
+
+# ---------------------------------------------------------------------------
 # scaled_dot_kkt  — K @ K^T with gated causal mask → A  [B,T,H,C]
 # ---------------------------------------------------------------------------
 

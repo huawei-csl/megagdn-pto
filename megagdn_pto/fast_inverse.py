@@ -105,6 +105,9 @@ def solve_tril(
     if tri_inv_func is None:
         tri_inv_func = load_tri_inverse()
 
+    if cu_seqlens is None:
+        T = A_fp16.shape[1]
+        cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=A_fp16.device)
     cu32 = cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
     cu_cpu = cu32.cpu().tolist()
     num_matrices = (

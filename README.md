@@ -6,18 +6,43 @@ used in [vLLM-Ascend](https://github.com/vllm-project/vllm-ascend).
 
 **Key results** (Ascend NPU, N=16 seqs × L=16384 tokens, D=128, Hg=16):
 
-| Stage | H=16 | H=32 | H=48 | H=64 | Baseline |
-|-------|------|------|------|------|----------|
-| chunk_h  | 1.53× | 1.58× | 1.49× | 1.46× | Triton BT=128 |
-| wy_fast  | 1.71× | 1.79× | 1.69× | 1.77× | Triton BT=128 |
-| chunk_o  | 1.44× | 1.43× | 1.38× | — ¹  | Triton BT=64  |
-| **Megakernel** (6 stages fused) | 4.2× | 2.6× | 2.1× | 1.8× | staged PTO |
+PTO always uses C=128. Speedup format: `BT=64 (BT=128)` — n/a means Triton fails or is not supported.
+Raw data: [`outputs/data/kernel_bench.json`](outputs/data/kernel_bench.json)
 
-¹ Triton `chunk_o` with H=64, BT=64 fails (known aicore incompatibility); PTO works fine.
+| Stage | H=16 | H=32 | H=48 | H=64 |
+|-------|------|------|------|------|
+| chunk_cumsum   | 3.1× (3.4×) | 3.1× (n/a ²) | 2.4× (n/a ²) | 5.2× (n/a ²) |
+| scaled_dot_kkt | 0.89× (n/a ³) | 0.81× (n/a ³) | 0.82× (n/a ³) | 0.80× (n/a ³) |
+| solve_tril     | n/a ¹ | n/a ¹ | n/a ¹ | n/a ¹ |
+| wy_fast        | 3.4× (1.7×) | 3.5× (1.8×) | 3.3× (1.7×) | 3.5× (1.8×) |
+| chunk_h        | 3.2× (1.6×) | 3.0× (1.5×) | 3.0× (1.5×) | n/a ⁴ (1.5×) |
+| chunk_o        | 1.4× (n/a ³) | 1.4× (n/a ³) | 1.4× (n/a ³) | n/a ⁴ |
+| **Megakernel** (6 stages fused) | **4.5×** | **2.8×** | **2.2×** | **1.9×** |
+
+Megakernel speedup is vs staged PTO (individual kernel calls with synchronization).
+
+¹ Triton `solve_tril` requires Triton grid ≤ 65536; fails at T=262144 tokens. PTO has no such limit.  
+² Triton `chunk_cumsum` BT=128 compilation fails for H ≥ 32.  
+³ Triton BT=128 compilation fails for `scaled_dot_kkt` and `chunk_o` on this configuration.  
+⁴ Triton BT=64 triggers an aicore exception for H=64 (known NPU incompatibility); PTO works fine.
 
 vLLM prefill TTFT speedup (megakernel vs Triton, all 4 models): **1.07–1.25×** depending on model and prompt length.
 
-Accuracy: PTO outputs match CPU fp64 reference within 5e-3 RMSE and R²>0.999.
+Accuracy (lm-eval, wikitext 256-doc subset, MMLU 6-subject subset):
+
+| Model | Metric | PTO megakernel | Triton |
+|-------|--------|---------------|--------|
+| Qwen3.5-0.8B | WikiText PPL ↓ | 19.89 | 19.87 |
+| Qwen3.5-9B   | WikiText PPL ↓ |  9.26 |  9.26 |
+| Qwen3.6-27B-w8a8 | WikiText PPL ↓ | 8.20 | 8.21 |
+| Qwen3.6-35B-A3B-w8a8 | WikiText PPL ↓ | 8.17 | 8.17 |
+| Qwen3.5-0.8B | MMLU acc ↑ | 49.4% | 49.4% |
+| Qwen3.5-9B   | MMLU acc ↑ | 79.7% | 79.5% |
+| Qwen3.6-27B-w8a8 | MMLU acc ↑ | 82.8% | 82.8% |
+| Qwen3.6-35B-A3B-w8a8 | MMLU acc ↑ | 83.6% | 84.2% |
+
+PTO and Triton outputs are numerically equivalent; differences are within lm-eval sampling noise.
+Unit test: PTO outputs match CPU fp64 reference within 5e-3 RMSE and R²>0.999.
 
 ---
 
@@ -173,20 +198,28 @@ bash benchmarks/vllm_prefill/run_prefill_sweep.sh
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0
-# Smoke-test
+# Single model, wikitext subset (default: 256 docs, ~10 min)
 python benchmarks/eval_acc/run_lm_eval.py \
-    --model qwen35_0_8b --case pto_mega \
-    --tasks wikitext --limit 64
+    --preset qwen35_0_8b --backend pto_mega \
+    --output-json outputs/data/eval/qwen35_0_8b_pto.json
 
-# Full sweep (all 4 models, ~2 h)
+# Full sweep: all 4 models × 2 backends, wikitext 256-doc subset (~3 h total)
 bash benchmarks/eval_acc/run_eval_suite.sh
+
+# Full wikitext (40 min per run)
+WIKITEXT_LIMIT=0 bash benchmarks/eval_acc/run_eval_suite.sh
 ```
 
 ### 6 – Plot results
 
 ```bash
-# After running run_prefill_sweep.sh
+# Auto-detect latest prefill + eval results
 python scripts/plot_results.py --auto
+
+# Or specify explicitly
+python scripts/plot_results.py \
+    --prefill-dir outputs/data/prefill_<stamp> \
+    --eval-dir    outputs/data/eval_<stamp>
 ```
 
 Figures are saved under `outputs/figure/`.

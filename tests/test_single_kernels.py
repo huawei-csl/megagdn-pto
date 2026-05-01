@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Numerical accuracy tests for the four PTO chunk-GDN kernels.
+"""Numerical accuracy tests for all six PTO chunk-GDN kernels.
 
-Tests each stage (scaled_dot_kkt, chunk_h, wy_fast, chunk_o) against
-CPU fp32 reference implementations across a wide range of packed-varlen
-shapes, value-head counts H, and GQA key-head counts Hg.
+Tests each stage against CPU fp32 reference implementations across a wide
+range of packed-varlen shapes, value-head counts H, and GQA key-head counts Hg:
+
+  cumsum, scaled_dot_kkt, solve_tril, wy_fast, chunk_h, chunk_o
 
 Usage::
 
@@ -25,8 +26,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from megagdn_pto.fast_inverse import load_tri_inverse, solve_tril
 from megagdn_pto.kernel_libs import (
     BLOCK_DIM,
+    run_chunk_cumsum,
     run_chunk_h,
     run_chunk_o,
     run_scaled_dot_kkt,
@@ -71,6 +74,25 @@ def ref_cumsum(g: torch.Tensor, cs: int, cu_seqlens=None) -> torch.Tensor:
 
 def _safe_exp(x: torch.Tensor) -> torch.Tensor:
     return torch.where(x <= 0, torch.exp(x), torch.zeros_like(x))
+
+
+def ref_solve_tril(A: torch.Tensor, cs: int, cu_seqlens=None) -> torch.Tensor:
+    """CPU reference for solve_tril: computes (I + A)^{-1} per chunk submatrix.
+
+    A is strictly lower triangular [B, T, H, cs] (PTO convention).
+    """
+    B, T, H, _ = A.shape
+    out = torch.zeros(B, T, H, cs, dtype=torch.float32)
+    Af = A.float()
+    for bos, eos in _seq_ranges(T, cu_seqlens):
+        for j in range(0, eos - bos, cs):
+            s, e = bos + j, min(bos + j + cs, eos)
+            v = e - s
+            for h in range(H):
+                Ac = Af[0, s:e, h, :v]  # [v, v], strictly lower triangular
+                inv = torch.linalg.inv(torch.eye(v) + Ac)
+                out[0, s:e, h, :v] = inv
+    return out
 
 
 def ref_kkt(k: torch.Tensor, beta: torch.Tensor, g_cumsum: torch.Tensor,
@@ -368,11 +390,48 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     return stats_ok(o_out.float().cpu(), o_ref.float())
 
 
+def test_cumsum(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    T = tc.T
+    cu = torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev) if tc.cu_seqlens_list else None
+    N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
+    torch.manual_seed(42)
+    g = torch.randn(1, T, H, device=dev, dtype=torch.float32)
+    g_sum = torch.empty_like(g)
+    stream = torch.npu.current_stream()._as_parameter_
+    run_chunk_cumsum(g, g_sum, stream=stream, chunk_size=C,
+                     cu_seqlens=cu, batch_size_override=N_seq)
+    torch.npu.synchronize()
+    ref = ref_cumsum(g.cpu(), C, tc.cu_seqlens_list)
+    return stats_ok(g_sum.cpu(), ref)
+
+
+def test_solve_tril(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    T = tc.T
+    cu = torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev) if tc.cu_seqlens_list else None
+    torch.manual_seed(42)
+    # Build A lower-triangular in the (time-within-chunk × chunk-col) space.
+    # All test-case boundaries are chunk-aligned (ensured by _align_cu), so
+    # position-within-chunk = t % C for every t.
+    # Use std=0.1 to keep (I+A)^{-1} well-conditioned in fp16.
+    t_pos = torch.arange(T) % C
+    c_pos = torch.arange(C)
+    chunk_mask = (t_pos[:, None] > c_pos[None, :]).float()  # [T, C]
+    A_raw = torch.randn(1, T, H, C) * 0.1 * chunk_mask[None, :, None, :]
+    A = A_raw.to(torch.float16).to(dev)
+    tri_inv = load_tri_inverse()
+    A_inv = solve_tril(A, cu, C, H, tri_inv)
+    torch.npu.synchronize()
+    ref = ref_solve_tril(A.cpu(), C, tc.cu_seqlens_list)
+    return stats_ok(A_inv.float().cpu(), ref)
+
+
 _STAGES = {
-    "kkt":     ("scaled_dot_kkt", test_kkt),
-    "chunk_h": ("chunk_h",        test_chunk_h),
-    "wy_fast": ("wy_fast",        test_wy),
-    "chunk_o": ("chunk_o",        test_chunk_o),
+    "cumsum":     ("chunk_cumsum",   test_cumsum),
+    "kkt":        ("scaled_dot_kkt", test_kkt),
+    "solve_tril": ("solve_tril",     test_solve_tril),
+    "chunk_h":    ("chunk_h",        test_chunk_h),
+    "wy_fast":    ("wy_fast",        test_wy),
+    "chunk_o":    ("chunk_o",        test_chunk_o),
 }
 
 
@@ -382,7 +441,8 @@ def main() -> None:
     parser.add_argument("--quick", action="store_true", help="Run a single small test case.")
     parser.add_argument("--H-list", default="16,32,48,64", help="Comma-separated value head counts.")
     parser.add_argument("--hg", type=int, default=16, help="Key head count Hg.")
-    parser.add_argument("--stage", default="kkt,chunk_h,wy_fast,chunk_o",
+    parser.add_argument("--stage",
+                        default="cumsum,kkt,solve_tril,chunk_h,wy_fast,chunk_o",
                         help="Comma-separated stages to test.")
     args = parser.parse_args()
 

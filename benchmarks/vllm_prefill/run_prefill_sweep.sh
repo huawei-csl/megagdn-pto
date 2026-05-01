@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Sweep prefill TTFT: Triton vs PTO vs PTO-megakernel across models.
+# Sweep prefill TTFT: Triton vs PTO-megakernel across models.
 #
-# Writes JSONL files under OUT_DIR/<model_label>/{triton,pto,pto_mega}.jsonl.
+# Writes JSONL files under OUT_DIR/<model_label>/{triton,pto_mega}.jsonl.
+# PTO-staged (pto) is skipped by default; set WITH_PTO_STAGED=1 to include it.
 #
 # Usage:
 #   export ASCEND_RT_VISIBLE_DEVICES=0
@@ -11,6 +12,7 @@
 #   MODELS="qwen35_0_8b qwen35_9b qwen36_27b_w8a8 qwen36_35b_a3b_w8a8"
 #   SEQ_LENS="512 1024 2048 4096 8192 16384 32768"
 #   WARMUP=2  REPEATS=10  OUT_DIR=outputs/data/prefill
+#   WITH_PTO_STAGED=1  # also benchmark PTO staged (slower, optional)
 
 set -euo pipefail
 
@@ -34,11 +36,19 @@ MODEL_QUANT=(
     [qwen36_35b_a3b_w8a8]="ascend"
 )
 MODELS="${MODELS:-qwen35_0_8b qwen35_9b qwen36_27b_w8a8 qwen36_35b_a3b_w8a8}"
+WITH_PTO_STAGED="${WITH_PTO_STAGED:-0}"
 
 mkdir -p "$OUT_DIR"
-echo "[prefill_sweep] output dir: $OUT_DIR"
-echo "[prefill_sweep] models: $MODELS"
-echo "[prefill_sweep] seq_lens: $SEQ_LENS"
+echo "[prefill_sweep] output dir:      $OUT_DIR"
+echo "[prefill_sweep] models:          $MODELS"
+echo "[prefill_sweep] seq_lens:        $SEQ_LENS"
+echo "[prefill_sweep] with_pto_staged: ${WITH_PTO_STAGED} (set WITH_PTO_STAGED=1 to enable)"
+
+# Build the list of cases to run
+CASES="pto_mega triton"
+if [[ "${WITH_PTO_STAGED}" == "1" ]]; then
+    CASES="pto_mega pto triton"
+fi
 
 for MODEL in $MODELS; do
     QUANT="${MODEL_QUANT[$MODEL]:-}"
@@ -51,7 +61,7 @@ for MODEL in $MODELS; do
         EXTRA+=(--quantization "$QUANT")
     fi
 
-    for CASE in pto_mega pto triton; do
+    for CASE in $CASES; do
         echo "  [${MODEL}] case=${CASE} ..."
         python3 "$PY" \
             --case "$CASE" \

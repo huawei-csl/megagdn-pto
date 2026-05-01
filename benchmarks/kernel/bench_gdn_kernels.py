@@ -1,34 +1,33 @@
 #!/usr/bin/env python3
 """Benchmark PTO chunk-GDN kernels vs FLA Triton baseline.
 
-Measures latency (ms) for each of the five computation stages:
-  scaled_dot_kkt, wy_fast, chunk_h, chunk_o, and the fused mega_kernel.
+Measures latency (ms) for all six computation stages:
+  chunk_cumsum, scaled_dot_kkt, solve_tril, wy_fast, chunk_h, chunk_o,
+  and the fused mega_kernel.
 
-For each stage, the Triton baseline uses chunk_size=64 (matching the vLLM
-default). PTO always uses chunk_size=128, which yields ~2× more compute per
-launch while still outperforming Triton — see outputs/data/ for saved results.
-
-Triton notes:
-  - ``chunk_o`` with H=64, BT=64 and ``scaled_dot_kkt`` BT=128 may fail to
-    compile for certain head counts; those entries are marked as "fail" in output.
-  - BT=128 for ``scaled_dot_kkt`` is optional (set GDN_TRITON_KKT_TRY128=1).
+PTO always uses chunk_size=128 (C_PTO=128).
+Each Triton stage is timed at both BT=64 and BT=128 where applicable:
+  - chunk_cumsum : Triton BT=64 and BT=128 both supported
+  - scaled_dot_kkt: Triton BT=64 (default); BT=128 may fail for some H
+  - solve_tril   : Triton BT=64 only (BT=128 not supported by Triton)
+  - wy_fast      : Triton BT=64 and BT=128 both supported
+  - chunk_h      : Triton BT=64 and BT=128 both supported
+  - chunk_o      : Triton BT=64 (default); BT=128 may fail for H=64
 
 Results are printed to stdout and optionally saved to ``--output-json``.
 
 Usage::
 
     python benchmarks/kernel/bench_gdn_kernels.py --device npu:0
-    python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --H-list 32,64 --stage kkt,chunk_h
+    python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --H-list 32,64
     python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --mega
     python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --mega \\
         --output-json outputs/data/kernel_bench.json
 
 Environment:
-    GDN_NPU_DEVICE             Default NPU device (default: npu:0)
-    GDN_BENCH_N_SEQ            Number of sequences (default: 16)
-    GDN_BENCH_L_SEG            Tokens per sequence (default: 16384)
-    GDN_TRITON_KKT_TRY128      Set to 1 to attempt BT=128 for kkt Triton baseline
-    GDN_TRITON_CHUNK_O_CHUNK   Chunk size for Triton chunk_o (default: 64)
+    GDN_NPU_DEVICE    Default NPU device (default: npu:0)
+    GDN_BENCH_N_SEQ   Number of sequences (default: 16)
+    GDN_BENCH_L_SEG   Tokens per sequence (default: 16384)
 """
 
 from __future__ import annotations
@@ -54,6 +53,7 @@ if _TRITON_BASELINE not in sys.path:
 from megagdn_pto.compile import BLOCK_DIM
 from megagdn_pto.fast_inverse import load_tri_inverse, solve_tril
 from megagdn_pto.kernel_libs import (
+    load_chunk_cumsum,
     load_chunk_h,
     load_chunk_o,
     load_scaled_dot_kkt,
@@ -119,6 +119,25 @@ def _ratio(ms_triton: float | None, ms_pto: float) -> str:
     return f"{ms_triton / ms_pto:.2f}x" if ms_triton and ms_pto > 0 else "—"
 
 
+# ---------------------------------------------------------------------------
+# Stage benchmarks
+# ---------------------------------------------------------------------------
+
+def _try_triton_cumsum(cu_seqlens, BT, dev, T, H) -> float | None:
+    try:
+        from fla_vendor.cumsum import chunk_local_cumsum
+        from fla_vendor.utils import prepare_chunk_indices
+        cu_long = cu_seqlens.long()
+        g = torch.randn(1, T, H, device=dev, dtype=torch.float32)
+        fn = lambda: chunk_local_cumsum(g=g, chunk_size=BT, cu_seqlens=cu_long)
+        fn(); torch.npu.synchronize()
+        return _bench_triton(fn)
+    except Exception as exc:
+        print(f"    [Triton cumsum BT={BT}: {str(exc).split(chr(10))[0][:80]}]")
+        gc.collect()
+        return None
+
+
 def _try_triton_kkt(cu_seqlens, BT, dev, T, H, HG) -> float | None:
     try:
         from fla_vendor.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
@@ -134,17 +153,145 @@ def _try_triton_kkt(cu_seqlens, BT, dev, T, H, HG) -> float | None:
         fn(); torch.npu.synchronize()
         return _bench_triton(fn)
     except Exception as exc:
-        print(f"    [Triton kkt BT={BT} unavailable: {str(exc).split(chr(10))[0][:80]}]")
+        print(f"    [Triton kkt BT={BT}: {str(exc).split(chr(10))[0][:80]}]")
         gc.collect()
         return None
 
 
-# ---------------------------------------------------------------------------
-# Stage benchmarks
-# ---------------------------------------------------------------------------
+def _try_triton_solve_tril(cu_seqlens, BT, dev, T, H) -> float | None:
+    if BT > 64:
+        print(f"    [Triton solve_tril BT={BT}: not supported by Triton (max BT=64)]")
+        return None
+    # Triton solve_tril requires grid ≤ 65536; with T=262144 it always exceeds this
+    # limit regardless of H.  Do NOT set TRITON_ALL_BLOCKS_PARALLEL here — doing so
+    # corrupts subsequent Triton benchmark timings via a global env change.
+    try:
+        from fla_vendor.solve_tril import solve_tril as triton_solve_tril
+        cu_long = cu_seqlens.long()
+        A = torch.randn(1, T, H, BT, device=dev, dtype=torch.float32).tril(-1)
+        fn = lambda: triton_solve_tril(A=A, cu_seqlens=cu_long)
+        fn(); torch.npu.synchronize()
+        return _bench_triton(fn)
+    except Exception as exc:
+        msg = str(exc).split(chr(10))[0][:80]
+        if "grid" in msg or "65536" in msg:
+            print(f"    [Triton solve_tril BT={BT}: grid > 65536 (T={T} too large)]")
+        else:
+            print(f"    [Triton solve_tril BT={BT}: {msg}]")
+        gc.collect()
+        return None
 
-def bench_kkt(H, HG, T, cu_seqlens, dev, stream, bd, try_128=False):
-    C_triton = int(os.getenv("GDN_TRITON_KKT_CHUNK", "64"))
+
+def _try_triton_chunk_h(cu_seqlens, BT, dev, T, H, HG) -> float | None:
+    # H=64 with BT=64 triggers an aicore exception on this NPU, corrupting device state.
+    if H >= 64 and BT <= 64:
+        print(f"    [Triton chunk_h BT={BT} H={H}: known aicore failure, skip]")
+        return None
+    try:
+        from fla_vendor.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+        from fla_vendor.utils import prepare_chunk_indices, prepare_chunk_offsets
+        cu_long = cu_seqlens.long()
+        CI = prepare_chunk_indices(cu_long, BT)
+        CO = prepare_chunk_offsets(cu_long, BT)
+        k_tr = torch.randn(1, T, HG, D, device=dev, dtype=torch.bfloat16)
+        w_tr = torch.randn(1, T, H, D, device=dev, dtype=torch.bfloat16)
+        u_tr = torch.randn(1, T, H, D, device=dev, dtype=torch.bfloat16)
+        g_tr = torch.randn(1, T, H, device=dev, dtype=torch.float32)
+        fn = lambda: chunk_gated_delta_rule_fwd_h(k=k_tr, w=w_tr, u=u_tr, g=g_tr,
+                                                   initial_state=None, output_final_state=False,
+                                                   cu_seqlens=cu_long, chunk_indices=CI,
+                                                   chunk_offsets=CO, chunk_size=BT)
+        fn(); torch.npu.synchronize()
+        return _bench_triton(fn)
+    except Exception as exc:
+        print(f"    [Triton chunk_h BT={BT}: {str(exc).split(chr(10))[0][:80]}]")
+        gc.collect()
+        return None
+
+
+def _try_triton_wy_fast(cu_seqlens, BT, dev, T, H, HG) -> float | None:
+    try:
+        from fla_vendor.wy_fast import recompute_w_u_fwd
+        from fla_vendor.utils import prepare_chunk_indices
+        cu_long = cu_seqlens.long()
+        CI = prepare_chunk_indices(cu_long, BT)
+        k_tr = torch.randn(1, T, HG, D, device=dev, dtype=torch.bfloat16)
+        v_tr = torch.randn(1, T, H, D, device=dev, dtype=torch.bfloat16)
+        beta_tr = torch.rand(1, T, H, device=dev, dtype=torch.bfloat16)
+        A_tr = torch.randn(1, T, H, BT, device=dev, dtype=torch.bfloat16)
+        g_tr = torch.randn(1, T, H, device=dev, dtype=torch.float32)
+        fn = lambda: recompute_w_u_fwd(k=k_tr, v=v_tr, beta=beta_tr, g_cumsum=g_tr,
+                                        A=A_tr, cu_seqlens=cu_long, chunk_indices=CI)
+        fn(); torch.npu.synchronize()
+        return _bench_triton(fn)
+    except Exception as exc:
+        print(f"    [Triton wy_fast BT={BT}: {str(exc).split(chr(10))[0][:80]}]")
+        gc.collect()
+        return None
+
+
+def _try_triton_chunk_o(cu_seqlens, BT, dev, T, H, HG) -> float | None:
+    # H=64 with BT=64 is a known aicore failure; skip to protect NPU state.
+    if H >= 64 and BT <= 64:
+        print(f"    [Triton chunk_o BT={BT} H={H}: known aicore failure, skip]")
+        return None
+    try:
+        from fla_vendor.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+        from fla_vendor.chunk_o import chunk_fwd_o
+        from fla_vendor.utils import prepare_chunk_indices, prepare_chunk_offsets
+        cu_long = cu_seqlens.long()
+        CI = prepare_chunk_indices(cu_long, BT)
+        CO = prepare_chunk_offsets(cu_long, BT)
+        scale = D ** -0.5
+        q_tr = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.bfloat16), dim=-1, p=2)
+        k_tr = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.bfloat16), dim=-1, p=2)
+        w_tr = torch.randn(1, T, H, D, device=dev, dtype=torch.bfloat16)
+        u_tr = torch.randn(1, T, H, D, device=dev, dtype=torch.bfloat16)
+        g_tr = torch.randn(1, T, H, device=dev, dtype=torch.float32)
+        h_tr, v_new_tr, _ = chunk_gated_delta_rule_fwd_h(
+            k=k_tr, w=w_tr, u=u_tr, g=g_tr, initial_state=None, output_final_state=False,
+            cu_seqlens=cu_long, chunk_indices=CI, chunk_offsets=CO, chunk_size=BT)
+        torch.npu.synchronize()
+        fn = lambda: chunk_fwd_o(q=q_tr, k=k_tr, v=v_new_tr, h=h_tr, g=g_tr,
+                                  scale=scale, cu_seqlens=cu_long, chunk_size=BT)
+        fn(); torch.npu.synchronize()
+        return _bench_triton(fn)
+    except Exception as exc:
+        print(f"    [Triton chunk_o BT={BT}: {str(exc).split(chr(10))[0][:80]}]")
+        gc.collect()
+        return None
+
+
+def _print_stage(name, ms_pto, ms_t64, ms_t128):
+    sp64 = _ratio(ms_t64, ms_pto)
+    sp128 = _ratio(ms_t128, ms_pto)
+    print(f"\n  {name}  (PTO C={C_PTO})")
+    print(f"    PTO        : {ms_pto:.2f} ms")
+    print(f"    Triton BT=64 : {ms_t64:.2f} ms  → {sp64}" if ms_t64 else
+          f"    Triton BT=64 : fail")
+    print(f"    Triton BT=128: {ms_t128:.2f} ms  → {sp128}" if ms_t128 else
+          f"    Triton BT=128: n/a")
+
+
+def bench_chunk_cumsum(H, T, cu_seqlens, dev, stream, bd):
+    lib = load_chunk_cumsum(H, D, C_PTO)
+    g = torch.randn(1, T, H, device=dev, dtype=torch.float32)
+    g_sum = torch.empty_like(g)
+    batch = len(cu_seqlens) - 1
+    cu32 = cu_seqlens.to(torch.int32)
+
+    def run_pto():
+        lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T)
+
+    run_pto(); torch.npu.synchronize()
+    ms_pto = _bench_npu(run_pto)
+    ms_t64 = _try_triton_cumsum(cu_seqlens, 64, dev, T, H)
+    ms_t128 = _try_triton_cumsum(cu_seqlens, 128, dev, T, H)
+    _print_stage("chunk_cumsum", ms_pto, ms_t64, ms_t128)
+    return ms_pto, ms_t64, ms_t128
+
+
+def bench_kkt(H, HG, T, cu_seqlens, dev, stream, bd):
     lib_k = load_scaled_dot_kkt(H, D, C_PTO, key_heads=HG)
     k = torch.randn(1, T, HG, D, device=dev, dtype=torch.float16)
     beta = torch.rand(1, T, H, device=dev, dtype=torch.float16)
@@ -161,68 +308,27 @@ def bench_kkt(H, HG, T, cu_seqlens, dev, stream, bd, try_128=False):
 
     run_pto(); torch.npu.synchronize()
     ms_pto = _bench_npu(run_pto)
-    ms_t64 = _try_triton_kkt(cu_seqlens, C_triton, dev, T, H, HG)
-    ms_t128 = _try_triton_kkt(cu_seqlens, 128, dev, T, H, HG) if try_128 else None
-
-    print(f"\n  scaled_dot_kkt  (PTO C={C_PTO}  vs  Triton BT={C_triton})")
-    print(f"    PTO:         {ms_pto:.2f} ms")
-    if ms_t64 is not None:
-        print(f"    Triton BT={C_triton}: {ms_t64:.2f} ms  →  speedup {_ratio(ms_t64, ms_pto)}")
-    else:
-        print(f"    Triton BT={C_triton}: fail")
-    if try_128:
-        if ms_t128 is not None:
-            print(f"    Triton BT=128: {ms_t128:.2f} ms  →  speedup {_ratio(ms_t128, ms_pto)}")
-        else:
-            print(f"    Triton BT=128: fail")
-    return ms_pto, ms_t64
+    ms_t64 = _try_triton_kkt(cu_seqlens, 64, dev, T, H, HG)
+    ms_t128 = _try_triton_kkt(cu_seqlens, 128, dev, T, H, HG)
+    _print_stage("scaled_dot_kkt", ms_pto, ms_t64, ms_t128)
+    return ms_pto, ms_t64, ms_t128
 
 
-def bench_chunk_h(H, HG, T, tc, cu_seqlens, dev, stream, bd):
-    lib = load_chunk_h(H, D, C_PTO, key_heads=HG)
-    k = torch.randn(1, T, HG, D, device=dev, dtype=torch.float16)
-    w = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
-    u = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
-    g_sum = torch.randn(1, T, H, device=dev, dtype=torch.float32)
-    g_t = transpose_gates(g_sum)
-    ws = torch.zeros(bd * 4, D, D, device=dev, dtype=torch.float16)
-    s = torch.zeros(tc * H, D, D, device=dev, dtype=torch.float16)
-    v_new = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
-    fs = torch.empty((len(cu_seqlens) - 1) * H, D, D, device=dev, dtype=torch.float16)
-    batch = len(cu_seqlens) - 1
+def bench_solve_tril(H, T, cu_seqlens, dev, tri_inv):
+    """PTO solve_tril (C=128) vs Triton solve_tril (BT=64; BT=128 unsupported).
 
-    def run_pto():
-        lib.call_kernel(bd, stream, _vp(k), _vp(w), _vp(u), _vp(g_t),
-                        _vp(s), _vp(v_new), _vp(fs), _vp(ws), _vp(cu_seqlens),
-                        batch, T, T)
-
-    run_pto(); torch.npu.synchronize()
-    ms_pto = _bench_npu(run_pto)
-    ms_tri = None
-    try:
-        from fla_vendor.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-        from fla_vendor.utils import prepare_chunk_indices, prepare_chunk_offsets
-        cu_long = cu_seqlens.long()
-        CI = prepare_chunk_indices(cu_long, C_PTO)
-        CO = prepare_chunk_offsets(cu_long, C_PTO)
-        k_tr = torch.randn(1, T, HG, D, device=dev, dtype=torch.bfloat16)
-        w_tr = torch.randn(1, T, H, D, device=dev, dtype=torch.bfloat16)
-        u_tr = torch.randn(1, T, H, D, device=dev, dtype=torch.bfloat16)
-        g_tr = torch.randn(1, T, H, device=dev, dtype=torch.float32)
-        fn_t = lambda: chunk_gated_delta_rule_fwd_h(k=k_tr, w=w_tr, u=u_tr, g=g_tr,
-                                                    initial_state=None, output_final_state=False,
-                                                    cu_seqlens=cu_long, chunk_indices=CI,
-                                                    chunk_offsets=CO, chunk_size=C_PTO)
-        fn_t(); torch.npu.synchronize()
-        ms_tri = _bench_triton(fn_t)
-    except Exception as exc:
-        print(f"    [Triton chunk_h unavailable: {str(exc).split(chr(10))[0][:80]}]")
-
-    print(f"\n  chunk_h  (PTO C={C_PTO}  vs  Triton BT={C_PTO})")
-    print(f"    PTO:    {ms_pto:.2f} ms")
-    if ms_tri is not None:
-        print(f"    Triton: {ms_tri:.2f} ms  →  speedup {_ratio(ms_tri, ms_pto)}")
-    return ms_pto, ms_tri
+    Note: Triton solve_tril requires Triton grid ≤ 65536.  With the default
+    workload (T = N_seq × L_seg = 262144) every H value exceeds this limit,
+    so the Triton baseline is always reported as n/a for this workload.
+    """
+    A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16).tril(-1)
+    cu32 = cu_seqlens.to(torch.int32)
+    ms_pto = _bench_npu(lambda: solve_tril(A, cu32, C_PTO, H, tri_inv))
+    ms_t64 = _try_triton_solve_tril(cu_seqlens, 64, dev, T, H)
+    ms_t128 = None  # BT=128 not supported by Triton (max BT=64)
+    print(f"    [Triton solve_tril BT=128: not supported (max BT=64)]")
+    _print_stage("solve_tril", ms_pto, ms_t64, ms_t128)
+    return ms_pto, ms_t64, ms_t128
 
 
 def bench_wy_fast(H, HG, T, cu_seqlens, dev, stream, bd):
@@ -246,33 +352,39 @@ def bench_wy_fast(H, HG, T, cu_seqlens, dev, stream, bd):
 
     run_pto(); torch.npu.synchronize()
     ms_pto = _bench_npu(run_pto)
-    ms_tri = None
-    try:
-        from fla_vendor.wy_fast import recompute_w_u_fwd
-        from fla_vendor.utils import prepare_chunk_indices
-        cu_long = cu_seqlens.long()
-        CI = prepare_chunk_indices(cu_long, C_PTO)
-        k_tr = torch.randn(1, T, HG, D, device=dev, dtype=torch.bfloat16)
-        v_tr = torch.randn(1, T, H, D, device=dev, dtype=torch.bfloat16)
-        beta_tr = torch.rand(1, T, H, device=dev, dtype=torch.bfloat16)
-        A_tr = torch.randn(1, T, H, C_PTO, device=dev, dtype=torch.bfloat16)
-        g_tr = torch.randn(1, T, H, device=dev, dtype=torch.float32)
-        fn_t = lambda: recompute_w_u_fwd(k=k_tr, v=v_tr, beta=beta_tr, g_cumsum=g_tr,
-                                          A=A_tr, cu_seqlens=cu_long, chunk_indices=CI)
-        fn_t(); torch.npu.synchronize()
-        ms_tri = _bench_triton(fn_t)
-    except Exception as exc:
-        print(f"    [Triton wy_fast unavailable: {str(exc).split(chr(10))[0][:80]}]")
+    ms_t64 = _try_triton_wy_fast(cu_seqlens, 64, dev, T, H, HG)
+    ms_t128 = _try_triton_wy_fast(cu_seqlens, 128, dev, T, H, HG)
+    _print_stage("wy_fast", ms_pto, ms_t64, ms_t128)
+    return ms_pto, ms_t64, ms_t128
 
-    print(f"\n  wy_fast  (PTO C={C_PTO}  vs  Triton BT={C_PTO})")
-    print(f"    PTO:    {ms_pto:.2f} ms")
-    if ms_tri is not None:
-        print(f"    Triton: {ms_tri:.2f} ms  →  speedup {_ratio(ms_tri, ms_pto)}")
-    return ms_pto, ms_tri
+
+def bench_chunk_h(H, HG, T, tc, cu_seqlens, dev, stream, bd):
+    lib = load_chunk_h(H, D, C_PTO, key_heads=HG)
+    k = torch.randn(1, T, HG, D, device=dev, dtype=torch.float16)
+    w = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
+    u = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
+    g_sum = torch.randn(1, T, H, device=dev, dtype=torch.float32)
+    g_t = transpose_gates(g_sum)
+    ws = torch.zeros(bd * 4, D, D, device=dev, dtype=torch.float16)
+    s = torch.zeros(tc * H, D, D, device=dev, dtype=torch.float16)
+    v_new = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
+    fs = torch.empty((len(cu_seqlens) - 1) * H, D, D, device=dev, dtype=torch.float16)
+    batch = len(cu_seqlens) - 1
+
+    def run_pto():
+        lib.call_kernel(bd, stream, _vp(k), _vp(w), _vp(u), _vp(g_t),
+                        _vp(s), _vp(v_new), _vp(fs), _vp(ws), _vp(cu_seqlens),
+                        batch, T, T)
+
+    run_pto(); torch.npu.synchronize()
+    ms_pto = _bench_npu(run_pto)
+    ms_t64 = _try_triton_chunk_h(cu_seqlens, 64, dev, T, H, HG)
+    ms_t128 = _try_triton_chunk_h(cu_seqlens, 128, dev, T, H, HG)
+    _print_stage("chunk_h", ms_pto, ms_t64, ms_t128)
+    return ms_pto, ms_t64, ms_t128
 
 
 def bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd):
-    C_triton_o = int(os.getenv("GDN_TRITON_CHUNK_O_CHUNK", "64"))
     lib_h = load_chunk_h(H, D, C_PTO, key_heads=HG)
     lib_o = load_chunk_o(H, D, C_PTO, key_heads=HG)
     k = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
@@ -286,7 +398,7 @@ def bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd):
     v_new = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     fs = torch.empty((len(cu_seqlens) - 1) * H, D, D, device=dev, dtype=torch.float16)
     batch = len(cu_seqlens) - 1
-    # Warmup chunk_h to populate s and v_new
+    # Populate s and v_new via chunk_h warmup
     lib_h.call_kernel(bd, stream, _vp(k), _vp(w), _vp(u), _vp(g_t),
                       _vp(s), _vp(v_new), _vp(fs), _vp(ws_h), _vp(cu_seqlens),
                       batch, T, T)
@@ -304,47 +416,10 @@ def bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd):
 
     run_pto(); torch.npu.synchronize()
     ms_pto = _bench_npu(run_pto)
-    ms_tri = None
-
-    # H=64 with BT=64 is a known Triton failure (aicore exception); skip to avoid
-    # poisoning the NPU device state for subsequent benchmarks.
-    if H >= 64 and C_triton_o <= 64:
-        print(f"    [Triton chunk_o BT={C_triton_o} known failure for H={H}: skip]")
-    else:
-        try:
-            from fla_vendor.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-            from fla_vendor.chunk_o import chunk_fwd_o
-            from fla_vendor.utils import prepare_chunk_indices, prepare_chunk_offsets
-            cu_long = cu_seqlens.long()
-            CI = prepare_chunk_indices(cu_long, C_triton_o)
-            CO = prepare_chunk_offsets(cu_long, C_triton_o)
-            scale = D ** -0.5
-            q_tr = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.bfloat16), dim=-1, p=2)
-            k_tr = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.bfloat16), dim=-1, p=2)
-            w_tr = torch.randn(1, T, H, D, device=dev, dtype=torch.bfloat16)
-            u_tr = torch.randn(1, T, H, D, device=dev, dtype=torch.bfloat16)
-            g_tr = torch.randn(1, T, H, device=dev, dtype=torch.float32)
-            h_tr, v_new_tr, _ = chunk_gated_delta_rule_fwd_h(k=k_tr, w=w_tr, u=u_tr, g=g_tr,
-                                                              initial_state=None, output_final_state=False,
-                                                              cu_seqlens=cu_long, chunk_indices=CI,
-                                                              chunk_offsets=CO, chunk_size=C_triton_o)
-            torch.npu.synchronize()
-            fn_t = lambda: chunk_fwd_o(q=q_tr, k=k_tr, v=v_new_tr, h=h_tr, g=g_tr,
-                                        scale=scale, cu_seqlens=cu_long, chunk_size=C_triton_o)
-            fn_t(); torch.npu.synchronize()
-            ms_tri = _bench_triton(fn_t)
-        except Exception as exc:
-            reason = str(exc).split(chr(10))[0][:100]
-            print(f"    [Triton chunk_o BT={C_triton_o} unavailable: {reason}]")
-
-    print(f"\n  chunk_o  (PTO C={C_PTO}  vs  Triton BT={C_triton_o})")
-    print(f"    PTO:    {ms_pto:.2f} ms")
-    if ms_tri is not None:
-        print(f"    Triton: {ms_tri:.2f} ms  →  speedup {_ratio(ms_tri, ms_pto)}")
-    else:
-        print(f"    Triton: fail (known H={H} BT={C_triton_o} incompatibility)" if H >= 64 else
-              f"    Triton: fail")
-    return ms_pto, ms_tri
+    ms_t64 = _try_triton_chunk_o(cu_seqlens, 64, dev, T, H, HG)
+    ms_t128 = _try_triton_chunk_o(cu_seqlens, 128, dev, T, H, HG)
+    _print_stage("chunk_o", ms_pto, ms_t64, ms_t128)
+    return ms_pto, ms_t64, ms_t128
 
 
 def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
@@ -430,11 +505,10 @@ def main() -> None:
     parser.add_argument("--H-list", default="16,32,48,64",
                         help="Comma-separated value head counts H.")
     parser.add_argument("--hg", type=int, default=16, help="Key head count Hg.")
-    parser.add_argument("--stage", default="kkt,chunk_h,wy_fast,chunk_o",
+    parser.add_argument("--stage",
+                        default="cumsum,kkt,solve_tril,wy_fast,chunk_h,chunk_o",
                         help="Comma-separated stages to benchmark.")
     parser.add_argument("--mega", action="store_true", help="Also benchmark mega-kernel.")
-    parser.add_argument("--try-kkt-128", action="store_true",
-                        help="Try Triton BT=128 for kkt (may fail for some H).")
     parser.add_argument("--output-json", default=None,
                         help="Save results as JSON to this path.")
     args = parser.parse_args()
@@ -454,7 +528,8 @@ def main() -> None:
     heads_list = [int(x) for x in args.H_list.split(",") if x.strip()]
     HG = args.hg
 
-    tri_inv = load_tri_inverse() if args.mega else None
+    tri_inv_needed = args.mega or "solve_tril" in {s.strip() for s in args.stage.split(",")}
+    tri_inv = load_tri_inverse() if tri_inv_needed else None
 
     print(f"Workload: N_seq={N_seq}  L_seg={L_seg}  T={T}  D={D}  C_PTO={C_PTO}  BLOCK_DIM={bd}")
     print(f"Stages: {stages}  H_list={heads_list}  Hg={HG}")
@@ -483,29 +558,52 @@ def main() -> None:
         print(f"{'='*68}")
         row: dict = {"H": H, "Hg": HG, "D": D, "N_seq": N_seq, "L_seg": L_seg, "C_pto": C_PTO}
 
-        if "kkt" in stages:
-            ms_pto, ms_tri = bench_kkt(H, HG, T, cu_seqlens, dev, stream, bd, try_128=args.try_kkt_128)
-            row["kkt_pto_ms"] = ms_pto
-            row["kkt_triton_ms"] = ms_tri
-            row["kkt_speedup"] = ms_tri / ms_pto if ms_tri else None
+        if "cumsum" in stages:
+            ms_pto, ms_t64, ms_t128 = bench_chunk_cumsum(H, T, cu_seqlens, dev, stream, bd)
+            row["cumsum_pto_ms"] = ms_pto
+            row["cumsum_triton64_ms"] = ms_t64
+            row["cumsum_triton128_ms"] = ms_t128
+            row["cumsum_speedup_vs64"] = ms_t64 / ms_pto if ms_t64 else None
+            row["cumsum_speedup_vs128"] = ms_t128 / ms_pto if ms_t128 else None
             gc.collect()
-        if "chunk_h" in stages:
-            ms_pto, ms_tri = bench_chunk_h(H, HG, T, tc, cu_seqlens, dev, stream, bd)
-            row["chunk_h_pto_ms"] = ms_pto
-            row["chunk_h_triton_ms"] = ms_tri
-            row["chunk_h_speedup"] = ms_tri / ms_pto if ms_tri else None
+        if "kkt" in stages:
+            ms_pto, ms_t64, ms_t128 = bench_kkt(H, HG, T, cu_seqlens, dev, stream, bd)
+            row["kkt_pto_ms"] = ms_pto
+            row["kkt_triton64_ms"] = ms_t64
+            row["kkt_triton128_ms"] = ms_t128
+            row["kkt_speedup_vs64"] = ms_t64 / ms_pto if ms_t64 else None
+            row["kkt_speedup_vs128"] = ms_t128 / ms_pto if ms_t128 else None
+            gc.collect()
+        if "solve_tril" in stages:
+            ms_pto, ms_t64, ms_t128 = bench_solve_tril(H, T, cu_seqlens, dev, tri_inv)
+            row["solve_tril_pto_ms"] = ms_pto
+            row["solve_tril_triton64_ms"] = ms_t64
+            row["solve_tril_triton128_ms"] = ms_t128  # always None
+            row["solve_tril_speedup_vs64"] = ms_t64 / ms_pto if ms_t64 else None
             gc.collect()
         if "wy_fast" in stages:
-            ms_pto, ms_tri = bench_wy_fast(H, HG, T, cu_seqlens, dev, stream, bd)
+            ms_pto, ms_t64, ms_t128 = bench_wy_fast(H, HG, T, cu_seqlens, dev, stream, bd)
             row["wy_fast_pto_ms"] = ms_pto
-            row["wy_fast_triton_ms"] = ms_tri
-            row["wy_fast_speedup"] = ms_tri / ms_pto if ms_tri else None
+            row["wy_fast_triton64_ms"] = ms_t64
+            row["wy_fast_triton128_ms"] = ms_t128
+            row["wy_fast_speedup_vs64"] = ms_t64 / ms_pto if ms_t64 else None
+            row["wy_fast_speedup_vs128"] = ms_t128 / ms_pto if ms_t128 else None
+            gc.collect()
+        if "chunk_h" in stages:
+            ms_pto, ms_t64, ms_t128 = bench_chunk_h(H, HG, T, tc, cu_seqlens, dev, stream, bd)
+            row["chunk_h_pto_ms"] = ms_pto
+            row["chunk_h_triton64_ms"] = ms_t64
+            row["chunk_h_triton128_ms"] = ms_t128
+            row["chunk_h_speedup_vs64"] = ms_t64 / ms_pto if ms_t64 else None
+            row["chunk_h_speedup_vs128"] = ms_t128 / ms_pto if ms_t128 else None
             gc.collect()
         if "chunk_o" in stages:
-            ms_pto, ms_tri = bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd)
+            ms_pto, ms_t64, ms_t128 = bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd)
             row["chunk_o_pto_ms"] = ms_pto
-            row["chunk_o_triton_ms"] = ms_tri
-            row["chunk_o_speedup"] = ms_tri / ms_pto if ms_tri else None
+            row["chunk_o_triton64_ms"] = ms_t64
+            row["chunk_o_triton128_ms"] = ms_t128
+            row["chunk_o_speedup_vs64"] = ms_t64 / ms_pto if ms_t64 else None
+            row["chunk_o_speedup_vs128"] = ms_t128 / ms_pto if ms_t128 else None
             gc.collect()
         if args.mega:
             ms_mega, ms_staged = bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv)
