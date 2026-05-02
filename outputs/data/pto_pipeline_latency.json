@@ -1,18 +1,176 @@
 {
-  "timestamp": "2026-05-02T17:40:03.787379+00:00",
+  "timestamp": "2026-05-02T19:15:09.043922+00:00",
   "device": "npu:0",
   "N_seq": 16,
+  "bench_timer": "perf_counter",
+  "bench_timing_between_iters": "Host wall clock: sync after cache.zero_; sync; time.perf_counter(); fn(); sync; perf_counter (no torch.npu Event). Idle device between trials avoids backlog amortization; includes eager/Python.",
   "results": [
     {
       "N_seq": 16,
+      "L_seg": 1024,
+      "H": 16,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 3.7445282796397805,
+      "separate_ms": 4.238375520799309,
+      "separate_over_mega": 1.1318850344500633,
+      "triton_bt64_chain_ms": 11.18755736388266,
+      "triton_chain_over_mega": 2.987708071190984
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 1024,
+      "H": 32,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 7.085520715918392,
+      "separate_ms": 7.604224549140781,
+      "separate_over_mega": 1.0732061698806503,
+      "triton_bt64_chain_ms": 17.553171375766397,
+      "triton_chain_over_mega": 2.4773297658041264
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 1024,
+      "H": 48,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 10.385597997810692,
+      "separate_ms": 11.069903266616166,
+      "separate_over_mega": 1.0658898282939246,
+      "triton_bt64_chain_ms": 24.13832995807752,
+      "triton_chain_over_mega": 2.3242118521404294
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 1024,
+      "H": 64,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 13.682845630683005,
+      "separate_ms": 14.436241239309311,
+      "separate_over_mega": 1.0550613248852898,
+      "triton_bt64_chain_ms": 30.943038291297853,
+      "triton_chain_over_mega": 2.261447591128986
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 2048,
+      "H": 16,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 7.0636888849548995,
+      "separate_ms": 7.604561164043844,
+      "separate_over_mega": 1.076570795783625,
+      "triton_bt64_chain_ms": 17.629480687901378,
+      "triton_chain_over_mega": 2.495789519474843
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 2048,
+      "H": 32,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 13.833110046107322,
+      "separate_ms": 14.517296280246228,
+      "separate_over_mega": 1.0494600441880702,
+      "triton_bt64_chain_ms": 31.035749707370996,
+      "triton_chain_over_mega": 2.2435843858630005
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 2048,
+      "H": 48,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 20.591161504853517,
+      "separate_ms": 21.486875193659216,
+      "separate_over_mega": 1.0434999108036995,
+      "triton_bt64_chain_ms": 44.387986592482775,
+      "triton_chain_over_mega": 2.155681532681881
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 2048,
+      "H": 64,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 26.739226770587265,
+      "separate_ms": 28.20676047122106,
+      "separate_over_mega": 1.0548831764368019,
+      "triton_bt64_chain_ms": 57.62109952047467,
+      "triton_chain_over_mega": 2.15492766544233
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 4096,
+      "H": 16,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 14.076933963224292,
+      "separate_ms": 14.607065066229552,
+      "separate_over_mega": 1.037659557428501,
+      "triton_bt64_chain_ms": 31.298623711336404,
+      "triton_chain_over_mega": 2.223397779168634
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 4096,
+      "H": 32,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 27.4332458502613,
+      "separate_ms": 28.454728133510798,
+      "separate_over_mega": 1.0372351958942463,
+      "triton_bt64_chain_ms": 58.00549627747387,
+      "triton_chain_over_mega": 2.1144233749839474
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 4096,
+      "H": 48,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 40.192442713305354,
+      "separate_ms": 42.39155777031556,
+      "separate_over_mega": 1.0547146405779961,
+      "triton_bt64_chain_note": "skipped heuristically at L_seg>=4096,H>=48 (Triton BT=64 chain risks device timeout)"
+    },
+    {
+      "N_seq": 16,
+      "L_seg": 4096,
+      "H": 64,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "mega_ms": 53.05478855734691,
+      "separate_ms": 55.91772455954924,
+      "separate_over_mega": 1.0539618775241708,
+      "triton_bt64_chain_note": "skipped heuristically at L_seg>=4096,H>=48 (Triton BT=64 chain risks device timeout)"
+    },
+    {
+      "N_seq": 16,
       "L_seg": 8192,
       "H": 16,
       "Hg": 16,
       "D": 128,
       "C_pto": 128,
-      "mega_ms": 27.98407280445099,
-      "separate_ms": 122.9790267944336,
-      "separate_over_mega": 4.394607877623633
+      "mega_ms": 27.809964725747705,
+      "separate_ms": 28.72553956694901,
+      "separate_over_mega": 1.0329225459374145,
+      "triton_bt64_chain_ms": 58.65676933899522,
+      "triton_chain_over_mega": 2.109199702964318
     },
     {
       "N_seq": 16,
@@ -21,9 +179,10 @@
       "Hg": 16,
       "D": 128,
       "C_pto": 128,
-      "mega_ms": 54.63551712036133,
-      "separate_ms": 148.64196109771729,
-      "separate_over_mega": 2.720610491711115
+      "mega_ms": 54.46468386799097,
+      "separate_ms": 56.37520633172244,
+      "separate_over_mega": 1.0350781888014278,
+      "triton_bt64_chain_note": "RuntimeError: grid should be less than 65536! You can try \"export TRITON_ALL_BLOCKS_PARALLEL=1\" to avoid this problem."
     },
     {
       "N_seq": 16,
@@ -32,9 +191,10 @@
       "Hg": 16,
       "D": 128,
       "C_pto": 128,
-      "mega_ms": 81.82180690765381,
-      "separate_ms": 182.97369956970215,
-      "separate_over_mega": 2.236246136390155
+      "mega_ms": 80.21725591970608,
+      "separate_ms": 84.68902431195602,
+      "separate_over_mega": 1.0557457163172719,
+      "triton_bt64_chain_note": "skipped heuristically at L_seg>=4096,H>=48 (Triton BT=64 chain risks device timeout)"
     },
     {
       "N_seq": 16,
@@ -43,9 +203,10 @@
       "Hg": 16,
       "D": 128,
       "C_pto": 128,
-      "mega_ms": 106.33359241485596,
-      "separate_ms": 204.94050979614258,
-      "separate_over_mega": 1.9273355215591321
+      "mega_ms": 107.98595217056572,
+      "separate_ms": 111.24925938202068,
+      "separate_over_mega": 1.0302197382702196,
+      "triton_bt64_chain_note": "skipped heuristically at L_seg>=4096,H>=48 (Triton BT=64 chain risks device timeout)"
     },
     {
       "N_seq": 16,
@@ -54,9 +215,10 @@
       "Hg": 16,
       "D": 128,
       "C_pto": 128,
-      "mega_ms": 55.4946665763855,
-      "separate_ms": 245.81427097320557,
-      "separate_over_mega": 4.4295116294618175
+      "mega_ms": 54.419851454440504,
+      "separate_ms": 56.9544262252748,
+      "separate_over_mega": 1.0465744522098928,
+      "triton_bt64_chain_note": "RuntimeError: grid should be less than 65536! You can try \"export TRITON_ALL_BLOCKS_PARALLEL=1\" to avoid this problem."
     },
     {
       "N_seq": 16,
@@ -65,9 +227,10 @@
       "Hg": 16,
       "D": 128,
       "C_pto": 128,
-      "mega_ms": 108.95972633361816,
-      "separate_ms": 302.1782760620117,
-      "separate_over_mega": 2.773302450639309
+      "mega_ms": 108.07100241072476,
+      "separate_ms": 112.35353467054665,
+      "separate_over_mega": 1.0396270244958596,
+      "triton_bt64_chain_note": "RuntimeError: grid should be less than 65536! You can try \"export TRITON_ALL_BLOCKS_PARALLEL=1\" to avoid this problem."
     },
     {
       "N_seq": 16,
@@ -76,9 +239,10 @@
       "Hg": 16,
       "D": 128,
       "C_pto": 128,
-      "mega_ms": 163.33953094482422,
-      "separate_ms": 366.6401138305664,
-      "separate_over_mega": 2.244650218534157
+      "mega_ms": 162.21108089666814,
+      "separate_ms": 168.52915129857138,
+      "separate_over_mega": 1.0389496843679131,
+      "triton_bt64_chain_note": "skipped heuristically at L_seg>=4096,H>=48 (Triton BT=64 chain risks device timeout)"
     },
     {
       "N_seq": 16,
@@ -87,9 +251,10 @@
       "Hg": 16,
       "D": 128,
       "C_pto": 128,
-      "mega_ms": 215.9103183746338,
-      "separate_ms": 474.2214107513428,
-      "separate_over_mega": 2.1963814157714503
+      "mega_ms": 215.28824843699113,
+      "separate_ms": 223.1412495020777,
+      "separate_over_mega": 1.0364766824111393,
+      "triton_bt64_chain_note": "skipped heuristically at L_seg>=4096,H>=48 (Triton BT=64 chain risks device timeout)"
     }
   ]
 }

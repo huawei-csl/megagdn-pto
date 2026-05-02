@@ -69,6 +69,26 @@ def total_chunks(
     )
 
 
+@lru_cache(maxsize=48)
+def precomputed_minus_identity(device_ty: str, device_index: int, chunk_size: int) -> torch.Tensor:
+    """Shared ``[C,C] fp16`` buffer with diagonal ``-1`` for ``tri_inverse`` / mega-kernel."""
+    idx = device_index if device_index >= 0 else 0
+    dev = torch.device(device_ty, idx) if device_ty != "cpu" else torch.device("cpu")
+    t = torch.zeros(chunk_size, chunk_size, device=dev, dtype=torch.float16)
+    t.fill_diagonal_(-1)
+    return t
+
+
+@lru_cache(maxsize=48)
+def chunk_gdn_causal_masks(device_ty: str, device_index: int, chunk_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lower-triangle masks for intra-chunk KKT attention (reuse across forwards)."""
+    idx = device_index if device_index >= 0 else 0
+    dev = torch.device(device_ty, idx) if device_ty != "cpu" else torch.device("cpu")
+    m_lower = torch.tril(torch.ones(chunk_size, chunk_size, device=dev), diagonal=-1).float()
+    m_full = torch.tril(torch.ones(chunk_size, chunk_size, device=dev), diagonal=0).float()
+    return m_lower, m_full
+
+
 def _mtime(name: str) -> int:
     return os.stat(os.path.join(_KERNELS_PTO, name)).st_mtime_ns
 

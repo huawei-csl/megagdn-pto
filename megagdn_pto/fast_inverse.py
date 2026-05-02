@@ -14,6 +14,7 @@ from functools import lru_cache
 import torch
 
 from megagdn_pto.compile import BLOCK_DIM, compile_tri_inverse, _KERNELS_PTO
+from megagdn_pto.kernel_libs import precomputed_minus_identity, total_chunks
 
 
 def _vp(t: torch.Tensor | None) -> ctypes.c_void_p:
@@ -23,8 +24,8 @@ def _vp(t: torch.Tensor | None) -> ctypes.c_void_p:
 
 
 @lru_cache(maxsize=1)
-def load_tri_inverse():
-    """Compile (once) and return a callable wrapper for the triangular-inverse kernel."""
+def _tri_inverse_cdll():
+    """Load ``tri_inverse`` shared library once (ctypes + signature)."""
     mtime = os.stat(os.path.join(_KERNELS_PTO, "tri_inverse.cpp")).st_mtime_ns
     lib_path = compile_tri_inverse(cpp_mtime_ns=mtime)
     lib = ctypes.CDLL(os.path.abspath(lib_path))
@@ -40,6 +41,41 @@ def load_tri_inverse():
         ctypes.c_void_p,    # cu_seqlens (optional int32)
     ]
     lib.call_kernel.restype = None
+    return lib
+
+
+def launch_tri_inverse_kernel(
+    tensor_out: torch.Tensor,
+    tensor_in: torch.Tensor,
+    minus_identity: torch.Tensor,
+    matrix_size: int,
+    num_matrices: int,
+    num_bsnd_heads: int,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    block_dim: int,
+    stream_ptr,
+    is_lower: bool,
+) -> None:
+    """Single ``lib.call_kernel`` dispatch — no stream lookup or dtype conversion.
+
+    For micro-benchmarks, capture ``stream_ptr = torch.npu.current_stream()._as_parameter_``
+    once outside the timed loop. If ``cu_seqlens`` is given, it must already be ``int32``.
+    """
+    lib = _tri_inverse_cdll()
+    eff_bd = min(block_dim, num_matrices)
+    heads_with_flag = (num_bsnd_heads & 0xFFFF) | (0x10000 if is_lower else 0)
+    lib.call_kernel(
+        eff_bd, stream_ptr,
+        _vp(tensor_out), _vp(tensor_in), _vp(minus_identity),
+        matrix_size, num_matrices, heads_with_flag,
+        _vp(cu_seqlens) if cu_seqlens is not None else ctypes.c_void_p(),
+    )
+
+
+@lru_cache(maxsize=1)
+def load_tri_inverse():
+    """Compile (once) and return a callable wrapper for the triangular-inverse kernel."""
 
     def tri_inverse(
         tensor_out: torch.Tensor,
@@ -71,16 +107,34 @@ def load_tri_inverse():
             stream_ptr = torch.npu.current_stream()._as_parameter_
         if cu_seqlens is not None and cu_seqlens.dtype != torch.int32:
             raise TypeError("cu_seqlens must be int32.")
-        eff_bd = min(block_dim, num_matrices)
-        heads_with_flag = (num_bsnd_heads & 0xFFFF) | (0x10000 if is_lower else 0)
-        lib.call_kernel(
-            eff_bd, stream_ptr,
-            _vp(tensor_out), _vp(tensor_in), _vp(minus_identity),
-            matrix_size, num_matrices, heads_with_flag,
-            _vp(cu_seqlens) if cu_seqlens is not None else ctypes.c_void_p(),
+        launch_tri_inverse_kernel(
+            tensor_out,
+            tensor_in,
+            minus_identity,
+            matrix_size,
+            num_matrices,
+            num_bsnd_heads,
+            cu_seqlens=cu_seqlens,
+            block_dim=block_dim,
+            stream_ptr=stream_ptr,
+            is_lower=is_lower,
         )
 
     return tri_inverse
+
+
+def _solve_tril_num_matrices(cu32: torch.Tensor, chunk_size: int, num_heads: int) -> int:
+    """Tile count (= ``total_chunks(...) * num_heads``) without host reads when lengths match."""
+    nseq = cu32.numel() - 1
+    if nseq <= 0:
+        return 0
+    d = torch.diff(cu32)
+    if d.numel() > 0 and bool(torch.all(d == d[0]).item()):
+        seg = int(d[0].item())
+        nt_seg = (seg + chunk_size - 1) // chunk_size
+        return nt_seg * int(nseq) * num_heads
+    tc = total_chunks(int(nseq), int(cu32[-1].item()), chunk_size, cu32)
+    return tc * num_heads
 
 
 def solve_tril(
@@ -89,6 +143,9 @@ def solve_tril(
     chunk_size: int,
     num_heads: int,
     tri_inv_func=None,
+    *,
+    workspace_fp32: torch.Tensor | None = None,
+    out_fp16: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Invert the lower-triangular ``A`` tiles (solve_tril stage).
 
@@ -98,6 +155,9 @@ def solve_tril(
         chunk_size:  Chunk size C (matrix side length).
         num_heads:   Number of value heads H.
         tri_inv_func: Pre-loaded tri-inverse callable (auto-loaded if None).
+        workspace_fp32: Optional fp32 workspace matching ``A_fp16.shape`` — reuse to skip
+            allocations in benchmarks / fused callers.
+        out_fp16:    Optional fp16 output buffer matching ``A_fp16.shape``.
 
     Returns:
         ``A_inv`` of the same shape and fp16 dtype.
@@ -109,17 +169,18 @@ def solve_tril(
         T = A_fp16.shape[1]
         cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=A_fp16.device)
     cu32 = cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
-    cu_cpu = cu32.cpu().tolist()
-    num_matrices = (
-        sum(
-            (cu_cpu[i + 1] - cu_cpu[i] + chunk_size - 1) // chunk_size
-            for i in range(len(cu_cpu) - 1)
-        )
-        * num_heads
-    )
-    tensor_out = torch.zeros_like(A_fp16, dtype=torch.float32)
-    minus_identity = torch.zeros(chunk_size, chunk_size, device=A_fp16.device, dtype=torch.float16)
-    minus_identity.fill_diagonal_(-1)
+    dev = A_fp16.device
+    dt, di = dev.type, dev.index if dev.index is not None else -1
+    num_matrices = _solve_tril_num_matrices(cu32, chunk_size, num_heads)
+
+    if workspace_fp32 is None:
+        tensor_out = torch.zeros_like(A_fp16, dtype=torch.float32)
+    else:
+        if workspace_fp32.shape != A_fp16.shape or workspace_fp32.dtype != torch.float32:
+            raise ValueError("workspace_fp32 must match A_fp16 shape and be float32.")
+        tensor_out = workspace_fp32
+
+    minus_identity = precomputed_minus_identity(dt, di, chunk_size)
 
     tri_inv_func(
         tensor_out, A_fp16, minus_identity,
@@ -128,4 +189,11 @@ def solve_tril(
         block_dim=BLOCK_DIM,
         is_lower=True,
     )
-    return tensor_out.to(torch.float16)
+    if out_fp16 is None:
+        dest = torch.empty_like(A_fp16)
+    else:
+        if out_fp16.shape != A_fp16.shape:
+            raise ValueError("out_fp16 shape must match A_fp16.")
+        dest = out_fp16
+    dest.copy_(tensor_out)
+    return dest

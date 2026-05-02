@@ -17,7 +17,12 @@ from functools import lru_cache
 import torch
 
 from megagdn_pto.compile import BLOCK_DIM, _KERNELS_PTO, compile_mega_kernel
-from megagdn_pto.kernel_libs import total_chunks, _vp
+from megagdn_pto.kernel_libs import (
+    chunk_gdn_causal_masks,
+    precomputed_minus_identity,
+    total_chunks,
+    _vp,
+)
 
 
 @lru_cache(maxsize=None)
@@ -91,11 +96,9 @@ def run_mega_kernel(
     if cu_seqlens.dtype != torch.int32:
         cu_seqlens = cu_seqlens.to(torch.int32)
 
-    # Pre-allocated buffers (intermediates passed directly into the fused kernel)
-    msk_lower = torch.tril(torch.ones(C, C, device=dev), diagonal=-1).float()
-    msk_full  = torch.tril(torch.ones(C, C, device=dev), diagonal=0).float()
-    minus_identity = torch.zeros(C, C, device=dev, dtype=torch.float16)
-    minus_identity.fill_diagonal_(-1)
+    dt, di = dev.type, dev.index if dev.index is not None else -1
+    msk_lower, msk_full = chunk_gdn_causal_masks(dt, di, C)
+    minus_identity = precomputed_minus_identity(dt, di, C)
 
     tc = total_chunks(N_seq, T, C, cu_seqlens)
     num_matrices = tc * H

@@ -10,9 +10,16 @@ micro-benchmarks (``N_seq`` sequences × ``L_seg`` tokens):
   * **triton_bt64_chain_ms** — chained Triton pipeline at chunk/BT=64 via
     ``tests/test_e2e.triton_pipeline``. Omitted when import, compile, or launch fails.
 
-``_bench_loop`` records events around ``fn()`` and synchronizes once per trial after timing.
+``_bench_loop`` uses **`time.perf_counter()` on the host** around each ``fn()``, bracketed by
+``torch.npu.synchronize()`` (idle queue before timing; wait for completion after). That pulls
+**PyTorch eager + Python interpreter overhead** into the measurement more than CUDA-style GPU
+timers alone, and still avoids backlog-amortizing work across repetitions.
 
 Outputs JSON for ``scripts/plot_results.py --pto-pipeline-json``.
+
+Default **--l-list** scans several shorter **L_seg** first so the Triton six-kernel
+BT=64 baseline succeeds on more (L,H) pairs within Ascend grid limits; combinations
+that still overflow omit ``triton_bt64_chain_ms`` and record ``triton_bt64_chain_note``.
 
 Usage::
 
@@ -23,10 +30,12 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +45,16 @@ import torch.nn.functional as F
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+
+def _triton_e2e_skip_reason(L_seg: int, H: int) -> str | None:
+    """Avoid Triton chained runs that reproducibly deadlock / wedge this NPU (ACL timeout)."""
+    # Empirical: BT=64 e2e at L_seg≥4096 and H≥48 can fail mid-stream then break the next kernels.
+    if L_seg >= 4096 and H >= 48:
+        return (
+            "skipped heuristically at L_seg>=4096,H>=48 (Triton BT=64 chain risks device timeout)"
+        )
+    return None
 
 
 def _bench_triton_e2e(
@@ -85,27 +104,33 @@ def _load_chunk_patch():
 
 
 def _bench_loop(fn, *, warmup: int = 4, iters: int = 18) -> float:
-    """Mean elapsed ms per call (includes final sync inside timing loop)."""
-    starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
-    ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
+    """Mean wall-clock elapsed ms (**host ``time.perf_counter``**) per ``fn()`` call.
+
+    Each timed trial: synchronize (cache touch already synced), timestamp, ``fn()``,
+    synchronize, timestamp again. No NPU Events — interpreter + eager dispatch latency
+    is included in each sample. Idle device before timing keeps trials from amortizing backlog.
+    """
     cache = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=torch.npu.current_device())
 
     def _timed():
+        cache.zero_()
+        torch.npu.synchronize()
         fn()
         torch.npu.synchronize()
 
+    torch.npu.synchronize()
     for _ in range(warmup):
         _timed()
     torch.npu.synchronize()
-    times: list[float] = []
-    for i in range(iters):
+    times_ms: list[float] = []
+    for _ in range(iters):
         cache.zero_()
-        starts[i].record()
+        torch.npu.synchronize()
+        t0 = time.perf_counter()
         fn()
-        ends[i].record()
-        ends[i].synchronize()
-        times.append(starts[i].elapsed_time(ends[i]))
-    return sum(times) / len(times)
+        torch.npu.synchronize()
+        times_ms.append((time.perf_counter() - t0) * 1000.0)
+    return sum(times_ms) / len(times_ms)
 
 
 def staged_separate_launch(
@@ -131,6 +156,8 @@ def staged_separate_launch(
     stream = torch.npu.current_stream()._as_parameter_
 
     from megagdn_pto.kernel_libs import (
+        chunk_gdn_causal_masks,
+        run_chunk_cumsum,
         run_chunk_h,
         run_chunk_o,
         run_scaled_dot_kkt,
@@ -141,12 +168,17 @@ def staged_separate_launch(
     )
     from megagdn_pto.fast_inverse import solve_tril
 
-    g_sum = patch_mod._chunk_cumsum(g.float(), cu32, C_PTO)
+    dt, di = dev.type, dev.index if dev.index is not None else -1
+    msk_lower, msk_full = chunk_gdn_causal_masks(dt, di, C_PTO)
+
+    g_sum = torch.empty(1, T, H, device=dev, dtype=torch.float32)
+    run_chunk_cumsum(
+        g.float(), g_sum,
+        stream=stream, chunk_size=C_PTO,
+        cu_seqlens=cu32, batch_size_override=N_seq,
+    )
     g_t = transpose_gates(g_sum)
     beta_t = transpose_beta(beta)
-
-    msk_lower = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
-    msk_full = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
 
     A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
     run_scaled_dot_kkt(
@@ -198,8 +230,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--device", default=os.getenv("GDN_NPU_DEVICE", "npu:0"))
     ap.add_argument("--n-seq", type=int, default=16)
-    ap.add_argument("--l-list", default="8192,16384",
-                    help="Comma-separated L_seg values (tokens per seq).")
+    ap.add_argument("--l-list", default="1024,2048,4096,8192,16384",
+                    help="Comma-separated L_seg values (tokens per seq). "
+                         "Include smaller L_seg so Triton BT=64 e2e fits Ascend grid limits on more (L,H).")
     ap.add_argument("--h-list", default="16,32,48,64",
                     help="Comma-separated head counts H (value heads).")
     ap.add_argument("--hg", type=int, default=16)
@@ -261,20 +294,25 @@ def main() -> int:
             ms_sep = _bench_loop(run_separate, warmup=args.warmup, iters=args.iters)
 
             tri_note: list[str] = []
-            ms_triton = _bench_triton_e2e(
-                q_w=q_w,
-                k_w=k_w,
-                v_w=v_w,
-                g_w=g_w,
-                beta_w=beta_w,
-                cu_long=cu.long(),
-                H=H,
-                Hg=Hg,
-                scale=scale,
-                warmup=args.warmup,
-                iters=args.iters,
-                error_note=tri_note,
-            )
+            skip_reason = _triton_e2e_skip_reason(L_seg, H)
+            if skip_reason:
+                tri_note.append(skip_reason)
+                ms_triton = None
+            else:
+                ms_triton = _bench_triton_e2e(
+                    q_w=q_w,
+                    k_w=k_w,
+                    v_w=v_w,
+                    g_w=g_w,
+                    beta_w=beta_w,
+                    cu_long=cu.long(),
+                    H=H,
+                    Hg=Hg,
+                    scale=scale,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    error_note=tri_note,
+                )
 
             row = {
                 "N_seq": N_seq,
@@ -303,10 +341,22 @@ def main() -> int:
                 f"  L_seg={L_seg} H={H}: mega={ms_mega:.2f} ms  separate={ms_sep:.2f} ms{tri_disp}"
             )
 
+            try:
+                gc.collect()
+                torch.npu.synchronize()
+            except RuntimeError as e:
+                note = str(e).split("\n")[0][:120]
+                print(f"    [warn] device sync skipped: {note}")
+
     out = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "device": args.device,
         "N_seq": N_seq,
+        "bench_timer": "perf_counter",
+        "bench_timing_between_iters": (
+            "Host wall clock: sync after cache.zero_; sync; time.perf_counter(); fn(); sync; perf_counter "
+            "(no torch.npu Event). Idle device between trials avoids backlog amortization; includes eager/Python."
+        ),
         "results": results,
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)

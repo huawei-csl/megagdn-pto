@@ -18,12 +18,15 @@ GQA is supported: if ``v.shape[2] > q.shape[2]``, the GQA path is taken.
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 import torch
 from einops import rearrange
 
 from megagdn_pto.fast_inverse import load_tri_inverse, solve_tril
 from megagdn_pto.kernel_libs import (
+    chunk_gdn_causal_masks,
+    run_chunk_cumsum,
     run_chunk_h,
     run_chunk_o,
     run_scaled_dot_kkt,
@@ -35,6 +38,11 @@ from megagdn_pto.kernel_libs import (
 from megagdn_pto.mega_kernel import run_mega_kernel
 
 C_PTO = 128
+
+
+@lru_cache(maxsize=1)
+def _pto_tri_inverse_cached():
+    return load_tri_inverse()
 
 
 # ---------------------------------------------------------------------------
@@ -63,23 +71,6 @@ def _megakernel_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Cumsum (CPU reference, same chunk boundaries as PTO kernels)
-# ---------------------------------------------------------------------------
-
-def _chunk_cumsum(g: torch.Tensor, cu_seqlens: torch.Tensor, chunk_size: int) -> torch.Tensor:
-    """Chunk-local cumulative sum of gates (fp32 → fp32)."""
-    B, T, H = g.shape
-    cu = cu_seqlens.cpu().tolist()
-    out = torch.zeros_like(g, dtype=torch.float32)
-    for i in range(len(cu) - 1):
-        bos, eos = cu[i], cu[i + 1]
-        for j in range(0, eos - bos, chunk_size):
-            s, e = bos + j, min(bos + j + chunk_size, eos)
-            out[:, s:e, :] = g.float()[:, s:e, :].cumsum(dim=1)
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Staged pipeline (6 kernel launches)
 # ---------------------------------------------------------------------------
 
@@ -101,13 +92,18 @@ def _staged_forward(
     N_seq = int(cu32.numel()) - 1
     stream = torch.npu.current_stream()._as_parameter_
 
-    g_sum = _chunk_cumsum(g.float(), cu32, C_PTO)
+    dt, di = dev.type, dev.index if dev.index is not None else -1
+    msk_lower, msk_full = chunk_gdn_causal_masks(dt, di, C_PTO)
+
+    g_sum = torch.empty(1, T, H, device=dev, dtype=torch.float32)
+    run_chunk_cumsum(
+        g.float(), g_sum,
+        stream=stream, chunk_size=C_PTO,
+        cu_seqlens=cu32, batch_size_override=N_seq,
+    )
     g_t = transpose_gates(g_sum)
     beta_t = transpose_beta(beta)
     torch.npu.synchronize()
-
-    msk_lower = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
-    msk_full = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
 
     A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
     with torch.autograd.profiler.record_function("PTO_kkt"):
@@ -117,7 +113,7 @@ def _staged_forward(
     torch.npu.synchronize()
 
     with torch.autograd.profiler.record_function("PTO_solve_tril"):
-        A_inv = solve_tril(A, cu32, C_PTO, H, load_tri_inverse())
+        A_inv = solve_tril(A, cu32, C_PTO, H, _pto_tri_inverse_cached())
     torch.npu.synchronize()
 
     w = torch.empty_like(v)

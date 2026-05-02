@@ -116,12 +116,12 @@ def plot_kernel_stage_stacked(
     xt_pto, xt_t64, xt_t128 = (0.0, 1.0, 2.0)
     width = 0.55
     labels = [
-        "PTO\n(per-stage fused drivers)",
-        "Triton BT=64\n(staged)",
-        "Triton BT=128\n(staged)",
+        "PTO",
+        "Triton (BT=64)",
+        "Triton (BT=128)",
     ]
 
-    fig, ax = plt.subplots(figsize=(10.5, 6.8))
+    fig, ax = plt.subplots(figsize=(11.0, 7.2))
 
     def _column_stack_triton(x_center: float, mode: str) -> tuple[float, bool]:
         """BT=64 / BT=128 stacks: only measured Triton time (or fail hatch scaled to PTO)."""
@@ -153,7 +153,7 @@ def plot_kernel_stage_stacked(
                     "fail",
                     ha="center",
                     va="center",
-                    fontsize=7,
+                    fontsize=9,
                     color="darkred",
                     fontweight="bold",
                     rotation=90,
@@ -195,15 +195,16 @@ def plot_kernel_stage_stacked(
     has_any_triton_gap = gap64 or gap128
 
     ax.set_xticks([xt_pto, xt_t64, xt_t128])
-    ax.set_xticklabels(labels, fontsize=10)
-    ax.set_ylabel("Latency (ms)")
+    ax.set_xticklabels(labels, fontsize=13)
+    ax.set_ylabel("Latency (ms)", fontsize=13)
+    ax.tick_params(axis="y", labelsize=12)
     ax.set_title(
         f"Per-stage kernel time (micro-benchmark) — device / kernel only; "
         f"PyTorch eager launch overhead amortized across iters.\n"
         f"N={n_seq} seqs × L={l_seg} tokens, H={h_value}, Hg={hg}, "
         f"D={int(row.get('D', blob.get('D', 128)))}, "
         f"C_PTO={int(row.get('C_pto', blob.get('C_pto', 128)))}",
-        fontsize=11,
+        fontsize=13,
     )
     ax.grid(axis="y", alpha=0.28)
     ax.set_axisbelow(True)
@@ -232,7 +233,7 @@ def plot_kernel_stage_stacked(
             [m[0] for m in merged] + extra,
             [m[1] for m in merged] + [p.get_label() for p in extra],
             loc="upper left",
-            fontsize=7,
+            fontsize=10,
             ncol=2,
             framealpha=0.92,
         )
@@ -241,7 +242,7 @@ def plot_kernel_stage_stacked(
             [m[0] for m in merged],
             [m[1] for m in merged],
             loc="upper left",
-            fontsize=7,
+            fontsize=10,
             ncol=2,
             framealpha=0.92,
         )
@@ -263,7 +264,10 @@ def plot_pto_pipeline_benefits(
     out_dir: Path,
     outfile: str | None = None,
 ) -> Path | None:
-    """Horizontal bars: PTO megakernel vs staged PTO; optional per-row Triton e2e (BT=64)."""
+    """Horizontal bars: PTO megakernel vs staged PTO; optional per-row Triton e2e (BT=64).
+
+    JSON from ``bench_pto_pipeline_latency.py`` — host ``time.perf_counter`` means (see ``bench_timer``).
+    """
     def _row_separate_ms(r: dict) -> float:
         if "separate_ms" in r:
             return float(r["separate_ms"])
@@ -366,7 +370,11 @@ def plot_pto_pipeline_benefits(
     stamp = blob.get("timestamp")
     dev = blob.get("device")
 
-    title2 = "End-to-end NPU latency (timed forward + sync after each trial; not sum of per-stage microbench)"
+    title2 = (
+        "Wall-clock latency (mean ``time.perf_counter()`` per ``fn()`` on host): "
+        "``torch.npu.synchronize()`` before/after measured region + between trials idle queue — "
+        "includes PyTorch eager / interpreter cost (multi-call **PTO separate** vs one-call **mega**)."
+    )
     if stamp:
         title2 += f" — {stamp}"
     tri_txt = "; Triton: six kernels, chunk size 64, where launches succeed" if any_triton else ""
@@ -379,6 +387,8 @@ def plot_pto_pipeline_benefits(
     footer = f"N_seq={n_seq}, Hg={hg}, C_PTO={cpto}{tri_txt}"
     if dev:
         footer += f", device {dev}"
+    if blob.get("bench_timing_between_iters"):
+        footer += " Timing: host perf_counter ± NPU sync boundaries (idle between trials)."
     footer += "."
 
     ax.text(

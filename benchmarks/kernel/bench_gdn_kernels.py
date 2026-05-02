@@ -9,7 +9,9 @@ PTO always uses chunk_size=128 (C_PTO=128).
 Each Triton stage is timed at both BT=64 and BT=128 where applicable:
   - chunk_cumsum : Triton BT=64 and BT=128 both supported
   - scaled_dot_kkt: Triton BT=64 (default); BT=128 may fail for some H
-  - solve_tril   : Triton BT=64 only (BT=128 not supported by Triton)
+  - solve_tril   : Triton BT=64 only (BT=128 not supported by Triton). PTO time is only
+                   the ``tri_inverse`` ``lib.call_kernel`` launch (buffers + stream ptr
+                   fixed outside the timed region; excludes ``solve_tril`` wrapper and fp16 ``copy_``).
   - wy_fast      : Triton BT=64 and BT=128 both supported
   - chunk_h      : Triton BT=64 and BT=128 both supported
   - chunk_o      : Triton BT=64 (default); BT=128 may fail for H=64
@@ -57,13 +59,14 @@ if _TRITON_BASELINE not in sys.path:
     sys.path.insert(0, _TRITON_BASELINE)
 
 from megagdn_pto.compile import BLOCK_DIM
-from megagdn_pto.fast_inverse import load_tri_inverse, solve_tril
+from megagdn_pto.fast_inverse import launch_tri_inverse_kernel, load_tri_inverse, solve_tril
 from megagdn_pto.kernel_libs import (
     load_chunk_cumsum,
     load_chunk_h,
     load_chunk_o,
     load_scaled_dot_kkt,
     load_wy_fast,
+    precomputed_minus_identity,
     total_chunks,
     transpose_beta,
     transpose_gates,
@@ -322,13 +325,46 @@ def bench_kkt(H, HG, T, cu_seqlens, dev, stream, bd):
 def bench_solve_tril(H, T, cu_seqlens, dev, tri_inv):
     """PTO solve_tril (C=128) vs Triton solve_tril (BT=64; BT=128 unsupported).
 
+    PTO timing uses :func:`megagdn_pto.fast_inverse.launch_tri_inverse_kernel` inside the loop:
+    one ctypes dispatch to ``lib.call_kernel``, with buffers, ``minus_identity``, ``num_matrices``,
+    and ``stream_ptr = torch.npu.current_stream()._as_parameter_`` captured once outside.
+    Does not invoke :func:`~megagdn_pto.fast_inverse.solve_tril` (no tile-count Python sync,
+    no fp32→fp16 ``copy_``). Caller still passes ``tri_inv`` so the DLL is warmed with the rest of the harness.
+
     Note: Ascend rejects launches when NT * H exceeds roughly 65536 (see README).
     Reduce ``L_seg`` (e.g. 8192 for H≤16 full parity; 4096 for H≤32) to benchmark
     the Triton reference without grid overflow.
     """
+    _ = tri_inv  # preload contract shared with staged/mega callers
+
     A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16).tril(-1)
     cu32 = cu_seqlens.to(torch.int32)
-    ms_pto = _bench_npu(lambda: solve_tril(A, cu32, C_PTO, H, tri_inv))
+    workspace_fp32 = torch.zeros_like(A, dtype=torch.float32)
+    batch = int(cu32.numel()) - 1
+    tc = total_chunks(batch, T, C_PTO, cu32)
+    num_matrices = tc * H
+    dty = dev.type
+    dix = dev.index if dev.index is not None else -1
+    minus_identity = precomputed_minus_identity(dty, dix, C_PTO)
+    stream_ptr = torch.npu.current_stream()._as_parameter_
+
+    def run_tri_inverse_kernel():
+        launch_tri_inverse_kernel(
+            workspace_fp32,
+            A,
+            minus_identity,
+            C_PTO,
+            num_matrices,
+            H,
+            cu_seqlens=cu32,
+            block_dim=BLOCK_DIM,
+            stream_ptr=stream_ptr,
+            is_lower=True,
+        )
+
+    run_tri_inverse_kernel()
+    torch.npu.synchronize()
+    ms_pto = _bench_npu(run_tri_inverse_kernel)
     ms_t64 = _try_triton_solve_tril(cu_seqlens, 64, dev, T, H)
     ms_t128 = None  # BT=128 not supported by Triton (max BT=64)
     print(f"    [Triton solve_tril BT=128: not supported (max BT=64)]")
