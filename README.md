@@ -4,47 +4,97 @@ Custom NPU kernels (compiled via [Bisheng](https://gitee.com/ascend/bisheng) JIT
 for the chunk GatedDeltaNet (GDN) recurrent layer, replacing the Triton baseline
 used in [vLLM-Ascend](https://github.com/vllm-project/vllm-ascend).
 
-**Key results** (Ascend NPU, N=16 seqs × L=16384 tokens, D=128, Hg=16, T=262144):
+Kernel micro-benchmarks compare PTO (C=128) to the FLA Triton reference (BT=64/128). **At the long context used in deployment** (N=16 × L=16384, T=262144) the Triton `solve_tril` launch exceeds the Ascend grid ceiling (roughly **NT × H ≤ 65536** program blocks, where **NT ≈ Σᵢ ⌈Lᵢ / 64⌉** over packed sequences), so a full six-stage Triton timing is not available at that scale—use the **shorter-context** tables below for apples-to-apples Triton totals that **include `solve_tril`**.
 
-PTO always uses C=128. Raw data: [`outputs/data/kernel_bench.json`](outputs/data/kernel_bench.json)
+Raw JSON: [`outputs/data/kernel_bench.json`](outputs/data/kernel_bench.json) (**L=16384** large-T profile), [`outputs/data/kernel_bench_L8192.json`](outputs/data/kernel_bench_L8192.json), [`outputs/data/kernel_bench_L4096.json`](outputs/data/kernel_bench_L4096.json).
+
+### Large-context profile (PTO characterization, N=16 × L=16384, Hg=16)
+
+This is the headline **latency** envelope for fused training/inference stacks; several Triton stages are **n/a** (grid blow-up on `solve_tril`, selective BT/H skips).
 
 #### Absolute latency at H=16 (Hg=16)
 
-| Stage | PTO C=128 (ms) | Triton BT=64 (ms) | Triton BT=128 (ms) | Speedup vs BT=64 |
-|-------|---------------:|------------------:|-------------------:|:----------------:|
+| Stage | PTO C=128 (ms) | Triton BT=64 (ms) | Triton BT=128 (ms) | Speedup vs BT=64 \(^{\*}\) |
+|-------|---------------:|------------------:|-------------------:|:---------------------------:|
 | chunk_cumsum   |  0.32 |  1.00 |  1.07 | **3.1×** |
-| scaled_dot_kkt |  4.62 |  4.09 |   n/a ³| 0.89× ⁵ |
-| solve_tril     | 20.60 |   n/a ¹|   n/a ¹| n/a ¹ |
+| scaled_dot_kkt |  4.62 |  4.09 |   n/a ᵇ| 0.89× ᵍ |
+| solve_tril     | 20.60 | n/a ᵃ | n/a ᵃ | n/a ᵃ |
 | wy_fast        |  6.94 | 23.37 | 11.90 | **3.4×** |
 | chunk_h        |  9.63 | 30.81 | 15.54 | **3.2×** |
-| chunk_o        | 11.39 | 16.14 |   n/a ³| **1.4×** |
-| **total (excl. solve\_tril)** | **32.90** | **75.41** | — | **2.3×** |
+| chunk_o        | 11.39 | 16.14 |   n/a ᵇ| **1.4×** |
+| **Sum of runnable Triton BT=64 stages (excl. solve\_tril)** | **32.90** | **75.41** | — | **2.3×** |
 | **Megakernel** (all 6 fused)  | **54.6** | — | — | **4.5× vs staged PTO** |
 
-#### Speedup across head counts (PTO vs Triton BT=64, with BT=128 in parentheses)
+#### Speedup across head counts (PTO vs Triton BT=64, BT=128 in parentheses)
 
 | Stage | H=16 | H=32 | H=48 | H=64 |
 |-------|:----:|:----:|:----:|:----:|
-| chunk_cumsum   | 3.1× (3.4×) | 3.1× (n/a ²) | 2.4× (n/a ²) | 5.2× (n/a ²) |
-| scaled_dot_kkt | 0.89× (n/a ³) | 0.81× (n/a ³) | 0.82× (n/a ³) | 0.80× (n/a ³) |
-| solve_tril     | n/a ¹ | n/a ¹ | n/a ¹ | n/a ¹ |
+| chunk_cumsum   | 3.1× (3.4×) | 3.1× (n/a ᶜ) | 2.4× (n/a ᶜ) | 5.2× (n/a ᶜ) |
+| scaled_dot_kkt | 0.89× (n/a ᵇ) | 0.81× (n/a ᵇ) | 0.82× (n/a ᵇ) | 0.80× (n/a ᵇ) |
+| solve_tril     | n/a ᵃ | n/a ᵃ | n/a ᵃ | n/a ᵃ |
 | wy_fast        | 3.4× (1.7×) | 3.5× (1.8×) | 3.3× (1.7×) | 3.5× (1.8×) |
-| chunk_h        | 3.2× (1.6×) | 3.0× (1.5×) | 3.0× (1.5×) | n/a ⁴ (1.5×) |
-| chunk_o        | 1.4× (n/a ³) | 1.4× (n/a ³) | 1.4× (n/a ³) | n/a ⁴ |
+| chunk_h        | 3.2× (1.6×) | 3.0× (1.5×) | 3.0× (1.5×) | n/a ᵉ (1.5×) |
+| chunk_o        | 1.4× (n/a ᵇ) | 1.4× (n/a ᵇ) | 1.4× (n/a ᵇ) | n/a ᵉ |
 | **Megakernel** | **4.5×** | **2.8×** | **2.2×** | **1.9×** |
 
-Megakernel speedup is vs staged PTO (individual kernel calls with synchronization).
+\(*\) Ratio **Triton ms / PTO ms** (>1 ⇒ PTO is faster on wall-clock for that stage).  
+ᵃ **`solve_tril`:** Ascend rejects the FLA merge grid when roughly **NT × H > 65536**—always true here at L=16384 (NT≈4096 ⇒ only fictitious tiny H fits).  
+ᵇ BT=128 kernel build fails on `scaled_dot_kkt` / `chunk_o` for this configuration (see upstream FLA shards).  
+ᶜ Triton `chunk_cumsum` BT=128 compile fails once H≥32 under this toolchain.  
+ᵉ Triton BT=64 on `chunk_h` / `chunk_o` at H=64 hits a known aicore fault; BT=128 is still benchmarked where it compiles.  
+ᵍ `scaled_dot_kkt`: GQA-aware Triton baseline ~4.1 ms consistent with upstream notes; legacy path ~4.8 ms would inflate the apparent ratio.
 
-¹ Triton `solve_tril` requires Triton grid ≤ 65536; fails at T=262144 tokens. PTO has no such limit.  
-² Triton `chunk_cumsum` BT=128 compilation fails for H ≥ 32.  
-³ Triton BT=128 compilation fails for `scaled_dot_kkt` and `chunk_o` on this configuration.  
-⁴ Triton BT=64 triggers an aicore exception for H=64 (known NPU incompatibility); PTO works fine.  
-⁵ `scaled_dot_kkt` uses the GQA-capable Triton kernel (`chunk_scaled_dot_kkt_fwd` with `chunk_indices`),
-  which benchmarks at ~4.1 ms for H=Hg=16 — consistent with `dynamic_bsnd_groupvalue/README.md` (4.08 ms).
-  The non-GQA `dynamic_bsnd` reference shows 4.84 ms for the same shape because it uses a different Triton
-  code path, making that speedup appear as 1.04×. PTO KKT performance (~4.6 ms) is the same in both cases.
+Megakernel speedup is staged-PTO latency / megakernel latency (fuse benefit).
 
-vLLM prefill TTFT speedup (megakernel vs Triton, all 4 models): **1.07–1.25×** depending on model and prompt length.
+---
+
+### Triton-inclusive reference (**N=16 × L=8192**, **T=131072**, Hg=16)
+
+Lowering **L_seg** shrinks **NT** so the merge-kernel launch fits the **≈65536** block budget. With **L=8192**, **NT ≈ 2048** and **solve_tril** timings are recorded cleanly for **H=16**; **H=32** sits at the **2048 × H = 65536** edge (and is left **n/a** in our L=8192 JSON), so **use L=4096** below when you need comparable **H=32** six-stage Triton numbers.
+
+#### All six stages plus pipeline totals (**H=16**)
+
+| Stage | PTO C=128 (ms) | Triton BT=64 (ms) | Triton BT=128 (ms) | Speedup vs BT=64 \(^{\*}\) |
+|-------|---------------:|------------------:|-------------------:|:--------------------------:|
+| chunk_cumsum   | 0.16 | 1.22 | 1.04 | **7.5×** |
+| scaled_dot_kkt | 2.32 | 2.23 | n/a ᵇ| 0.96× ᵍ |
+| **solve\_tril** | **10.31** | **12.62** | n/a | **1.2×** |
+| wy_fast        | 3.50 | 11.89 | 6.16 | **3.4×** |
+| chunk_h        | 5.09 | 15.60 | 8.10 | **3.1×** |
+| chunk_o        | 5.59 | 8.48 | n/a ᵇ| **1.5×** |
+| **Sum (PTO staged path, all six stages)** | **26.98** | **52.04** | — | **1.93×** |
+| **Megakernel** (fused six) | **27.42** | — | — | **4.15× vs staged PTO** |
+
+#### Speedups vs Triton BT=64 (**L=8192**, BT=128 in parentheses where available)
+
+| Stage | H=16 | H=32 | H=48 | H=64 |
+|-------|:----:|:----:|:----:|:----:|
+| chunk_cumsum   | **7.5×** (**6.4×**) | 5.6× (n/a ᶜ) | 4.4× (n/a ᶜ) | 6.9× (n/a ᶜ) |
+| scaled_dot_kkt | 0.96× (n/a ᵇ) | 0.84× (n/a ᵇ) | 0.90× (n/a ᵇ) | 0.81× (n/a ᵇ) |
+| solve_tril | **1.2×** | n/a ᶠ | n/a ᶠ | n/a ᶠ |
+| wy_fast | 3.4× (**1.8×**) | **3.5×** (**1.8×**) | 3.3× (**1.7×**) | **3.5×** (**1.8×**) |
+| chunk_h | **3.1×** (**1.6×**) | **3.0×** (**1.5×**) | **3.2×** (**1.6×**) | n/a ᵉ (**1.5×**) |
+| chunk_o | **1.5×** (n/a ᵇ) | **1.5×** (n/a ᵇ) | **1.4×** (n/a ᵇ) | n/a ᵉ (n/a ᵇ) |
+| Megakernel | **4.15×** | **2.6×** | **2.1×** | **1.8×** |
+
+ᶠ At **L=8192**, **NT ≈ 2048** and **NT × H** exceeds the **65536** grid cap once **H > 16**, so the Triton `solve_tril` timer is skipped even though other stages still run.
+
+---
+
+### Shorter context when **H=32** must include Triton `solve_tril` (**N=16 × L=4096**, **T=65536**)
+
+Here **NT ≈ 1024**, so **NT × 32 = 32768** stays inside the grid budget and all six Triton BT=64 stages are measurable for **H∈{16, 32}** (raw file: `kernel_bench_L4096.json`).
+
+| Case | PTO sum (6 stages) | Triton BT=64 sum (6 stages) | Speedup \(^{\*}\) | Megakernel (ms) | Megakernel vs staged |
+|------|-------------------:|----------------------------:|:-----------------:|----------------:|---------------------:|
+| **H=16** | **13.42** | **28.09** | **2.09×** | 14.09 | **4.41×** |
+| **H=32** | **26.74** | **51.74** | **1.94×** | 27.37 | **2.69×** |
+
+Per-stage latencies (**H=16**, **L=4096**): cumsum 0.10 / 1.00; KKT 1.17 / 1.36; **solve\_tril 5.29 / 7.10**; wy\_fast 1.77 / 6.08; chunk\_h 2.58 / 7.98; chunk\_o 2.50 / 4.58 (ms, PTO / Triton BT=64).
+
+---
+
+**Key results** — see tables above. vLLM prefill TTFT speedup (megakernel vs Triton, all 4 models): **1.07–1.25×** depending on model and prompt length.
 
 Accuracy (lm-eval, wikitext 256-doc subset, MMLU 6-subject subset):
 
@@ -198,14 +248,25 @@ Expected output: `ALL PASS` for every test case.
 ### 2 – Kernel benchmarks
 
 ```bash
+# Default profile (matches kernel_bench.json): N_seq=16, L_seg=16384
 GDN_NPU_DEVICE=npu:0 python benchmarks/kernel/bench_gdn_kernels.py \
     --device npu:0 --H-list 16,32,48,64 --mega \
     --output-json outputs/data/kernel_bench.json
+
+# Shorter contexts for Triton solve_tril parity (CLI overrides env):
+GDN_NPU_DEVICE=npu:0 python benchmarks/kernel/bench_gdn_kernels.py \
+    --device npu:0 --n-seq 16 --l-seg 8192 --H-list 16,32,48,64 --mega \
+    --output-json outputs/data/kernel_bench_L8192.json
+GDN_NPU_DEVICE=npu:0 python benchmarks/kernel/bench_gdn_kernels.py \
+    --device npu:0 --n-seq 16 --l-seg 4096 --H-list 16,32 --mega \
+    --output-json outputs/data/kernel_bench_L4096.json
 ```
 
 > **Triton notes:**
 > - `chunk_o` with H=64, BT=64 is a known Triton failure (aicore exception); the
 >   script skips it and marks it "fail".
+> - **`solve_tril`** needs **≈ NT × H ≤ 65536** Ascend blocks; reduce `--l-seg` until
+>   the merge grid launches (README tables use **8192 / 4096**).
 > - PTO always uses `chunk_size=128`; Triton defaults to `BT=64`.
 
 ### 3 – vLLM-Ascend patch (one-time)

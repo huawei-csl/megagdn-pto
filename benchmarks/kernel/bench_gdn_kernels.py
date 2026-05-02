@@ -22,12 +22,18 @@ Usage::
     python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --H-list 32,64
     python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --mega
     python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --mega \\
-        --output-json outputs/data/kernel_bench.json
+        --l-seg 8192 --output-json outputs/data/kernel_bench_L8192.json
 
-Environment:
+Environment (``--n-seq`` / ``--l-seg`` override these when passed):
     GDN_NPU_DEVICE    Default NPU device (default: npu:0)
     GDN_BENCH_N_SEQ   Number of sequences (default: 16)
     GDN_BENCH_L_SEG   Tokens per sequence (default: 16384)
+
+    Large ``T = N_seq * L_seg`` makes the Triton ``solve_tril`` launch exceed the
+    Ascend runtime grid limit (≤65536 blocks for ``NT × H``, where NT is roughly
+    the total number of 64-token blocks across sequences). Prefer ``--l-seg 8192``
+    (Triton parity for smaller H; see README) or ``--l-seg 4096`` when you need a
+    larger head count together with all six Triton stages.
 """
 
 from __future__ import annotations
@@ -162,9 +168,8 @@ def _try_triton_solve_tril(cu_seqlens, BT, dev, T, H) -> float | None:
     if BT > 64:
         print(f"    [Triton solve_tril BT={BT}: not supported by Triton (max BT=64)]")
         return None
-    # Triton solve_tril requires grid ≤ 65536; with T=262144 it always exceeds this
-    # limit regardless of H.  Do NOT set TRITON_ALL_BLOCKS_PARALLEL here — doing so
-    # corrupts subsequent Triton benchmark timings via a global env change.
+    # Triton solve_tril requires NT * H ≤ ~65536 (NT ≈ Σ ceil(Lᵢ / BT) merge chunks).
+    # Do NOT set TRITON_ALL_BLOCKS_PARALLEL here — it corrupts later Triton timings.
     try:
         from fla_vendor.solve_tril import solve_tril as triton_solve_tril
         cu_long = cu_seqlens.long()
@@ -175,7 +180,7 @@ def _try_triton_solve_tril(cu_seqlens, BT, dev, T, H) -> float | None:
     except Exception as exc:
         msg = str(exc).split(chr(10))[0][:80]
         if "grid" in msg or "65536" in msg:
-            print(f"    [Triton solve_tril BT={BT}: grid > 65536 (T={T} too large)]")
+            print(f"    [Triton solve_tril BT={BT}: grid exceeds 65536 (T={T}, H too large for this L_seg)]")
         else:
             print(f"    [Triton solve_tril BT={BT}: {msg}]")
         gc.collect()
@@ -317,9 +322,9 @@ def bench_kkt(H, HG, T, cu_seqlens, dev, stream, bd):
 def bench_solve_tril(H, T, cu_seqlens, dev, tri_inv):
     """PTO solve_tril (C=128) vs Triton solve_tril (BT=64; BT=128 unsupported).
 
-    Note: Triton solve_tril requires Triton grid ≤ 65536.  With the default
-    workload (T = N_seq × L_seg = 262144) every H value exceeds this limit,
-    so the Triton baseline is always reported as n/a for this workload.
+    Note: Ascend rejects launches when NT * H exceeds roughly 65536 (see README).
+    Reduce ``L_seg`` (e.g. 8192 for H≤16 full parity; 4096 for H≤32) to benchmark
+    the Triton reference without grid overflow.
     """
     A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16).tril(-1)
     cu32 = cu_seqlens.to(torch.int32)
@@ -502,6 +507,10 @@ def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default=os.getenv("GDN_NPU_DEVICE", "npu:0"))
+    parser.add_argument("--n-seq", type=int, default=None,
+                        help="Sequences in batch (default: GDN_BENCH_N_SEQ or 16).")
+    parser.add_argument("--l-seg", type=int, default=None,
+                        help="Tokens per sequence before concat (default: GDN_BENCH_L_SEG or 16384).")
     parser.add_argument("--H-list", default="16,32,48,64",
                         help="Comma-separated value head counts H.")
     parser.add_argument("--hg", type=int, default=16, help="Key head count Hg.")
@@ -518,8 +527,10 @@ def main() -> None:
     dev = torch.device(args.device)
     stream = torch.npu.current_stream()._as_parameter_
 
-    N_seq = int(os.getenv("GDN_BENCH_N_SEQ", "16"))
-    L_seg = int(os.getenv("GDN_BENCH_L_SEG", "16384"))
+    env_n = int(os.getenv("GDN_BENCH_N_SEQ", "16"))
+    env_l = int(os.getenv("GDN_BENCH_L_SEG", "16384"))
+    N_seq = args.n_seq if args.n_seq is not None else env_n
+    L_seg = args.l_seg if args.l_seg is not None else env_l
     T = N_seq * L_seg
     cu_seqlens = torch.arange(0, T + 1, L_seg, dtype=torch.int32, device=dev)
     tc = total_chunks(N_seq, T, C_PTO, cu_seqlens)
