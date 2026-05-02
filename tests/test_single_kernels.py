@@ -410,12 +410,17 @@ def test_solve_tril(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     cu = torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev) if tc.cu_seqlens_list else None
     torch.manual_seed(42)
     # Build A lower-triangular in the (time-within-chunk × chunk-col) space.
-    # All test-case boundaries are chunk-aligned (ensured by _align_cu), so
-    # position-within-chunk = t % C for every t.
+    # Position-within-chunk = (t - bos) % C for each sequence starting at bos.
+    # This handles non-chunk-aligned sequence starts correctly.
     # Use std=0.1 to keep (I+A)^{-1} well-conditioned in fp16.
-    t_pos = torch.arange(T) % C
-    c_pos = torch.arange(C)
-    chunk_mask = (t_pos[:, None] > c_pos[None, :]).float()  # [T, C]
+    t_within = torch.zeros(T, dtype=torch.long)
+    if tc.cu_seqlens_list is not None:
+        for i in range(len(tc.cu_seqlens_list) - 1):
+            bos, eos = tc.cu_seqlens_list[i], tc.cu_seqlens_list[i + 1]
+            t_within[bos:eos] = torch.arange(eos - bos) % C
+    else:
+        t_within = torch.arange(T) % C
+    chunk_mask = (t_within[:, None] > torch.arange(C)[None, :]).float()  # [T, C]
     A_raw = torch.randn(1, T, H, C) * 0.1 * chunk_mask[None, :, None, :]
     A = A_raw.to(torch.float16).to(dev)
     tri_inv = load_tri_inverse()
