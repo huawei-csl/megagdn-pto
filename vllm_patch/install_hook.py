@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Apply in-source edits to the installed vllm-ascend package for PTO hook support.
 
-This script patches three files inside the installed ``vllm_ascend`` package:
+The script is **idempotent**. After running once, set ``VLLM_PTO_PATCH_DIR`` at
+runtime to activate the PTO patch.
+
+**v0.18 (and similar layouts):** patches three files under ``vllm_ascend``:
 
 1. ``patch/worker/__init__.py`` — injects an early hook that calls
-   ``apply_pto_patch()`` when ``VLLM_PTO_PATCH_DIR`` is set, before any Qwen
-   model patch imports ``chunk_gated_delta_rule``.
+   ``apply_pto_patch()`` when ``VLLM_PTO_PATCH_DIR`` is set, after Triton
+   patches load and before Qwen worker modules import ``chunk_gated_delta_rule``.
 
 2. ``patch/worker/patch_qwen3_5.py`` — switches from a static import to a
-   dynamic attribute lookup so monkey-patches on ``vllm.model_executor.layers.fla.ops``
-   take effect at call time.
+   dynamic ``fla_ops`` lookup so monkey-patches take effect at call time.
 
-3. ``patch/worker/patch_qwen3_next.py`` — same fix as above for the MoE model.
+3. ``patch/worker/patch_qwen3_next.py`` — same for the MoE / Next path.
 
-The script is **idempotent**: run it multiple times safely. After running once,
-just set ``VLLM_PTO_PATCH_DIR`` in the environment to activate the PTO patch.
+**v0.19+:** the worker hook is unchanged. Qwen patch files may be missing or no
+longer import ``chunk_gated_delta_rule`` (GDN prefill uses ``vllm_ascend.ops.gdn``);
+``install_hook.py`` skips those edits. Runtime routing is handled in
+``apply.py`` (patches ``vllm.model_executor.layers.fla.ops`` and
+``vllm_ascend.ops.triton.fla.chunk``).
 
 Usage::
 
@@ -149,14 +154,21 @@ def main() -> int:
                 target.write_text(new_text, "utf-8")
                 print(f"OK: worker hook written → {target}")
 
-    # 2. Qwen model patches
+    # 2. Qwen model patches (v0.18: static ``chunk_gated_delta_rule`` import in these files;
+    # v0.19+: GDN uses ``vllm_ascend.ops.gdn`` + ``apply_pto_patch`` on the Ascend chunk module.)
     if not args.skip_qwen_patch:
         for name in ("patch_qwen3_5.py", "patch_qwen3_next.py"):
             p = root / "patch" / "worker" / name
             if not p.is_file():
-                print(f"ERROR: {p} not found", file=sys.stderr)
-                return 4
-            new_text = _patch_qwen_file(p.read_text("utf-8"), path=p)
+                print(f"SKIP (not present): {p}")
+                continue
+            try:
+                new_text = _patch_qwen_file(p.read_text("utf-8"), path=p)
+            except RuntimeError as exc:
+                if "expected import not found" in str(exc):
+                    print(f"SKIP (layout differs): {p} — {exc}")
+                    continue
+                raise
             if new_text is None:
                 print(f"OK (already applied): {p}")
             elif args.dry_run:

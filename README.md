@@ -169,10 +169,11 @@ megagdn-pto/
 
 ## Environment
 
-Use the pre-built Docker image that ships vLLM-Ascend and Triton:
+Use a pre-built Docker image that ships vLLM-Ascend and Triton, for example:
 
 ```bash
-docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1
+docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1   # reference image used in original benchmarks
+docker pull quay.io/ascend/vllm-ascend:v0.19.1rc1   # also supported (see **vLLM-Ascend version differences** below)
 ```
 
 The C++ kernels depend on **pto-isa** header-only library, included here as a git
@@ -272,13 +273,44 @@ GDN_NPU_DEVICE=npu:0 python benchmarks/kernel/bench_gdn_kernels.py \
 
 ### 3 – vLLM-Ascend patch (one-time)
 
-Apply in-source hooks to the installed vllm-ascend package:
+Apply in-source hooks to the **installed** `vllm-ascend` tree (editable install or
+image copy):
 
 ```bash
 python vllm_patch/install_hook.py
+# or, if you have multiple trees:
+python vllm_patch/install_hook.py --vllm-ascend-root /path/to/vllm_ascend
 ```
 
-This is idempotent; run again if vllm-ascend is re-installed.
+This is idempotent; run again after re-installing `vllm-ascend`.
+
+Verify without writing files:
+
+```bash
+python vllm_patch/install_hook.py --dry-run --vllm-ascend-root /path/to/vllm_ascend
+```
+
+For **v0.18**, expect: worker hook + patches to `patch_qwen3_5.py` and
+`patch_qwen3_next.py`. For **v0.19+**, expect: worker hook only; Qwen files may
+show `SKIP (layout differs)` or `SKIP (not present)` — that is normal.
+
+#### vLLM-Ascend version differences (0.18 vs 0.19+)
+
+| Topic | v0.18.x (e.g. `v0.18.0rc1`) | v0.19.x (e.g. `v0.19.1rc1`) |
+|-------|---------------------------|-----------------------------|
+| Worker hook | Injected after `patch_v2.patch_triton`, before `# isort: off` | Same anchor in `patch/worker/__init__.py` |
+| Qwen source edits | `install_hook.py` rewrites `patch_qwen3_5.py` / `patch_qwen3_next.py` so `chunk_gated_delta_rule` is resolved via `fla_ops` at call time | Often **skipped**: `patch_qwen3_next.py` may be absent; `patch_qwen3_5.py` may no longer import `chunk_gated_delta_rule` |
+| Where GDN prefill calls the kernel | Primarily through `vllm.model_executor.layers.fla.ops` after `patch_triton` | Also `vllm_ascend.ops.gdn`, which imports `chunk_gated_delta_rule` from `vllm_ascend.ops.triton.fla.chunk` |
+| `apply.py` | Must patch `fla_ops`; patching `_ascend_chunk_mod` is redundant but safe | **Required** to patch both `fla_ops` and `vllm_ascend.ops.triton.fla.chunk` so workers see PTO; optionally refresh `vllm_ascend.ops.gdn` if already imported |
+
+Backward compatibility: `vllm_patch/apply.py` keeps v0.18 behavior (replacing
+`fla_ops.chunk_gated_delta_rule`) and adds v0.19 routing on the Ascend chunk
+module. One `install_hook.py` + `apply.py` pair works for both lines.
+
+**Benchmarks / lm-eval:** relative prefill TTFT versus Triton and small lm-eval
+registry differences may change between minor vLLM-Ascend versions; see
+`benchmarks/eval_acc/run_lm_eval.py` (Qwen3.5 dense no longer uses a forced
+`Qwen3Config` shim on 0.19).
 
 ### 4 – Prefill TTFT benchmark
 
@@ -376,26 +408,43 @@ warnings are safe to ignore.
 Using Triton/FLA GDN prefill kernel
 ```
 
-This line comes from the patched `patch_qwen3_5.py`/`patch_qwen3_next.py`
-before the PTO override is applied. Even for `pto_mega`, the PTO megakernel
-subsequently replaces the Triton function at runtime. The log line is an
-artefact of the patch ordering and does not mean Triton is being used.
+This line is emitted when the **original** Qwen/GDN worker code runs, before
+`apply_pto_patch()` replaces `chunk_gated_delta_rule`. On **v0.18** it may
+follow the `patch_qwen3_5` / `patch_qwen3_next` import path; on **v0.19+** it
+often originates from `gdn_linear_attn` while the Ascend `chunk` module has
+already been patched. In all cases, when `VLLM_PTO_PATCH_DIR` is set and the
+worker hook succeeded, PTO (or the megakernel) is what executes for the GDN
+prefill chunk.
 
 ---
 
 ## How the PTO patch works
 
-`vllm_patch/install_hook.py` makes two in-source edits to the installed
-`vllm_ascend` package (idempotent, safe to re-run):
+`vllm_patch/install_hook.py` edits the installed `vllm_ascend` package
+(idempotent):
 
-1. Injects an early hook in `patch/worker/__init__.py` that calls
-   `apply_pto_patch()` when `VLLM_PTO_PATCH_DIR` is set.
-2. Patches `patch_qwen3_5.py` and `patch_qwen3_next.py` to look up
-   `chunk_gated_delta_rule` dynamically via `fla_ops.*` rather than a cached
-   static import, so the monkey-patch takes effect.
+1. **Worker hook** in `patch/worker/__init__.py`: after `patch_triton` / `patch_v2.patch_triton`
+   load, if `VLLM_PTO_PATCH_DIR` is set, calls `apply_pto_patch()` from this
+   repo’s `vllm_patch/apply.py` **before** the long `# isort: off` import list
+   (so later imports see the swapped kernel).
 
-At runtime, setting `VLLM_PTO_PATCH_DIR=/path/to/vllm_patch` activates PTO.
-Setting `VLLM_PTO_MEGAKERNEL=1` additionally enables the fused megakernel.
+2. **Qwen worker files** (`patch_qwen3_5.py`, `patch_qwen3_next.py`): on **v0.18**
+   layouts, replaces static `from ... chunk_gated_delta_rule` imports with
+   `_vllm_fla_ops.chunk_gated_delta_rule` so runtime monkey-patches apply. On
+   **v0.19+**, these edits are often skipped automatically (see table above).
+
+At runtime, `vllm_patch/apply.py` binds PTO to:
+
+- `vllm.model_executor.layers.fla.ops.chunk_gated_delta_rule` (all versions), and  
+- `vllm_ascend.ops.triton.fla.chunk.chunk_gated_delta_rule` (**required** for
+  v0.19+ `ops.gdn` prefill; **harmless** on v0.18 where prefill still goes through
+  `fla_ops` after `patch_triton`).
+
+If `vllm_ascend.ops.gdn` was imported before the hook runs, `apply.py` also
+refreshes that module’s bound name.
+
+Then set `VLLM_PTO_PATCH_DIR=/path/to/vllm_patch`. For the fused megakernel, add
+`VLLM_PTO_MEGAKERNEL=1`.
 
 ---
 
