@@ -77,11 +77,14 @@ _PRESETS: dict[str, ModelPreset] = {
 
 
 def _autoconfig_patch(model_path: str):
-    """Workaround for local Qwen3.6 checkpoints with unregistered model types."""
+    """Workaround for local Qwen3 MoE checkpoints that need a synthetic HF config.
+
+    Qwen3.5 **dense** checkpoints are left untouched so vLLM uses ``Qwen3_5ForConditionalGeneration``
+    (coercing ``text_config`` into ``Qwen3Config`` breaks vLLM 0.19 weight loading under lm-eval).
+    """
     import json as _json
     from pathlib import Path as _Path
     from transformers.models.auto.configuration_auto import AutoConfig
-    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
     from transformers.models.qwen3_moe import Qwen3MoeConfig
 
     cfg_file = _Path(model_path) / "config.json"
@@ -89,14 +92,14 @@ def _autoconfig_patch(model_path: str):
         return lambda: None
     meta = _json.loads(cfg_file.read_text())
     mt = meta.get("model_type")
+    # Qwen3.5 dense: vLLM 0.18+ expects the real HF config (Qwen3_5ForConditionalGeneration).
+    # Forcing Qwen3Config from text_config made vLLM pick Qwen3Model + pooling and broke weights.
+    if mt == "qwen3_5":
+        return lambda: None
     if mt == "qwen3_5_moe":
         def _build():
             tc = dict(meta.get("text_config") or {}); tc["model_type"] = "qwen3_moe"
             return Qwen3MoeConfig(**tc)
-    elif mt == "qwen3_5":
-        def _build():
-            tc = dict(meta.get("text_config") or {}); tc["model_type"] = "qwen3"
-            return Qwen3Config(**tc)
     else:
         return lambda: None
 
