@@ -160,7 +160,7 @@ megagdn-pto/
 │   └── plot_results.py         # Generate figures from benchmark outputs
 ├── outputs/
 │   ├── data/                   # Raw benchmark results (JSON / JSONL)
-│   └── figure/                 # PDF plots
+│   └── figure/                 # PNG plots (scripts/plot_results.py)
 └── third_party/
     └── pto-isa/                # Git submodule: Ascend PTO ISA headers
 ```
@@ -292,6 +292,8 @@ python benchmarks/vllm_prefill/benchmark_prefill.py \
 bash benchmarks/vllm_prefill/run_prefill_sweep.sh
 ```
 
+> **`run_prefill_sweep.sh`** shortens some runs: **9B** stops at **32768** tokens; **Triton** skips **65536** only for **`qwen36_27b_w8a8`** (known device failure), while **0.8B** and **35B** still measure Triton through **65536**.
+
 ### 5 – Accuracy evaluation (lm-eval)
 
 Requires `lm-eval` — install with `pip install -e '.[eval]'` first.
@@ -318,7 +320,17 @@ WIKITEXT_LIMIT=0 bash benchmarks/eval_acc/run_eval_suite.sh
 
 ### 6 – Plot results
 
+PNG figures are written to `outputs/figure/`: prefill curves (`prefill_*.png`),
+eval bars (`eval_accuracy.png`), and optionally a **stacked per-stage kernel latency**
+chart from `bench_gdn_kernels.py` JSON (PTO megakernel vs PTO six stages vs Triton):
+
 ```bash
+# Stacked bar chart (one workload / H row per invocation)
+python scripts/plot_results.py \
+    --kernel-stage-json outputs/data/kernel_bench_L8192.json \
+    --kernel-stage-h 16 \
+    --kernel-stage-out kernel_stages_N16_L8192_H16.png
+
 # Auto-detect latest prefill + eval results
 python scripts/plot_results.py --auto
 
@@ -328,7 +340,7 @@ python scripts/plot_results.py \
     --eval-dir    outputs/data/eval_<stamp>
 ```
 
-Figures are saved under `outputs/figure/`.
+Figures are saved under `outputs/figure/` as **PNG** (`prefill_<model>.png`, `eval_accuracy.png`, and `kernel_stages_*.png` from `--kernel-stage-json`).
 
 ---
 

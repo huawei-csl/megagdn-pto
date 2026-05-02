@@ -131,7 +131,6 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
     g_sum = ref_cumsum(g_in.cpu(), C_PTO, cu_cpu).to(dev)
     g_t = transpose_gates(g_sum)
     beta_t = transpose_beta(beta)
-    torch.npu.synchronize()
 
     # 2. scaled_dot_kkt
     msk_lower = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
@@ -139,11 +138,9 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
     run_scaled_dot_kkt(k, beta, g_sum, msk_lower, A,
                        stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                        cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
-    torch.npu.synchronize()
 
     # 3. solve_tril
     A_inv = solve_tril(A, cu32, C_PTO, H, tri_inv_func)
-    torch.npu.synchronize()
 
     # 4. wy_fast
     w = torch.empty_like(v)
@@ -151,7 +148,6 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
     run_wy_fast(k, v, beta, g_sum, A_inv, w, u,
                 stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                 cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
-    torch.npu.synchronize()
 
     # 5. chunk_h
     tc_n = total_chunks(N_seq, T, C_PTO, cu32)
@@ -161,7 +157,6 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
     run_chunk_h(k, w, u, g_sum, s, v_new, fs,
                 stream=stream, g_t=g_t, chunk_size=C_PTO,
                 cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
-    torch.npu.synchronize()
 
     # 6. chunk_o
     msk_full = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
@@ -169,7 +164,6 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
     run_chunk_o(q, k, v_new, s, g_sum, msk_full, o,
                 stream=stream, g_t=g_t, chunk_size=C_PTO,
                 cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
-    torch.npu.synchronize()
 
     return (o * scale).to(q.dtype)
 
