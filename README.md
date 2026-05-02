@@ -4,27 +4,45 @@ Custom NPU kernels (compiled via [Bisheng](https://gitee.com/ascend/bisheng) JIT
 for the chunk GatedDeltaNet (GDN) recurrent layer, replacing the Triton baseline
 used in [vLLM-Ascend](https://github.com/vllm-project/vllm-ascend).
 
-**Key results** (Ascend NPU, N=16 seqs × L=16384 tokens, D=128, Hg=16):
+**Key results** (Ascend NPU, N=16 seqs × L=16384 tokens, D=128, Hg=16, T=262144):
 
-PTO always uses C=128. Speedup format: `BT=64 (BT=128)` — n/a means Triton fails or is not supported.
-Raw data: [`outputs/data/kernel_bench.json`](outputs/data/kernel_bench.json)
+PTO always uses C=128. Raw data: [`outputs/data/kernel_bench.json`](outputs/data/kernel_bench.json)
+
+#### Absolute latency at H=16 (Hg=16)
+
+| Stage | PTO C=128 (ms) | Triton BT=64 (ms) | Triton BT=128 (ms) | Speedup vs BT=64 |
+|-------|---------------:|------------------:|-------------------:|:----------------:|
+| chunk_cumsum   |  0.32 |  1.00 |  1.07 | **3.1×** |
+| scaled_dot_kkt |  4.62 |  4.09 |   n/a ³| 0.89× ⁵ |
+| solve_tril     | 20.60 |   n/a ¹|   n/a ¹| n/a ¹ |
+| wy_fast        |  6.94 | 23.37 | 11.90 | **3.4×** |
+| chunk_h        |  9.63 | 30.81 | 15.54 | **3.2×** |
+| chunk_o        | 11.39 | 16.14 |   n/a ³| **1.4×** |
+| **total (excl. solve\_tril)** | **32.90** | **75.41** | — | **2.3×** |
+| **Megakernel** (all 6 fused)  | **54.6** | — | — | **4.5× vs staged PTO** |
+
+#### Speedup across head counts (PTO vs Triton BT=64, with BT=128 in parentheses)
 
 | Stage | H=16 | H=32 | H=48 | H=64 |
-|-------|------|------|------|------|
+|-------|:----:|:----:|:----:|:----:|
 | chunk_cumsum   | 3.1× (3.4×) | 3.1× (n/a ²) | 2.4× (n/a ²) | 5.2× (n/a ²) |
 | scaled_dot_kkt | 0.89× (n/a ³) | 0.81× (n/a ³) | 0.82× (n/a ³) | 0.80× (n/a ³) |
 | solve_tril     | n/a ¹ | n/a ¹ | n/a ¹ | n/a ¹ |
 | wy_fast        | 3.4× (1.7×) | 3.5× (1.8×) | 3.3× (1.7×) | 3.5× (1.8×) |
 | chunk_h        | 3.2× (1.6×) | 3.0× (1.5×) | 3.0× (1.5×) | n/a ⁴ (1.5×) |
 | chunk_o        | 1.4× (n/a ³) | 1.4× (n/a ³) | 1.4× (n/a ³) | n/a ⁴ |
-| **Megakernel** (6 stages fused) | **4.5×** | **2.8×** | **2.2×** | **1.9×** |
+| **Megakernel** | **4.5×** | **2.8×** | **2.2×** | **1.9×** |
 
 Megakernel speedup is vs staged PTO (individual kernel calls with synchronization).
 
 ¹ Triton `solve_tril` requires Triton grid ≤ 65536; fails at T=262144 tokens. PTO has no such limit.  
 ² Triton `chunk_cumsum` BT=128 compilation fails for H ≥ 32.  
 ³ Triton BT=128 compilation fails for `scaled_dot_kkt` and `chunk_o` on this configuration.  
-⁴ Triton BT=64 triggers an aicore exception for H=64 (known NPU incompatibility); PTO works fine.
+⁴ Triton BT=64 triggers an aicore exception for H=64 (known NPU incompatibility); PTO works fine.  
+⁵ `scaled_dot_kkt` uses the GQA-capable Triton kernel (`chunk_scaled_dot_kkt_fwd` with `chunk_indices`),
+  which benchmarks at ~4.1 ms for H=Hg=16 — consistent with `dynamic_bsnd_groupvalue/README.md` (4.08 ms).
+  The non-GQA `dynamic_bsnd` reference shows 4.84 ms for the same shape because it uses a different Triton
+  code path, making that speedup appear as 1.04×. PTO KKT performance (~4.6 ms) is the same in both cases.
 
 vLLM prefill TTFT speedup (megakernel vs Triton, all 4 models): **1.07–1.25×** depending on model and prompt length.
 
