@@ -35,7 +35,7 @@ from megagdn_pto.kernel_libs import (
     transpose_beta,
     transpose_gates,
 )
-from megagdn_pto.mega_kernel import run_mega_kernel
+from megagdn_pto.mega_kernel import run_mega_kernel, run_mega_kernel_bf16
 
 C_PTO = 128
 
@@ -162,11 +162,21 @@ def _mega_forward(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     stream = torch.npu.current_stream()._as_parameter_
     with torch.autograd.profiler.record_function("PTO_mega_kernel"):
-        result = run_mega_kernel(
-            q, k, v, g.float(), beta, cu32,
-            stream=stream, chunk_size=C_PTO, scale=scale,
-            key_heads=Hg, return_final_state=output_final_state,
-        )
+        if q.dtype == torch.bfloat16:
+            # BF16 path: cast q,k,v,beta→fp16 INSIDE the kernel.
+            # g must be float32; caller passes g.float().
+            result = run_mega_kernel_bf16(
+                q, k, v, g, beta, cu32,
+                stream=stream, chunk_size=C_PTO, scale=scale,
+                key_heads=Hg, return_final_state=output_final_state,
+            )
+        else:
+            # FP16 path: existing, unchanged.
+            result = run_mega_kernel(
+                q, k, v, g.float(), beta, cu32,
+                stream=stream, chunk_size=C_PTO, scale=scale,
+                key_heads=Hg, return_final_state=output_final_state,
+            )
     if output_final_state:
         o, fs = result
         return o.to(q.dtype), fs.to(q.dtype)
@@ -237,17 +247,33 @@ def chunk_gated_delta_rule_pto(
     Hg = q.shape[2]
     H = v.shape[2]
     cu32 = cu_seqlens.to(torch.int32).contiguous()
-    q_w = q.to(torch.float16)
-    k_w = k.to(torch.float16)
-    v_w = v.to(torch.float16)
-    beta_w = beta.to(torch.float16)
-    g_w = g.float()
 
-    if _megakernel_enabled():
+    if _megakernel_enabled() and q.dtype == torch.bfloat16:
+        # BF16 megakernel path: pass original bf16 tensors directly.
+        # The kernel handles bf16→fp16 casting internally, eliminating 4-5
+        # separate Python-level torch.to() calls.
+        # g is still converted to float32 here (small tensor, torch is efficient).
+        g_w = g.float()
+        o, final_state = _mega_forward(
+            q, k, v, g_w, beta, cu32, scale, Hg=Hg, output_final_state=output_final_state,
+        )
+    elif _megakernel_enabled():
+        # FP16 megakernel path: existing behaviour, unchanged.
+        q_w = q.to(torch.float16)
+        k_w = k.to(torch.float16)
+        v_w = v.to(torch.float16)
+        beta_w = beta.to(torch.float16)
+        g_w = g.float()
         o, final_state = _mega_forward(
             q_w, k_w, v_w, g_w, beta_w, cu32, scale, Hg=Hg, output_final_state=output_final_state,
         )
     else:
+        # Staged path: always casts to fp16 (individual stage kernels only speak fp16).
+        q_w = q.to(torch.float16)
+        k_w = k.to(torch.float16)
+        v_w = v.to(torch.float16)
+        beta_w = beta.to(torch.float16)
+        g_w = g.float()
         o, final_state = _staged_forward(q_w, k_w, v_w, g_w, beta_w, cu32, scale, Hg=Hg, H=H)
 
     if not output_final_state:

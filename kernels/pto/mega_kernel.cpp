@@ -219,9 +219,103 @@ AICORE void mega_cast_fp32_to_fp16_bsnd(
 #endif
 }
 
-#endif // __CCE_AICORE__
+#endif // __CCE_AICORE__ (closes block starting at line 41)
 
 // ===================================================================
+// BF16 cast helpers for the bf16 megakernel variant.
+//
+// These mirror cast_bf16_fp16.cpp's approach:
+//   - GlobalTensor<half,...> for DMA (bfloat16_t GlobalTensor is unreliable)
+//   - bfloat16_t UB tile alias declared inside loop for TCVT (vconv_bf162f32)
+//   - set_flag(PIPE_V, PIPE_MTE2) + wait_flag at end of each iteration to
+//     prevent next TLOAD from corrupting bfloat16_t TCVT UB state.
+//
+// MK_CAST_C controls elements processed per loop iteration. Default 1024
+// reduces per-iteration overhead ~8× vs GDN_C=128.
+// ===================================================================
+#ifdef __CCE_AICORE__
+
+#ifndef MK_CAST_C
+#define MK_CAST_C 1024
+#endif
+
+// ------------------------------------------------------------------
+// Flat 1D BF16 → FP16 cast (distributes across AIcores)
+// src/dst: passed as half* (same 16-bit raw layout as bf16)
+// ------------------------------------------------------------------
+template <int32_t CC>
+AICORE void mega_cast_bf16_to_fp16_flat(__gm__ half *src, __gm__ half *dst,
+                                         int64_t n_elem)
+{
+#if defined(__DAV_C220_VEC__)
+    if (get_subblockid() != 0) return;
+    set_mask_norm();
+    set_vector_mask(-1, -1);
+
+    constexpr int32_t RAW16_UB = 0;
+    constexpr int32_t F32_UB   = CC * static_cast<int32_t>(sizeof(half));
+    constexpr int32_t F16_UB   = F32_UB + CC * static_cast<int32_t>(sizeof(float));
+
+    using HFull = Tile<TileType::Vec, half, 1, CC, BLayout::RowMajor,
+                       1, CC, SLayout::NoneBox, 512, PadValue::Zero>;
+    using HDyn  = Tile<TileType::Vec, half, 1, CC, BLayout::RowMajor,
+                       DYNAMIC, DYNAMIC, SLayout::NoneBox, 512, PadValue::Zero>;
+    using BF16A = Tile<TileType::Vec, bfloat16_t, 1, CC, BLayout::RowMajor,
+                       1, CC, SLayout::NoneBox, 512, PadValue::Zero>;
+    using F32F  = Tile<TileType::Vec, float, 1, CC, BLayout::RowMajor,
+                       1, CC, SLayout::NoneBox, 512, PadValue::Zero>;
+    using HOut  = Tile<TileType::Vec, half, 1, CC, BLayout::RowMajor,
+                       1, CC, SLayout::NoneBox, 512>;
+    using HDynO = Tile<TileType::Vec, half, 1, CC, BLayout::RowMajor,
+                       DYNAMIC, DYNAMIC, SLayout::NoneBox, 512>;
+
+    using Gm1D = Shape<1, 1, 1, 1, DYNAMIC>;
+    using GmS1 = Stride<1, 1, 1, 1, 1>;
+
+    HFull raw_ub; TASSIGN(raw_ub, RAW16_UB);
+    F32F  f32_ub; TASSIGN(f32_ub, F32_UB);
+    HOut  f16_ub; TASSIGN(f16_ub, F16_UB);
+
+    auto cid = get_block_idx(), block_num = get_block_num();
+    int64_t n_chunks = (n_elem + CC - 1) / CC;
+
+    for (int64_t ci = static_cast<int64_t>(cid); ci < n_chunks;
+         ci += static_cast<int64_t>(block_num)) {
+        int64_t off   = ci * CC;
+        int32_t valid = (off + CC <= n_elem) ? CC : static_cast<int32_t>(n_elem - off);
+
+        { Gm1D gs; gs.shape[4] = valid;
+          GlobalTensor<half, Gm1D, GmS1> gm(src + off, gs);
+          HDyn ld(1, valid); TASSIGN(ld, RAW16_UB);
+          TLOAD(ld, gm);
+          if (valid != CC) TFILLPAD_INPLACE(raw_ub, ld); }
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+        BF16A bf16_alias; TASSIGN(bf16_alias, RAW16_UB);
+        TCVT(f32_ub, bf16_alias, RoundMode::CAST_NONE);
+        pipe_barrier(PIPE_V);
+        TCVT(f16_ub, f32_ub, RoundMode::CAST_RINT);
+        pipe_barrier(PIPE_V);
+
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+
+        { Gm1D gs; gs.shape[4] = valid;
+          GlobalTensor<half, Gm1D, GmS1> gm(dst + off, gs);
+          HDynO st(1, valid); TASSIGN(st, F16_UB);
+          TSTORE(gm, st); }
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+    }
+#endif
+}
+
+#endif // __CCE_AICORE__ (second block for cast helpers)
+
+
 // Include original kernel implementations in separate namespaces.
 // ===================================================================
 
@@ -500,3 +594,253 @@ extern "C" void call_kernel(
         batch_size, seq_len, total_tokens, num_matrices,
         fftsAddr);
 }
+
+// ===================================================================
+// BF16 megakernel variant: casts q,k,v,beta from BF16→FP16 inside the
+// kernel before running the same pipeline as launch_mega_kernel.
+//
+// The BF16 cast adds a prefix stage (all AIcores run in parallel) before
+// the main pipeline. After the cast, SyncAllImpl<false>() ensures fp16
+// workspace is globally visible before the main stages proceed.
+//
+// q_bf16, k_bf16, v_bf16, beta_bf16: BF16 inputs (passed as half* internally)
+// q_fp16, k_fp16, v_fp16, beta_fp16: fp16 workspace (pre-allocated from Python)
+// g_in_ptr: float32 (caller does g.float() in Python — single-hop BF16→FP32
+//           is cheap and torch-efficient for the smaller g tensor)
+// All other args: same as launch_mega_kernel.
+// ===================================================================
+
+extern "C" __global__ AICORE void launch_mega_kernel_bf16(
+    // BF16 inputs (reinterpreted as half* for DMA safety)
+    __gm__ uint8_t *q_bf16_ptr,
+    __gm__ uint8_t *k_bf16_ptr,
+    __gm__ uint8_t *v_bf16_ptr,
+    __gm__ uint8_t *beta_bf16_ptr,
+    // Remaining args: same as launch_mega_kernel
+    __gm__ uint8_t *g_in_ptr,
+    __gm__ uint8_t *msk_lower_ptr,
+    __gm__ uint8_t *msk_full_ptr,
+    __gm__ uint8_t *minus_id_ptr,
+    __gm__ uint8_t *cu_seqlens_ptr,
+    __gm__ uint8_t *o_ptr,
+    __gm__ uint8_t *g_sum_ptr,
+    __gm__ uint8_t *g_t_ptr,
+    __gm__ uint8_t *beta_t_ptr,
+    __gm__ uint8_t *A_ptr,
+    __gm__ uint8_t *A_inv_f32_ptr,
+    __gm__ uint8_t *A_inv_ptr,
+    __gm__ uint8_t *w_ptr,
+    __gm__ uint8_t *u_ptr,
+    __gm__ uint8_t *s_ptr,
+    __gm__ uint8_t *v_new_ptr,
+    __gm__ uint8_t *fs_ptr,
+    __gm__ uint8_t *kkt_ws_ptr,
+    __gm__ uint8_t *wy_ws_a1_ptr,
+    __gm__ uint8_t *wy_ws_a2_ptr,
+    __gm__ uint8_t *h_ws_ptr,
+    __gm__ uint8_t *o_ws_qk_ptr,
+    __gm__ uint8_t *o_ws_qs_ptr,
+    __gm__ uint8_t *o_ws_gated_ptr,
+    // FP16 workspace buffers (filled by the cast stage)
+    __gm__ uint8_t *q_fp16_ptr,
+    __gm__ uint8_t *k_fp16_ptr,
+    __gm__ uint8_t *v_fp16_ptr,
+    __gm__ uint8_t *beta_fp16_ptr,
+    // Dimensions
+    int64_t batch_size,
+    int64_t seq_len,
+    int64_t total_tokens,
+    uint32_t num_matrices,
+    int64_t hg_elems,     // total elements for q/k: total_tokens * HG * D
+    int64_t hv_elems,     // total elements for v/beta_raw: total_tokens * H * D or * H
+    int64_t beta_elems,   // total elements for beta: total_tokens * H
+    uint64_t ffts_addr)
+{
+    set_ffts_base_addr(ffts_addr);
+
+    constexpr int32_t H  = GDN_H;
+    constexpr int32_t HG = GDN_HG;
+    constexpr int32_t D  = GDN_D;
+    constexpr int32_t C  = GDN_C;
+
+    // ---------------------------------------------------------------
+    // Stage 0: BF16 → FP16 cast for q, k, v, beta
+    // All AIcores work in parallel on each tensor's elements.
+    // ---------------------------------------------------------------
+    mega_cast_bf16_to_fp16_flat<MK_CAST_C>(
+        reinterpret_cast<__gm__ half *>(q_bf16_ptr),
+        reinterpret_cast<__gm__ half *>(q_fp16_ptr),
+        hg_elems);
+
+    mega_cast_bf16_to_fp16_flat<MK_CAST_C>(
+        reinterpret_cast<__gm__ half *>(k_bf16_ptr),
+        reinterpret_cast<__gm__ half *>(k_fp16_ptr),
+        hg_elems);
+
+    mega_cast_bf16_to_fp16_flat<MK_CAST_C>(
+        reinterpret_cast<__gm__ half *>(v_bf16_ptr),
+        reinterpret_cast<__gm__ half *>(v_fp16_ptr),
+        hv_elems);
+
+    mega_cast_bf16_to_fp16_flat<MK_CAST_C>(
+        reinterpret_cast<__gm__ half *>(beta_bf16_ptr),
+        reinterpret_cast<__gm__ half *>(beta_fp16_ptr),
+        beta_elems);
+
+    // Ensure all cast outputs are globally visible before the main pipeline.
+    SyncAllImpl<false>();
+
+    // ---------------------------------------------------------------
+    // Stages 1-7: same as launch_mega_kernel but using fp16 workspace
+    // ---------------------------------------------------------------
+
+    mk_cumsum::cumsum_kernel<H, C>(
+        reinterpret_cast<__gm__ float *>(g_in_ptr),
+        reinterpret_cast<__gm__ float *>(g_sum_ptr),
+        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+        batch_size, seq_len, ffts_addr);
+
+    SyncAllImpl<false>();
+
+    mega_transpose_TH_to_HT<float, H>(
+        reinterpret_cast<__gm__ float *>(g_sum_ptr),
+        reinterpret_cast<__gm__ float *>(g_t_ptr),
+        total_tokens);
+    mega_transpose_TH_to_HT<half, H>(
+        reinterpret_cast<__gm__ half *>(beta_fp16_ptr),
+        reinterpret_cast<__gm__ half *>(beta_t_ptr),
+        total_tokens);
+
+    SyncAllImpl<false>();
+
+    mk_kkt::kkt_kernel<H, HG, D, C>(
+        reinterpret_cast<__gm__ half *>(k_fp16_ptr),
+        reinterpret_cast<__gm__ half *>(beta_t_ptr),
+        reinterpret_cast<__gm__ float *>(g_t_ptr),
+        reinterpret_cast<__gm__ float *>(msk_lower_ptr),
+        reinterpret_cast<__gm__ half *>(kkt_ws_ptr),
+        reinterpret_cast<__gm__ half *>(A_ptr),
+        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+        batch_size, seq_len, total_tokens, ffts_addr);
+
+#if defined(__DAV_C220_CUBE__)
+    pipe_barrier(PIPE_ALL);
+    wait_flag_dev(2);
+    wait_flag_dev(3);
+#endif
+
+    SyncAllImpl<false>();
+
+    mega_solve_tril(
+        reinterpret_cast<__gm__ half *>(A_inv_ptr),
+        reinterpret_cast<__gm__ half *>(A_ptr),
+        reinterpret_cast<__gm__ half *>(minus_id_ptr),
+        C, num_matrices, H,
+        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr), 1);
+
+    SyncAllImpl<false>();
+
+    SyncAllImpl<false>();
+
+    mk_wy::wy_fast_kernel<H, HG, D, C>(
+        reinterpret_cast<__gm__ half *>(k_fp16_ptr),
+        reinterpret_cast<__gm__ half *>(v_fp16_ptr),
+        reinterpret_cast<__gm__ half *>(beta_t_ptr),
+        reinterpret_cast<__gm__ float *>(g_t_ptr),
+        reinterpret_cast<__gm__ half *>(A_inv_ptr),
+        reinterpret_cast<__gm__ half *>(wy_ws_a1_ptr),
+        reinterpret_cast<__gm__ half *>(wy_ws_a2_ptr),
+        reinterpret_cast<__gm__ half *>(w_ptr),
+        reinterpret_cast<__gm__ half *>(u_ptr),
+        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+        batch_size, seq_len, total_tokens, ffts_addr);
+
+#if defined(__DAV_C220_VEC__)
+    if (get_block_idx() < num_matrices) {
+        pipe_barrier(PIPE_ALL);
+        wait_flag_dev(3);
+        wait_flag_dev(4);
+    }
+#endif
+
+    SyncAllImpl<false>();
+
+    mk_h::chunk_h_kernel<H, HG, D, C>(
+        reinterpret_cast<__gm__ half *>(k_fp16_ptr),
+        reinterpret_cast<__gm__ half *>(w_ptr),
+        reinterpret_cast<__gm__ half *>(u_ptr),
+        reinterpret_cast<__gm__ float *>(g_t_ptr),
+        reinterpret_cast<__gm__ half *>(s_ptr),
+        reinterpret_cast<__gm__ half *>(v_new_ptr),
+        reinterpret_cast<__gm__ half *>(fs_ptr),
+        reinterpret_cast<__gm__ half *>(h_ws_ptr),
+        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+        batch_size, seq_len, total_tokens, ffts_addr);
+
+    SyncAllImpl<false>();
+
+    mk_o::chunk_o_kernel<H, HG, D, C>(
+        reinterpret_cast<__gm__ half *>(q_fp16_ptr),
+        reinterpret_cast<__gm__ half *>(k_fp16_ptr),
+        reinterpret_cast<__gm__ half *>(v_new_ptr),
+        reinterpret_cast<__gm__ half *>(s_ptr),
+        reinterpret_cast<__gm__ float *>(g_t_ptr),
+        reinterpret_cast<__gm__ float *>(msk_full_ptr),
+        reinterpret_cast<__gm__ half *>(o_ws_qk_ptr),
+        reinterpret_cast<__gm__ half *>(o_ws_qs_ptr),
+        reinterpret_cast<__gm__ half *>(o_ws_gated_ptr),
+        reinterpret_cast<__gm__ half *>(o_ptr),
+        reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
+        batch_size, seq_len, total_tokens, ffts_addr);
+
+#if defined(__DAV_C220_CUBE__)
+    if (get_block_idx() < num_matrices) {
+        pipe_barrier(PIPE_ALL);
+        wait_flag_dev(3);
+    }
+#endif
+}
+
+// C wrapper for the BF16 megakernel.
+// Python call signature: see run_mega_kernel_bf16 in mega_kernel.py.
+extern "C" void call_kernel_bf16(
+    uint32_t block_dim, void *stream,
+    // BF16 inputs
+    uint8_t *q_bf16, uint8_t *k_bf16, uint8_t *v_bf16, uint8_t *beta_bf16,
+    // float32 gate (Python does g.float())
+    uint8_t *g_in,
+    // Common workspace (same as call_kernel)
+    uint8_t *msk_lower, uint8_t *msk_full,
+    uint8_t *minus_id, uint8_t *cu_seqlens,
+    uint8_t *o,
+    uint8_t *g_sum, uint8_t *g_t, uint8_t *beta_t,
+    uint8_t *A, uint8_t *A_inv_f32, uint8_t *A_inv,
+    uint8_t *w, uint8_t *u, uint8_t *s, uint8_t *v_new, uint8_t *fs,
+    uint8_t *kkt_ws, uint8_t *wy_ws_a1, uint8_t *wy_ws_a2,
+    uint8_t *h_ws,
+    uint8_t *o_ws_qk, uint8_t *o_ws_qs, uint8_t *o_ws_gated,
+    // FP16 workspace (pre-allocated from Python)
+    uint8_t *q_fp16, uint8_t *k_fp16, uint8_t *v_fp16, uint8_t *beta_fp16,
+    // Dimensions
+    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_matrices,
+    int64_t hg_elems, int64_t hv_elems, int64_t beta_elems)
+{
+    uint32_t fftsLen{0};
+    uint64_t fftsAddr{0};
+    rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
+    launch_mega_kernel_bf16<<<block_dim, nullptr, stream>>>(
+        q_bf16, k_bf16, v_bf16, beta_bf16,
+        g_in,
+        msk_lower, msk_full, minus_id, cu_seqlens,
+        o,
+        g_sum, g_t, beta_t, A, A_inv_f32, A_inv,
+        w, u, s, v_new, fs,
+        kkt_ws, wy_ws_a1, wy_ws_a2, h_ws,
+        o_ws_qk, o_ws_qs, o_ws_gated,
+        q_fp16, k_fp16, v_fp16, beta_fp16,
+        batch_size, seq_len, total_tokens, num_matrices,
+        hg_elems, hv_elems, beta_elems,
+        fftsAddr);
+}
+

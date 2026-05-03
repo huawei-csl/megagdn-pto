@@ -150,7 +150,12 @@ def compile_mega_kernel(
     chunk_size: int = 128,
     cpp_mtime_ns: int = 0,
 ) -> str:
-    """Compile the fused mega-kernel and return the path to the resulting ``.so``."""
+    """Compile the fused mega-kernel and return the path to the resulting ``.so``.
+
+    The compiled ``.so`` exports BOTH entry points:
+      - ``call_kernel``:      fp16 input path (existing, unchanged)
+      - ``call_kernel_bf16``: bf16 input path (new; casts bf16→fp16 inside kernel)
+    """
     kh = key_heads if key_heads is not None else num_heads
     os.makedirs(_COMPILED_DIR, exist_ok=True)
     cpp_path = os.path.join(_KERNELS_PTO, "mega_kernel.cpp")
