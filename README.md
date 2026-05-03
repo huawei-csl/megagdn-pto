@@ -6,6 +6,8 @@
 - [2] All 6 stages: `chunk_cumsum`, `scaled_dot_kkt`, `solve_tril`, `wy_fast`, `chunk_h`, `chunk_o`. Plus a merged metakernel to save kernel launch overhead.
 - [3] Tested model sizes: `0.8B`, `2B`, `4B`, `9B`, `27B`, `35B-A3B`. Also compatible with `122B-A10B` `397B-A17B` shapes, but full multi-device evaluation not conducted yet.
 
+See full report [in English](blog/mega_gdn_en.md) or [in Chinese](blog/mega_gdn_zh.md).
+
 # To reproduce
 
 ## NPU Environment
