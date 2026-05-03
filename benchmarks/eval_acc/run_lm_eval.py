@@ -81,9 +81,18 @@ def _autoconfig_patch(model_path: str):
 
     Qwen3.5 **dense** checkpoints are left untouched so vLLM uses ``Qwen3_5ForConditionalGeneration``
     (coercing ``text_config`` into ``Qwen3Config`` breaks vLLM 0.19 weight loading under lm-eval).
+
+    For **qwen3_5_moe** (e.g. Qwen3.6 MoE W8A8), vLLM **0.19+** loads ``Qwen3_5MoeForConditionalGeneration``
+    from ``config.json`` correctly—the same path as ``benchmark_prefill.py``.  Older lm-eval hacks replaced
+    ``AutoConfig`` with ``Qwen3MoeConfig`` built only from ``text_config``, which diverges from the
+    checkpoint layout and breaks Ascend ``modelslim`` quantization lookup
+    (``KeyError: 'model.embed_tokens.weight'``).  Skip the monkey-patch on vLLM >= 0.19 so eval matches prefill.
     """
     import json as _json
+    from importlib.metadata import version as pkg_version
     from pathlib import Path as _Path
+
+    from packaging.version import parse as parse_version
     from transformers.models.auto.configuration_auto import AutoConfig
     from transformers.models.qwen3_moe import Qwen3MoeConfig
 
@@ -95,6 +104,8 @@ def _autoconfig_patch(model_path: str):
     # Qwen3.5 dense: vLLM 0.18+ expects the real HF config (Qwen3_5ForConditionalGeneration).
     # Forcing Qwen3Config from text_config made vLLM pick Qwen3Model + pooling and broke weights.
     if mt == "qwen3_5":
+        return lambda: None
+    if mt == "qwen3_5_moe" and parse_version(pkg_version("vllm")) >= parse_version("0.19.0"):
         return lambda: None
     if mt == "qwen3_5_moe":
         def _build():
