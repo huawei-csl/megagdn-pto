@@ -331,6 +331,9 @@ bash benchmarks/vllm_prefill/run_prefill_sweep.sh
 
 Requires `lm-eval` — install with `pip install -e '.[eval]'` first.
 
+If evaluation crashes because Transformers does not recognize **`qwen3_5`**, see
+**[Troubleshooting](#troubleshooting)** (lm-eval + Transformers).
+
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0
 
@@ -415,6 +418,39 @@ often originates from `gdn_linear_attn` while the Ascend `chunk` module has
 already been patched. In all cases, when `VLLM_PTO_PATCH_DIR` is set and the
 worker hook succeeded, PTO (or the megakernel) is what executes for the GDN
 prefill chunk.
+
+---
+
+## Troubleshooting
+
+### lm-eval fails: Transformers does not recognize `qwen3_5`
+
+**Symptom:** Running §5 (`run_lm_eval.py` or `run_eval_suite.sh`) crashes inside
+`lm_eval` / `AutoConfig.from_pretrained` with an error like “checkpoint has model type
+`qwen3_5` but Transformers does not recognize this architecture”, or a `KeyError` on
+`qwen3_5`.
+
+**Cause:** The Hugging Face checkpoints for **Qwen3.5** dense models declare
+`model_type: qwen3_5`. The **lm-eval** integration loads the checkpoint config through
+Transformers before vLLM builds the engine. Older Transformers releases (including the
+latest **4.x** wheels on PyPI at some points in time) may not register that model type,
+even though **vLLM-Ascend** can still load the same weights for inference.
+
+**What to do:**
+
+1. Upgrade Transformers (and usually **`huggingface_hub`**) to a release that includes
+   **`qwen3_5`** / `Qwen3_5Config` — for example **Transformers 5.x**:
+   ```bash
+   pip install -U 'transformers>=5' 'huggingface-hub>=0.34'
+   ```
+2. Expect **`pip` resolver warnings**: vLLM 0.18’s metadata asks for
+   **`transformers>=4.56,<5`**, so upgrading past 5.x is **outside** that declared range.
+   Many environments still run §4 and §5 correctly after upgrading; if anything breaks,
+   use a **separate virtual environment** for lm-eval-only runs, or pin a Transformers
+   version your stack vendor documents as compatible.
+
+**Verify:** After upgrading, `AutoConfig.from_pretrained(<path_to_qwen3.5>, trust_remote_code=True)`
+should return without error before you rerun the eval suite.
 
 ---
 
