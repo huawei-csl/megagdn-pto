@@ -1,0 +1,81 @@
+{
+  "timestamp": "2026-05-03T11:09:49.272890+00:00",
+  "device": "npu:0",
+  "H": 16,
+  "Hg": 16,
+  "D": 128,
+  "C_pto": 128,
+  "note": "Speedup > 1 means bf16 megakernel is FASTER than fp16+Python-casts. For short T, Python dispatch savings dominate. For long T, the slower in-kernel PTO cast may dominate.",
+  "results": [
+    {
+      "T": 256,
+      "H": 16,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "fp16_cast_plus_kernel_ms": 0.635097328821818,
+      "bf16_kernel_ms": 0.6883586684862772,
+      "speedup": 0.9226255989750479
+    },
+    {
+      "T": 512,
+      "H": 16,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "fp16_cast_plus_kernel_ms": 0.7144146680831909,
+      "bf16_kernel_ms": 0.7758413354555765,
+      "speedup": 0.9208257351532891
+    },
+    {
+      "T": 1024,
+      "H": 16,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "fp16_cast_plus_kernel_ms": 0.8116346637407938,
+      "bf16_kernel_ms": 0.8676986734072367,
+      "speedup": 0.935387696922143
+    },
+    {
+      "T": 2048,
+      "H": 16,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "fp16_cast_plus_kernel_ms": 0.9925493319829305,
+      "bf16_kernel_ms": 1.0887173334757487,
+      "speedup": 0.9116685309070994
+    },
+    {
+      "T": 4096,
+      "H": 16,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "fp16_cast_plus_kernel_ms": 1.4639786720275878,
+      "bf16_kernel_ms": 1.5835039854049682,
+      "speedup": 0.9245184638125096
+    },
+    {
+      "T": 8192,
+      "H": 16,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "fp16_cast_plus_kernel_ms": 2.3808693567911785,
+      "bf16_kernel_ms": 2.587815999984741,
+      "speedup": 0.9200303873247623
+    },
+    {
+      "T": 16384,
+      "H": 16,
+      "Hg": 16,
+      "D": 128,
+      "C_pto": 128,
+      "fp16_cast_plus_kernel_ms": 4.448708025614421,
+      "bf16_kernel_ms": 4.882342688242594,
+      "speedup": 0.911183075355929
+    }
+  ]
+}

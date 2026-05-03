@@ -222,16 +222,12 @@ AICORE void mega_cast_fp32_to_fp16_bsnd(
 #endif // __CCE_AICORE__ (closes block starting at line 41)
 
 // ===================================================================
-// BF16 cast helpers for the bf16 megakernel variant.
+// BF16 cast helper for the bf16 megakernel variant.
 //
-// These mirror cast_bf16_fp16.cpp's approach:
-//   - GlobalTensor<half,...> for DMA (bfloat16_t GlobalTensor is unreliable)
-//   - bfloat16_t UB tile alias declared inside loop for TCVT (vconv_bf162f32)
-//   - set_flag(PIPE_V, PIPE_MTE2) + wait_flag at end of each iteration to
-//     prevent next TLOAD from corrupting bfloat16_t TCVT UB state.
-//
-// MK_CAST_C controls elements processed per loop iteration. Default 1024
-// reduces per-iteration overhead ~8× vs GDN_C=128.
+// Uses double-buffered pipeline with post-TCVT prefetch:
+//   TCVT(N) completes → TSTORE(N) ∥ TLOAD(N+1) → V→MTE2 barrier
+// TLOAD is issued only AFTER TCVT finishes, avoiding concurrent TLOAD +
+// bfloat16_t TCVT hardware state conflicts. V→MTE2 barrier preserved.
 // ===================================================================
 #ifdef __CCE_AICORE__
 
@@ -239,10 +235,10 @@ AICORE void mega_cast_fp32_to_fp16_bsnd(
 #define MK_CAST_C 1024
 #endif
 
-// ------------------------------------------------------------------
-// Flat 1D BF16 → FP16 cast (distributes across AIcores)
-// src/dst: passed as half* (same 16-bit raw layout as bf16)
-// ------------------------------------------------------------------
+#define MK_BF16_OFF(i) ((i) * (MK_CAST_C * 8))
+#define MK_F32_OFF(i)  ((i) * (MK_CAST_C * 8) + MK_CAST_C * 2)
+#define MK_F16_OFF(i)  ((i) * (MK_CAST_C * 8) + MK_CAST_C * 6)
+
 template <int32_t CC>
 AICORE void mega_cast_bf16_to_fp16_flat(__gm__ half *src, __gm__ half *dst,
                                          int64_t n_elem)
@@ -252,64 +248,91 @@ AICORE void mega_cast_bf16_to_fp16_flat(__gm__ half *src, __gm__ half *dst,
     set_mask_norm();
     set_vector_mask(-1, -1);
 
-    constexpr int32_t RAW16_UB = 0;
-    constexpr int32_t F32_UB   = CC * static_cast<int32_t>(sizeof(half));
-    constexpr int32_t F16_UB   = F32_UB + CC * static_cast<int32_t>(sizeof(float));
-
-    using HFull = Tile<TileType::Vec, half, 1, CC, BLayout::RowMajor,
-                       1, CC, SLayout::NoneBox, 512, PadValue::Zero>;
-    using HDyn  = Tile<TileType::Vec, half, 1, CC, BLayout::RowMajor,
-                       DYNAMIC, DYNAMIC, SLayout::NoneBox, 512, PadValue::Zero>;
-    using BF16A = Tile<TileType::Vec, bfloat16_t, 1, CC, BLayout::RowMajor,
-                       1, CC, SLayout::NoneBox, 512, PadValue::Zero>;
-    using F32F  = Tile<TileType::Vec, float, 1, CC, BLayout::RowMajor,
-                       1, CC, SLayout::NoneBox, 512, PadValue::Zero>;
-    using HOut  = Tile<TileType::Vec, half, 1, CC, BLayout::RowMajor,
-                       1, CC, SLayout::NoneBox, 512>;
-    using HDynO = Tile<TileType::Vec, half, 1, CC, BLayout::RowMajor,
-                       DYNAMIC, DYNAMIC, SLayout::NoneBox, 512>;
-
+    using HF  = Tile<TileType::Vec, half,       1, CC, BLayout::RowMajor, 1, CC, SLayout::NoneBox, 512, PadValue::Zero>;
+    using HD  = Tile<TileType::Vec, half,       1, CC, BLayout::RowMajor, DYNAMIC, DYNAMIC, SLayout::NoneBox, 512, PadValue::Zero>;
+    using BFA = Tile<TileType::Vec, bfloat16_t, 1, CC, BLayout::RowMajor, 1, CC, SLayout::NoneBox, 512, PadValue::Zero>;
+    using F3F = Tile<TileType::Vec, float,      1, CC, BLayout::RowMajor, 1, CC, SLayout::NoneBox, 512, PadValue::Zero>;
+    using HO  = Tile<TileType::Vec, half,       1, CC, BLayout::RowMajor, 1, CC, SLayout::NoneBox, 512>;
+    using HOD = Tile<TileType::Vec, half,       1, CC, BLayout::RowMajor, DYNAMIC, DYNAMIC, SLayout::NoneBox, 512>;
     using Gm1D = Shape<1, 1, 1, 1, DYNAMIC>;
     using GmS1 = Stride<1, 1, 1, 1, 1>;
 
-    HFull raw_ub; TASSIGN(raw_ub, RAW16_UB);
-    F32F  f32_ub; TASSIGN(f32_ub, F32_UB);
-    HOut  f16_ub; TASSIGN(f16_ub, F16_UB);
+    HF  raw0; TASSIGN(raw0, MK_BF16_OFF(0)); HF  raw1; TASSIGN(raw1, MK_BF16_OFF(1));
+    F3F f32_0; TASSIGN(f32_0, MK_F32_OFF(0)); F3F f32_1; TASSIGN(f32_1, MK_F32_OFF(1));
+    HO  f16_0; TASSIGN(f16_0, MK_F16_OFF(0)); HO  f16_1; TASSIGN(f16_1, MK_F16_OFF(1));
 
-    auto cid = get_block_idx(), block_num = get_block_num();
-    int64_t n_chunks = (n_elem + CC - 1) / CC;
+    const int64_t cid_64 = (int64_t)get_block_idx(), bn_64 = (int64_t)get_block_num();
+    const int64_t n_chunks = (n_elem + CC - 1) / CC;
+    if (cid_64 >= n_chunks) return;
+    const int64_t n_my = (n_chunks - cid_64 - 1) / bn_64 + 1;
+    const bool all_full = (n_elem % CC == 0);
 
-    for (int64_t ci = static_cast<int64_t>(cid); ci < n_chunks;
-         ci += static_cast<int64_t>(block_num)) {
-        int64_t off   = ci * CC;
-        int32_t valid = (off + CC <= n_elem) ? CC : static_cast<int32_t>(n_elem - off);
+#define MK_DO_LOAD(ci_, b_)                                                      \
+    {   int64_t _off = (ci_) * CC;                                               \
+        int32_t _v = (_off+CC <= n_elem) ? CC : (int32_t)(n_elem-_off);         \
+        Gm1D _gs; _gs.shape[4] = _v;                                            \
+        GlobalTensor<half, Gm1D, GmS1> _gm(src+_off, _gs);                     \
+        if ((b_)==0) { HD _l(1,_v); TASSIGN(_l,MK_BF16_OFF(0)); TLOAD(_l,_gm); \
+            if (!all_full&&_v!=CC) TFILLPAD_INPLACE(raw0,_l); }                 \
+        else { HD _l(1,_v); TASSIGN(_l,MK_BF16_OFF(1)); TLOAD(_l,_gm);         \
+            if (!all_full&&_v!=CC) TFILLPAD_INPLACE(raw1,_l); } }
 
-        { Gm1D gs; gs.shape[4] = valid;
-          GlobalTensor<half, Gm1D, GmS1> gm(src + off, gs);
-          HDyn ld(1, valid); TASSIGN(ld, RAW16_UB);
-          TLOAD(ld, gm);
-          if (valid != CC) TFILLPAD_INPLACE(raw_ub, ld); }
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+#define MK_DO_STORE(ci_, b_)                                                     \
+    {   int64_t _off = (ci_) * CC;                                               \
+        int32_t _v = (_off+CC <= n_elem) ? CC : (int32_t)(n_elem-_off);         \
+        Gm1D _gs; _gs.shape[4] = _v;                                            \
+        GlobalTensor<half, Gm1D, GmS1> _gm(dst+_off, _gs);                     \
+        if ((b_)==0) { HOD _s(1,_v); TASSIGN(_s,MK_F16_OFF(0)); TSTORE(_gm,_s); } \
+        else { HOD _s(1,_v); TASSIGN(_s,MK_F16_OFF(1)); TSTORE(_gm,_s); } }
+
+    // Prologue: pre-load first chunk into buf[0]
+    MK_DO_LOAD(cid_64, 0); set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+    int64_t iter = 0;
+    for (int64_t ci = cid_64; ci < n_chunks; ci += bn_64, ++iter) {
+        const int32_t cur = (int32_t)(iter & 1);
+        const int32_t nxt = 1 - cur;
+        const int64_t ci_next = ci + bn_64;
+
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-        BF16A bf16_alias; TASSIGN(bf16_alias, RAW16_UB);
-        TCVT(f32_ub, bf16_alias, RoundMode::CAST_NONE);
-        pipe_barrier(PIPE_V);
-        TCVT(f16_ub, f32_ub, RoundMode::CAST_RINT);
+        // BF16→FP32 (fresh alias per iteration)
+        if (cur == 0) { BFA a; TASSIGN(a, MK_BF16_OFF(0)); TCVT(f32_0, a, RoundMode::CAST_NONE); }
+        else          { BFA a; TASSIGN(a, MK_BF16_OFF(1)); TCVT(f32_1, a, RoundMode::CAST_NONE); }
         pipe_barrier(PIPE_V);
 
-        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        if (iter >= 2) wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
 
-        { Gm1D gs; gs.shape[4] = valid;
-          GlobalTensor<half, Gm1D, GmS1> gm(dst + off, gs);
-          HDynO st(1, valid); TASSIGN(st, F16_UB);
-          TSTORE(gm, st); }
-        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
-        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+        // FP32→FP16
+        if (cur == 0) TCVT(f16_0, f32_0, RoundMode::CAST_RINT);
+        else          TCVT(f16_1, f32_1, RoundMode::CAST_RINT);
+
+        // Signal MTE3 to start TSTORE
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+
+        // Issue TLOAD for next chunk AFTER TCVT (safe, different UB)
+        if (ci_next < n_chunks) {
+            MK_DO_LOAD(ci_next, nxt);
+            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        }
+
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+        MK_DO_STORE(ci, cur);
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+
+        // V→MTE2 barrier: resets bfloat16_t TCVT state
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID3);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID3);
     }
+
+    const int64_t pending = (n_my < 2) ? n_my : 2;
+    for (int64_t k = 0; k < pending; ++k) wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+
+#undef MK_DO_LOAD
+#undef MK_DO_STORE
+#undef MK_BF16_OFF
+#undef MK_F32_OFF
+#undef MK_F16_OFF
 #endif
 }
 
