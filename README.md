@@ -1,9 +1,9 @@
-# Megakernel for Gated DeltaNet, optimized 
+# Megakernel for Gated DeltaNet, optimized for NPU
 
-This repo provides **1.5~3x faster**<sup>[1]</sup> NPU kernels for chunk GDN<sup>[2]</sup> with integration to [vllm-ascend](https://github.com/vllm-project/vllm-ascend) to enable **~15% faster prefill** for Qwen3.5/3.6 models<sup>[3]</sup> without any loss in accuracy.
+**TL;DR** This repo provides **1.5~3x faster**<sup>[1]</sup> NPU kernels for chunk GDN<sup>[2]</sup>, with integration to [vllm-ascend](https://github.com/vllm-project/vllm-ascend) to enable **~15% faster prefill** for Qwen3.5/3.6 models<sup>[3]</sup>, without no loss in inference accuracy.
 
 - [1] Compared to the default triton kernels used in vllm-ascend/sgl-kernel-npu
-- [2] All 6 stages: `chunk_cumsum`, `scaled_dot_kkt`, `solve_tril`, `wy_fast`, `chunk_h`, `chunk_o`
+- [2] All 6 stages: `chunk_cumsum`, `scaled_dot_kkt`, `solve_tril`, `wy_fast`, `chunk_h`, `chunk_o`. Plus a merged metakernel to save kernel launch overhead.
 - [3] Tested model sizes: `0.8B`, `2B`, `4B`, `9B`, `27B`, `35B-A3B`. Also compatible with `122B-A10B` `397B-A17B` shapes, but full multi-device evaluation not conducted yet.
 
 # To reproduce
