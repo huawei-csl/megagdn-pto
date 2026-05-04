@@ -16,7 +16,7 @@
 
 # 总体设计: 为NPU量身定做的Chunk128 GDN大算子
 
-Linear Attention系列的[chunkwise算法](https://sustcsonglin.github.io/blog/2024/deltanet-2/#a-chunkwise-algorithm-for-deltanet)最重要的参数是chunksize `C`，类似FlashAttention中的序列维度`S`，直接决定了计算访存比(arithmetic intensity)，也就决定了矩阵单元(Cube core, TensorCore)的利用率。GPU上普遍采用较小的chunk size：[FLA项目](https://github.com/fla-org/flash-linear-attention)默认用64 (Triton源码里的`BT`参数), 而[FlashKDA](https://github.com/MoonshotAI/FlashKDA/blob/master/docs/20260420-flashkda-v1-deep-dive.md)选了更小的16 -- 理由之一是三角求逆步骤的计算量为`O(C^2)`，且多出来的FLOPs不是简单的矩阵乘，chunk太大会导致求逆成为瓶颈。
+Linear Attention系列的[chunkwise算法](https://sustcsonglin.github.io/blog/2024/deltanet-2/#a-chunkwise-algorithm-for-deltanet)最重要的参数是chunksize `C`，类似FlashAttention中的序列维度`S`，直接决定了计算访存比(arithmetic intensity)，也就决定了矩阵单元(Cube core, TensorCore)的利用率。GPU上普遍采用较小的chunk size：[FLA项目](https://github.com/fla-org/flash-linear-attention)默认用64 (Triton源码里的`BT`参数), 而[FlashKDA](https://github.com/MoonshotAI/FlashKDA/blob/master/docs/20260420-flashkda-v1-deep-dive.md)选了更小的16 -- 理由之一是三角求逆步骤的计算量为`O(C^3)`，且多出来的FLOPs不是简单的矩阵乘，chunk太大会导致求逆成为瓶颈。
 
 我们上一篇[基于PTO指令的求逆算子优化](https://github.com/huawei-csl/gdn-tri-inverse/blob/0.1.0/markdown/fast_inverse_blog/fast_inverse_zh.md)，实现了亲和NPU矩阵单元的求逆算法，使得Chunk128的求逆不再是瓶颈，因此整个GDN可以改写成chunk128。(为什么不做chunk256? 算术密度超过了硬件roofline拐点，多出的FLOPs不再“免费”了，得不偿失)
 
