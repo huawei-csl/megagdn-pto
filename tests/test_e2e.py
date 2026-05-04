@@ -46,6 +46,7 @@ from megagdn_pto.kernel_libs import (
     transpose_gates,
 )
 from tests.test_single_kernels import (
+    ref_solve_tril,
     ref_chunk_h,
     ref_chunk_o,
     ref_cumsum,
@@ -63,32 +64,6 @@ D = 128
 MAX_RMSE_CROSS = 0.02
 MIN_R2_CROSS = 0.999
 MIN_PEARSON_CROSS = 0.999
-
-
-# ---------------------------------------------------------------------------
-# CPU reference for solve_tril
-# ---------------------------------------------------------------------------
-
-def ref_solve_tril(A: torch.Tensor, cs: int, cu_seqlens=None) -> torch.Tensor:
-    """CPU fp64 reference for the triangular inverse (solve_tril) stage.
-
-    For each chunk block of shape ``[v, v]`` (per head), computes
-    ``inv(A^T + I)^T`` which matches the ``fast_inverse`` kernel convention.
-    """
-    A64 = A.detach().cpu().double()
-    out = torch.zeros_like(A64)
-    for bos, eos in _seq_ranges(A.shape[1], cu_seqlens):
-        for chunk_start in range(bos, eos, cs):
-            v = min(cs, eos - chunk_start)
-            block = A64[:, chunk_start:chunk_start + v, :, :v]  # [1, v, H, v]
-            eye = torch.eye(v, dtype=torch.float64)
-            # inv(A^T + I)^T per head
-            # block: [1, v, H, v] — treat as [H, v, v] for batched inv
-            b = block[0].permute(1, 0, 2)  # [H, v, v]
-            b_t = b.transpose(1, 2) + eye.unsqueeze(0)  # [H, v, v]
-            inv_b = torch.linalg.inv(b_t).transpose(1, 2)  # [H, v, v]
-            out[0, chunk_start:chunk_start + v, :, :v] = inv_b.permute(1, 0, 2)
-    return out.to(dtype=A.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -182,40 +157,9 @@ def _triton_available() -> bool:
 
 def triton_pipeline(q, k, v, g_in, beta, cu_long, H, Hg, scale=1.0):
     """Full six-stage Triton pipeline (C=64, bf16)."""
-    from fla_vendor.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-    from fla_vendor.chunk_o import chunk_fwd_o
-    from fla_vendor.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-    from fla_vendor.cumsum import chunk_local_cumsum
-    from fla_vendor.solve_tril import solve_tril as triton_solve_tril
-    from fla_vendor.utils import prepare_chunk_indices, prepare_chunk_offsets
-    from fla_vendor.wy_fast import recompute_w_u_fwd
+    from fla_vendor.chunk import chunk_gated_delta_rule_fwd
 
-    chunk_indices = prepare_chunk_indices(cu_long, C_TRITON)
-    chunk_offsets = prepare_chunk_offsets(cu_long, C_TRITON)
-
-    q_bf = q.bfloat16()
-    k_bf = k.bfloat16()
-    v_bf = v.bfloat16()
-    beta_bf = beta.bfloat16()
-    g_f32 = g_in.float()
-
-    g_cs = chunk_local_cumsum(g_f32, cu_seqlens=cu_long, chunk_size=C_TRITON,
-                               chunk_indices=chunk_indices)
-    A_tri = chunk_scaled_dot_kkt_fwd(k=k_bf, beta=beta_bf, g_cumsum=g_cs,
-                                     cu_seqlens=cu_long, chunk_indices=chunk_indices,
-                                     chunk_size=C_TRITON, output_dtype=torch.float32)
-    A_inv_tri = triton_solve_tril(A_tri.half(), cu_seqlens=cu_long)
-    w_tri, u_tri = recompute_w_u_fwd(k=k_bf, v=v_bf, beta=beta_bf, g_cumsum=g_cs,
-                                     A=A_inv_tri.bfloat16(), cu_seqlens=cu_long,
-                                     chunk_indices=chunk_indices)
-    h_tri, v_new_tri, _ = chunk_gated_delta_rule_fwd_h(
-        k=k_bf, w=w_tri, u=u_tri, g=g_f32,
-        initial_state=None, output_final_state=False,
-        cu_seqlens=cu_long, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
-        chunk_size=C_TRITON,
-    )
-    o_tri = chunk_fwd_o(q=q_bf, k=k_bf, v=v_new_tri, h=h_tri, g=g_f32,
-                        scale=scale, cu_seqlens=cu_long, chunk_size=C_TRITON)
+    _, o_tri, _, _, _, _, _ = chunk_gated_delta_rule_fwd(q, k, v, g_in, beta, scale, None, None, cu_long)
     torch.npu.synchronize()
     return o_tri.float()
 
