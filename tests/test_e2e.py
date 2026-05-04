@@ -55,6 +55,7 @@ from tests.test_single_kernels import (
     _seq_ranges,
     stats_ok,
 )
+from megagdn_pto.mega_kernel import run_mega_kernel
 
 C_PTO = 128
 C_TRITON = 64
@@ -229,7 +230,17 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
         g_in.cpu(), beta.cpu().float(), cu_cpu, H, Hg, scale,
     )
 
+    # PTO mega kernel
+    o_mega = run_mega_kernel(
+        q, k, v, g_in, beta, cu32,
+        stream=torch.npu.current_stream()._as_parameter_,
+        chunk_size=C_PTO,
+        scale=scale,
+        key_heads=Hg,
+    )
+
     ok_pto = stats_ok(o_pto.float().cpu(), o_cpu)
+    ok_mega = stats_ok(o_mega.float().cpu(), o_cpu)
 
     ok_cross = True
     if triton_ok:
@@ -241,7 +252,7 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
             print(f"    [Triton skipped: {str(e).split(chr(10))[0][:80]}]")
             ok_cross = True  # not a failure, triton may not support all shapes
 
-    return ok_pto and ok_cross, label, ok_pto, ok_cross
+    return ok_pto and ok_cross and ok_mega, label, ok_pto, ok_cross, ok_mega
 
 
 def main() -> None:
@@ -269,13 +280,13 @@ def main() -> None:
         assert H % Hg == 0
         print(f"\n{'='*60}\nH={H}  Hg={Hg}\n{'='*60}")
         for T_or_cu, T_total in TEST_SHAPES:
-            ok, label, ok_pto, ok_cross = run_one(
+            ok, label, ok_pto, ok_cross, ok_mega = run_one(
                 T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok)
             if not ok:
                 all_pass = False
             cross_str = f"  cross={'PASS' if ok_cross else 'FAIL'}" if triton_ok else ""
             status = "PASS" if ok else "FAIL"
-            print(f"  {status}  {label}  pto_vs_cpu={'PASS' if ok_pto else 'FAIL'}{cross_str}")
+            print(f"  {status}  {label}  pto_vs_cpu={'PASS' if ok_pto else 'FAIL'}  mega_vs_cpu={'PASS' if ok_mega else 'FAIL'}{cross_str}")
 
     print(f"\n{'ALL PASS' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)
