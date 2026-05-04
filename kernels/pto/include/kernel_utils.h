@@ -8,7 +8,9 @@ for the full License text.
 */
 #pragma once
 
+#ifndef MEMORY_BASE
 #define MEMORY_BASE
+#endif
 #include <pto/pto-inst.hpp>
 #include <type_traits>
 
