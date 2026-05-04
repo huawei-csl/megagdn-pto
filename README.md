@@ -92,7 +92,3 @@ Prefill speed-up for vllm-ascend 0.18, measured on Atlas A2 (uses single NPU)
 Prefill speed-up for vllm-ascend 0.19 (both triton baseline and PTO become faster than 0.18, due to framework-side optimizations)
 
 <img src="outputs/figure/prefill_qwen36_35b_a3b_w8a8_v019.png" alt="alt text" style="width: 50%;" />
-
-# References
-
-For full documentation see [README_full.md](./README_full.md)
