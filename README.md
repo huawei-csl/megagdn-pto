@@ -1,10 +1,14 @@
-# Megakernel for Gated DeltaNet, optimized for NPU using [PTO-ISA](gitcode.com/cann/pto-isa)
+<div align="center">
+
+# Megakernel for Gated DeltaNet </br> optimized for NPU using [PTO-ISA](gitcode.com/cann/pto-isa)
+
+</div>
 
 **TL;DR** This repo provides **1.5~3x faster**<sup>[1]</sup> NPU kernels for chunk GDN<sup>[2]</sup>, with integration to [vllm-ascend](https://github.com/vllm-project/vllm-ascend) to enable **~15% faster prefill** for Qwen3.5/3.6 models<sup>[3]</sup>.
 
 - [1] Compared to the triton kernels used [in vllm-ascend](https://github.com/vllm-project/vllm-ascend/tree/v0.19.1rc1/vllm_ascend/ops/triton/fla)/[sgl-kernel-npu](https://github.com/sgl-project/sgl-kernel-npu/tree/2026.05.01/python/sgl_kernel_npu/sgl_kernel_npu/fla). See [Performance highlights](#performance-highlights).
 - [2] All 6 stages: `chunk_cumsum`, `scaled_dot_kkt`, `solve_tril`, `wy_fast`, `chunk_h`, `chunk_o`. Plus a merged metakernel to save kernel launch overhead.
-- [3] Tested model sizes: `0.8B`, `2B`, `4B`, `9B`, `27B`, `35B-A3B`. For larger `122B-A10B` `397B-A17B`, need to adapt for tensor parallelism.
+- [3] Tested model sizes: `0.8B`, `2B`, `4B`, `9B`, `27B`, `35B-A3B`. For larger `122B-A10B` `397B-A17B`, need to adapt for multi-device parallelism.
 
 See full report [in English](blog/mega_gdn_en.md) or [in Chinese](blog/mega_gdn_zh.md).
 
@@ -21,7 +25,7 @@ docker pull quay.io/ascend/vllm-ascend:v0.19.1rc1
 
 If only test PTO kernels (no vllm and triton), then a standard CANN installation plus torch-npu is sufficent. Recommend [CANN docker images](https://quay.io/repository/ascend/cann?tab=tags). CANN 8.5.0~9.0.0 are verified. A minimum dockerfile example:
 
-```bash
+```dockerfile
 FROM quay.io/ascend/cann:8.5.1-910b-ubuntu22.04-py3.11
 
 # older torch version also works
@@ -32,7 +36,7 @@ RUN pip install --no-cache-dir torch==2.9.0 --index-url https://download.pytorch
 
 ## Installation
 
-PTO kernels depend on [PTO-ISA](gitcode.com/cann/pto-isa) which is included as git submodule.
+PTO kernels depend on [PTO-ISA](gitcode.com/cann/pto-isa) library which is included as git submodule.
 
 ```bash
 git clone --recursive https://github.com/huawei-csl/megagdn-pto.git
@@ -75,7 +79,7 @@ bash benchmarks/eval_acc/run_eval_suite.sh  # lm-eval accuracy check, takes 20 m
 
 Kernel performance vs Triton, measured on 910B2.
 
-<img src="outputs/figure/kernel_stages_N16_L8192_H16.png" alt="alt text" style="width: 70%;" />
+<img src="outputs/figure/kernel_stages_N16_L8192_H16.png" alt="alt text" style="width: 80%;" />
 
 No loss in lm-eval scores for vllm-ascend inference. Just better & faster kernels.
 
@@ -85,7 +89,7 @@ Prefill speed-up for vllm-ascend 0.18, measured on Atlas A2 (uses single NPU)
 
 <img src="outputs/figure/prefill_qwen36_35b_a3b_w8a8.png" alt="alt text" style="width: 50%;" />
 
-Prefill speed-up for vllm-ascend 0.19 (both triton baseline and PTO become faster than 0.18, due to framework-side optimization)
+Prefill speed-up for vllm-ascend 0.19 (both triton baseline and PTO become faster than 0.18, due to framework-side optimizations)
 
 <img src="outputs/figure/prefill_qwen36_35b_a3b_w8a8_v019.png" alt="alt text" style="width: 50%;" />
 
