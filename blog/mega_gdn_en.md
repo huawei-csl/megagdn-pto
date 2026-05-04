@@ -76,7 +76,7 @@ Tensor-parallel sharding changes the effective shapes; this article targets sing
 
 # Six kernels benchmarked: PTO vs Triton
 
-Compared to the Triton kernels used [in vllm-ascend](https://github.com/vllm-project/vllm-ascend/tree/v0.19.1rc1/vllm_ascend/ops/triton/fla)/[sgl-kernel-npu](https://github.com/sgl-project/sgl-kernel-npu/tree/2026.05.01/python/sgl_kernel_npu/sgl_kernel_npu/fla), our PTO kernels are **3x** faster for the costly stages such as `chunk_h`, `chunk_k`, `wy_fast`. The Triton baseline uses default chunk_size(BT) = 64. As said before, we also tried recompiling Triton kernels with chunk_size=128 -- `chunk_h` and `wy_fast` run faster, only being **1.5x** slower than our PTO kernels. But `chunk_o` and `scaled_dot_kkt` failed, and the Triton `solve_tril` is hard-coded to chunk 64.
+Compared to the Triton kernels used [in vllm-ascend](https://github.com/vllm-project/vllm-ascend/tree/v0.19.1rc1/vllm_ascend/ops/triton/fla)/[sgl-kernel-npu](https://github.com/sgl-project/sgl-kernel-npu/tree/2026.05.01/python/sgl_kernel_npu/sgl_kernel_npu/fla), our PTO kernels are **3x** faster for the costly stages such as `chunk_h`, `chunk_k`, `wy_fast`. The Triton baseline uses default chunk_size(BT) = 64. As said before, we also tried recompiling Triton kernels with chunk_size=128 -- `chunk_h` and `wy_fast` run faster, only being **1.5~2x** slower than our PTO kernels. But `chunk_o` and `scaled_dot_kkt` failed, and the Triton `solve_tril` is hard-coded to chunk 64.
 
 <img src="fig/kernel_stages_N16_L8192_H16.png" alt="alt text" style="width: 80%;" />
 
