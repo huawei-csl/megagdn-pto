@@ -8,4 +8,6 @@ Also vendored (same tag) from [`vllm_ascend/ops/triton/triton_utils.py`](https:/
 
 Runtime still expects **`from vllm.triton_utils import tl, triton`** (vLLM’s Triton bindings for Ascend).
 
-**Local edits:** `solve_tril.py` — `extract_slice` / `insert_slice` import from `.ascend_triton_utils` instead of `vllm_ascend.ops.triton.triton_utils`.
+**Local edits:**
+`solve_tril.py` — `extract_slice` / `insert_slice` import from `.ascend_triton_utils` instead of `vllm_ascend.ops.triton.triton_utils`.
+`chunk.py` — only `chunk_gated_delta_rule_fwd` is kept (no distributed).
