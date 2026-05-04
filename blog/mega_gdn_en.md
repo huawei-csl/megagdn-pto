@@ -1,4 +1,4 @@
-# MegaGDN: One fused kernel cuts Qwen3.5/3.6 prefill TTFT by 15% <br/> (enable high-performance PTO kernels in vLLM-Ascend)
+# MegaGDN: One fused kernel cuts Qwen3.5/3.6 inference TTFT by 15% <br/> (accelerate vLLM-Ascend by PTO-ISA)
 
 - Author: Jiawei Zhuang
 - Team: Aleksandros Sobczyk, Gioele Gottardo, Filip Skogh, Mirko De Vita, Christos Konstantinos Matzoros, Anastasios Zouzias, Jiawei Zhuang
@@ -6,13 +6,16 @@
 **TL;DR**: We reimplemented every stage of chunk Gated DeltaNet (GDN) using PTO ISA for NPU. Each stage is **1.5~3x** faster than the corresponding Triton kernels in vLLM-Ascend, and all stages are further merged together to reduce kernel launch overhead. Integrated into vLLM, we measured **15% lower prefill TTFT** for Qwen3.5/3.6, with **no accuracy regression** on lm-eval benchmarks.
 
 **To reproduce everything in this post**, see:
-- Operator source, micro-benchmarks, accuracy tests, and the vLLM-Ascend integration: https://github.com/huawei-csl/megagdn-pto
-- vLLM-Ascend pull request: https://github.com/vllm-project/vllm-ascend/pulls (**TODO**)
+- Kernel source code, accuracy and performance tests, and vLLM-Ascend patch: https://github.com/huawei-csl/megagdn-pto
+- vLLM-Ascend pull request: https://github.com/vllm-project/vllm-ascend/pull/8872
 
 # Outline
 
 - [Overall design: Chunk-128 GDN kernel tailored to the NPU](#overall-design-chunk-128-gdn-kernel-tailored-to-the-npu)
-- [Requirements: dynamic batch axes and the full Qwen3.5/3.6 shape matrix](#requirements-dynamic-batch-axes-and-the-full-qwen3536-shape-matrix)
+  - [Compared with existing Triton and TileLang samples](#compared-with-existing-triton-and-tilelang-samples)
+- [Requirements: dynamic batch axes and full Qwen3.5/3.6 shape list](#requirements-dynamic-batch-axes-and-full-qwen3536-shape-list)
+  - [Dynamic axes](#dynamic-axes)
+  - [Static axes](#static-axes)
 - [Six kernels benchmarked: PTO vs Triton](#six-kernels-benchmarked-pto-vs-triton)
 - [Megakernel: single launch to reduce host overhead](#megakernel-single-launch-to-reduce-host-overhead)
   - [Host overhead in eager PyTorch](#host-overhead-in-eager-pytorch)
@@ -21,7 +24,7 @@
 
 # Overall design: Chunk-128 GDN kernel tailored to the NPU
 
-In the [chunkwise algorithm](https://sustcsonglin.github.io/blog/2024/deltanet-2/#a-chunkwise-algorithm-for-deltanet) for linear attention family, the central knob is the chunk size `C`, analogous to the sequence tile `S` in FlashAttention: it determines arithmetic intensity and thus how well the matrix engine (Cube / Tensor Core) can be fed. GPU kernels prefer small chunks: [FLA](https://github.com/fla-org/flash-linear-attention) defaults to 64 (the `BT` parameter in the Triton sources), while [FlashKDA](https://github.com/MoonshotAI/FlashKDA/blob/master/docs/20260420-flashkda-v1-deep-dive.md) goes even smaller, down to 16 -- partly because the triangular-inverse step costs `O(C^3)` FLOPs that are not "just cheap Matmul FLOPs", so an oversized chunk makes inversion the slow bottleneck.
+In the [chunkwise algorithm](https://sustcsonglin.github.io/blog/2024/deltanet-2/#a-chunkwise-algorithm-for-deltanet) for linear attention family, the central knob is the chunk size `C`, analogous to the sequence tile `S` in FlashAttention: it determines arithmetic intensity and thus how well the matrix engine (Cube / Tensor Core) can be fed. GPU kernels prefer small chunks: [FLA](https://github.com/fla-org/flash-linear-attention) defaults to 64 (the `BT` parameter in the Triton sources), while [FlashKDA](https://github.com/MoonshotAI/FlashKDA/blob/master/docs/20260420-flashkda-v1-deep-dive.md) goes even smaller, down to 16 -- partly because the triangular-inverse step costs `O(C^3)` FLOPs that are not "just cheap Matmul FLOPs", so an oversized chunk makes inversion the slow bottleneck. *(Note: although solving $Lx = y$ is only quadratic, explicitly forming the inverted matrix $L^{-1}$ is **cubic** w.r.t. matrix size — same big-O class as LU factorization, just with a smaller constant factor)*
 
 Our previous post on [NPU-friendly inversion algorithm](https://github.com/huawei-csl/gdn-tri-inverse/blob/0.1.0/markdown/fast_inverse_blog/fast_inverse.md) removed that bottleneck for chunk size 128, so the full GDN pipeline can be reformulated in chunk 128. (Why not 256? Past the corner of the hardware roofline, extra FLOPs stop being “free”; the trade-off turns negative.)
 
@@ -31,7 +34,7 @@ vLLM-Ascend and sgl-kernel-npu already ship Triton implementations -- so why not
 
 We also studied tilelang-ascend’s [opt_gdn](https://github.com/tile-ai/tilelang-ascend/tree/67d6a4a818e864b8cfb84e310ec568bd18b879fe/examples/linear_attention_and_rnn/opt_gdn) (static shapes only) and [chunk_gated_delta_rule](https://github.com/tile-ai/tilelang-ascend/tree/67d6a4a818e864b8cfb84e310ec568bd18b879fe/examples/chunk_gated_delta_rule) (currently only the `chunk_h` stage). We completed all six stages, added support for variable-length dynamic-shape batches, and hand-tuned the PTO-ISA C++ for a large performance jump.
 
-# Requirements: dynamic batch axes and the full Qwen3.5/3.6 shape matrix
+# Requirements: dynamic batch axes and full Qwen3.5/3.6 shape list
 
 To land inside a production inference stack, we must decide which tensor axes are true runtime-dynamic shapes and which can be compile-time constants (macros or C++ template parameters) to simplify tiling and squeeze more performance.
 
@@ -44,7 +47,7 @@ Batch and sequence length are obviously dynamic for prefill. Following FLA namin
 - `pto::TLOAD` / `pto::TSTORE` offsets need the accumulated `cu_seqlens`, not raw per-seq lengths alone.
 
 Readers familiar with FLA’s Triton will notice extra arguments such as `chunk_indices` and `chunk_offset`. Our NPU kernels drop them. Why it differs comes down to how multicore `block_idx` is assigned; see our earlier note on [NPU kernel launch behavior](https://github.com/huawei-csl/pto-dsl/blob/0.1.2/examples/aot/matmul_optimization_guide/matmul_optim_guide.md#typical-kernel-launch-syntax). In Triton/CUDA the launch grid often scales with data size, for example:
-- In [chunk_delta_h.py](https://github.com/fla-org/flash-linear-attention/blob/v0.4.2/fla/ops/common/chunk_delta_h.py#L691C5-L691C61), `grid = (triton.cdiv(V, meta['BV']), N*H)`.
+- In [chunk_delta_h.py](https://github.com/fla-org/flash-linear-attention/blob/v0.4.2/fla/ops/common/chunk_delta_h.py#L691), `grid = (triton.cdiv(V, meta['BV']), N*H)`.
 - Because `block_idx` (Triton’s `program_id`) is unbounded, mapping a program id to a chunk index needs side metadata (`chunk_indices`, `chunk_offset`).
 - NPU code typically fixes `block_dim = num_cores` with `block_idx` in `[0, num_cores - 1]` and just assigns workload across cores inside main loops.
 
