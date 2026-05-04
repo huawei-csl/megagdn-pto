@@ -78,7 +78,7 @@ Tensor-parallel sharding changes the effective shapes; this article targets sing
 
 Compared to the triton kernels used [in vllm-ascend](https://github.com/vllm-project/vllm-ascend/tree/v0.19.1rc1/vllm_ascend/ops/triton/fla)/[sgl-kernel-npu](https://github.com/sgl-project/sgl-kernel-npu/tree/2026.05.01/python/sgl_kernel_npu/sgl_kernel_npu/fla), our PTO kernels are **3x** faster for the costly stages such as `chunk_h`, `chunk_k`, `wy_fast`. The triton baseline uses default chunk_size(BT) = 64. . As said before we also tried recompiling triton kernels with chunk_size=128 -- `chunk_h` and `wy_fast` runs faster, only being **1.5x** slower than our PTO kernels. But `chunk_o` and `scaled_dot_kkt` failed, and the triton `solve_tril` is hard-coded to chunk 64.
 
-![alt text](fig/kernel_stages_N16_L8192_H16.png)
+<img src="fig/kernel_stages_N16_L8192_H16.png" alt="alt text" style="width: 80%;" />
 
 (Reproduced by scripts in `benchmarks/kernel/` directory. Raw performance data for more shape configs inside `outputs/data/` directory.)
 
@@ -90,7 +90,7 @@ Results are from 910B2 devices. 910C can reuse the same kernel code. PTO-ISA abs
 
 Kernel-only optimizations alone are not enough to speed-up end-to-end inference on Atlas A2/A3 systems -- those machines are notoriously easy to get host-bounded when running pytorch eager mode. Profiling vLLM prefill (original triton backend) shows large bubbles on device side, due to host-side Python overhead and kernel launch overhead.
 
-![alt text](fig/torch_profiling.png)
+<img src="fig/torch_profiling.png" alt="alt text" style="width: 80%;" />
 
 (reproduced by `profiling/` directory)
 
@@ -114,10 +114,12 @@ No loss in lm-eval scores for vllm-ascend inference. Just better & faster kernel
 
 <img src="fig/eval_accuracy.png" alt="alt text" style="width: 70%;" />
 
-Prefill speed-up for vllm-ascend 0.18, measured on Atlas A2 (uses single NPU)
+To measure the prefill TTFT, we use the `first_token_latency` metric in the built-in `RequestStateStats` class defined by [vllm/v1/metrics/stats.py](https://github.com/vllm-project/vllm/blob/v0.19.1/vllm/v1/metrics/stats.py#L216). Medium and mean TTFT agree well, we report medium here.
+
+Observed 15~25% (average 20%) prefill speed-up for vllm-ascend 0.18, measured on Atlas A2 (uses single NPU)
 
 <img src="fig/prefill_qwen36_35b_a3b_w8a8.png" alt="alt text" style="width: 50%;" />
 
-Prefill speed-up for vllm-ascend 0.19 (both triton baseline and PTO backend become faster than 0.18, due to framework-side optimizations)
+Observed average 15% prefill speed-up for vllm-ascend 0.19 (both triton baseline and new PTO backend become faster than in 0.18, due to framework-side optimizations)
 
 <img src="fig/prefill_qwen36_35b_a3b_w8a8_v019.png" alt="alt text" style="width: 50%;" />
