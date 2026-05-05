@@ -75,6 +75,15 @@ bash benchmarks/vllm_prefill/run_prefill_sweep.sh  # prefill speed-up
 bash benchmarks/eval_acc/run_eval_suite.sh  # lm-eval accuracy check, takes 20 min for one model
 ```
 
+## Generating figures
+
+After running the benchmarks, use `scripts/plot_results.py` to generate all figures under `outputs/figure/`.
+
+```bash
+# Plot all available data (prefill/eval via --auto paths; omit kernel unless flags set)
+python scripts/plot_results.py --auto
+```
+
 # Performance highlights
 
 Kernel performance vs Triton, measured on 910B2.
