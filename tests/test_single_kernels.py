@@ -329,10 +329,11 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
                 stream=stream, g_t=g_t, chunk_size=C,
                 cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
     torch.npu.synchronize()
-    h_ref, v_ref, _ = ref_chunk_h(k.cpu(), w.cpu(), u.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
+    h_ref, v_ref, fs_ref = ref_chunk_h(k.cpu(), w.cpu(), u.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
     ok_h = stats_ok(s_out.float().cpu().view(tc_n, H, D, D), h_ref.float())
     ok_v = stats_ok(v_out.float().cpu(), v_ref.float())
-    return ok_h and ok_v
+    ok_fs = stats_ok(fs_out.float().cpu().view(N_seq, H, D, D), fs_ref.float())
+    return ok_h and ok_v and ok_fs
 
 
 def test_wy(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
