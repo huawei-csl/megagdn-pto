@@ -5,7 +5,7 @@ Matches the math of ``kda_naive.naive_chunk_kda`` exactly, which is used as
 ground truth in test_kda_e2e.py.  No CUDA extensions, no FLA imports.
 
 KDA pipeline stages:
-  gate_cumsum → kkt (L matrix) → inversion → wy (u, w) → recurrent (Aqk + state)
+  gate_cumsum → kkt (L matrix) → inversion → wy (u, w) → chunk_h_kda (snapshots + v_corr) → chunk_o_kda (output)
 
 Key math (see kda_naive.py):
   - g is per-dimension log-space decay (natural exp applied internally)
@@ -262,6 +262,119 @@ def ref_recurrent_kda(
 
 
 # ---------------------------------------------------------------------------
+# Stage 6 – chunk_h_kda: sequential state pass (snapshot S + compute v_corr)
+# ---------------------------------------------------------------------------
+
+def ref_chunk_h_kda(
+    k: torch.Tensor,
+    u: torch.Tensor,
+    w: torch.Tensor,
+    g_cs: torch.Tensor,
+    chunk_size: int,
+    cu_seqlens=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sequential state pass: snapshot S entering each chunk, compute v_corr.
+
+    Mirrors GDN's ref_chunk_h.  The state S [K, V] propagates sequentially
+    across chunks within each sequence.  Both output terms in chunk_o depend
+    on S *entering* the chunk, so snapshotting here decouples output computation.
+
+    Args:
+        k:    [B, T, HV, K]  float32, keys (GQA-expanded)
+        u:    [B, T, HV, V]  float32, from ref_wy_kda
+        w:    [B, T, HV, K]  float32, from ref_wy_kda
+        g_cs: [B, T, HV, K]  float32, within-chunk cumulative gate sum
+        chunk_size, cu_seqlens: as in other stages
+
+    Returns:
+        s_snapshots: [total_chunks, HV, K, V]  float32 — S entering each chunk
+        v_corr:      [B, T, HV, V]             float32 — u - w @ S per position
+    """
+    B, T, HV, Kd = k.shape
+    Vd = u.shape[-1]
+    ranges = _seq_ranges(T, cu_seqlens)
+    n_chunks = sum((eos - bos + chunk_size - 1) // chunk_size for bos, eos in ranges)
+    s_snapshots = torch.zeros(n_chunks, HV, Kd, Vd, dtype=torch.float32)
+    v_corr_out  = torch.zeros(B, T, HV, Vd, dtype=torch.float32)
+    ci_base = 0
+    for bos, eos in ranges:
+        nc = (eos - bos + chunk_size - 1) // chunk_size
+        for h in range(HV):
+            S = torch.zeros(Kd, Vd, dtype=torch.float32)
+            for ci in range(nc):
+                s = bos + ci * chunk_size
+                e = min(s + chunk_size, eos)
+                gc      = g_cs[0, s:e, h, :]                       # [c_len, K]
+                g_total = gc[-1]                                    # [K]
+                kc      = k[0, s:e, h, :]                          # [c_len, K]
+                uc      = u[0, s:e, h, :]                          # [c_len, V]
+                wc      = w[0, s:e, h, :]                          # [c_len, K]
+                s_snapshots[ci_base + ci, h] = S.clone()
+                v_corr = uc - wc @ S                               # [c_len, V]
+                v_corr_out[0, s:e, h, :] = v_corr
+                k_rest = kc * torch.exp(g_total.unsqueeze(0) - gc) # [c_len, K]
+                S = torch.exp(g_total).unsqueeze(-1) * S + k_rest.T @ v_corr
+        ci_base += nc
+    return s_snapshots, v_corr_out
+
+
+# ---------------------------------------------------------------------------
+# Stage 7 – chunk_o_kda: output pass (no sequential state dependency)
+# ---------------------------------------------------------------------------
+
+def ref_chunk_o_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v_corr: torch.Tensor,
+    s_snapshots: torch.Tensor,
+    g_cs: torch.Tensor,
+    chunk_size: int,
+    cu_seqlens=None,
+) -> torch.Tensor:
+    """Output pass: compute o from pre-computed state snapshots and v_corr.
+
+    Mirrors GDN's ref_chunk_o.  Each chunk's output depends only on
+    s_snapshots[ci] (the state *entering* that chunk) and v_corr — no
+    sequential dependency between chunks within this pass.
+
+    Args:
+        q:           [B, T, HV, K]         float32, queries (scale already applied)
+        k:           [B, T, HV, K]         float32, keys (GQA-expanded)
+        v_corr:      [B, T, HV, V]         float32, from ref_chunk_h_kda
+        s_snapshots: [total_chunks, HV, K, V]  float32, from ref_chunk_h_kda
+        g_cs:        [B, T, HV, K]         float32, within-chunk cumulative gate sum
+        chunk_size, cu_seqlens: as in other stages
+
+    Returns:
+        o: [B, T, HV, V]  float32
+    """
+    B, T, HV, Kd = q.shape
+    Vd = v_corr.shape[-1]
+    o = torch.zeros(B, T, HV, Vd, dtype=torch.float32)
+    ci_base = 0
+    for bos, eos in _seq_ranges(T, cu_seqlens):
+        nc = (eos - bos + chunk_size - 1) // chunk_size
+        for h in range(HV):
+            for ci in range(nc):
+                s = bos + ci * chunk_size
+                e = min(s + chunk_size, eos)
+                gc  = g_cs[0, s:e, h, :]             # [c_len, K]
+                qc  = q[0, s:e, h, :]                # [c_len, K]
+                kc  = k[0, s:e, h, :]                # [c_len, K]
+                vc  = v_corr[0, s:e, h, :]           # [c_len, V]
+                S   = s_snapshots[ci_base + ci, h]   # [K, V]
+                inter = (qc * torch.exp(gc)) @ S     # [c_len, V]
+                delta_g = gc.unsqueeze(1) - gc.unsqueeze(0)          # [c_len, c_len, K]
+                Aqk = torch.tril(
+                    (qc.unsqueeze(1) * kc.unsqueeze(0)
+                     * torch.exp(delta_g)).sum(-1),
+                    diagonal=0)                                       # [c_len, c_len]
+                o[0, s:e, h, :] = inter + Aqk @ vc
+        ci_base += nc
+    return o
+
+
+# ---------------------------------------------------------------------------
 # Full CPU pipeline
 # ---------------------------------------------------------------------------
 
@@ -304,7 +417,8 @@ def cpu_pipeline_kda(
     L    = ref_kkt_kda(kf, g_cs, bf, chunk_size, cu_seqlens_list)
     INV  = ref_inversion_kda(L, chunk_size, cu_seqlens_list)
     u, w = ref_wy_kda(kf, vf, g_cs, bf, INV, chunk_size, cu_seqlens_list)
-    return ref_recurrent_kda(qf, kf, u, w, g_cs, chunk_size, cu_seqlens_list)
+    s_snapshots, v_corr = ref_chunk_h_kda(kf, u, w, g_cs, chunk_size, cu_seqlens_list)
+    return ref_chunk_o_kda(qf, kf, v_corr, s_snapshots, g_cs, chunk_size, cu_seqlens_list)
 
 
 # ---------------------------------------------------------------------------
@@ -464,16 +578,60 @@ def test_pipeline(tc: TestCase, H: int) -> bool:
     return bool(torch.allclose(o1, o2))
 
 
+def test_chunk_h_kda(tc: TestCase, H: int) -> bool:
+    """chunk_h structural checks: first snapshot is zero; v_corr at chunk start equals u."""
+    q, k, v, g_log, beta_sig, scale = _make_inputs(tc, H)
+    kf = k.float()
+    vf = v.float()
+    bf = beta_sig.float()
+    g_cs = ref_gate_cumsum(g_log.float(), CHUNK, tc.cu_seqlens_list)
+    L    = ref_kkt_kda(kf, g_cs, bf, CHUNK, tc.cu_seqlens_list)
+    INV  = ref_inversion_kda(L, CHUNK, tc.cu_seqlens_list)
+    u, w = ref_wy_kda(kf, vf, g_cs, bf, INV, CHUNK, tc.cu_seqlens_list)
+    s_snapshots, v_corr = ref_chunk_h_kda(kf, u, w, g_cs, CHUNK, tc.cu_seqlens_list)
+    # First snapshot of every sequence is zero (no prior state)
+    ci_base = 0
+    for bos, eos in _seq_ranges(tc.T, tc.cu_seqlens_list):
+        if s_snapshots[ci_base].abs().max().item() > 1e-7:
+            return False
+        ci_base += (eos - bos + CHUNK - 1) // CHUNK
+    # v_corr at the first position of each sequence equals u (S=0 initially)
+    for bos, eos in _seq_ranges(tc.T, tc.cu_seqlens_list):
+        e = min(bos + CHUNK, eos)
+        if not stats_ok(v_corr[0, bos:e], u[0, bos:e]):
+            return False
+    return True
+
+
+def test_chunk_o_kda(tc: TestCase, H: int) -> bool:
+    """chunk_h + chunk_o composed output matches ref_recurrent_kda."""
+    q, k, v, g_log, beta_sig, scale = _make_inputs(tc, H)
+    qf = q.float() * scale
+    kf = k.float()
+    vf = v.float()
+    bf = beta_sig.float()
+    g_cs = ref_gate_cumsum(g_log.float(), CHUNK, tc.cu_seqlens_list)
+    L    = ref_kkt_kda(kf, g_cs, bf, CHUNK, tc.cu_seqlens_list)
+    INV  = ref_inversion_kda(L, CHUNK, tc.cu_seqlens_list)
+    u, w = ref_wy_kda(kf, vf, g_cs, bf, INV, CHUNK, tc.cu_seqlens_list)
+    o_ref   = ref_recurrent_kda(qf, kf, u, w, g_cs, CHUNK, tc.cu_seqlens_list)
+    s_snapshots, v_corr = ref_chunk_h_kda(kf, u, w, g_cs, CHUNK, tc.cu_seqlens_list)
+    o_split = ref_chunk_o_kda(qf, kf, v_corr, s_snapshots, g_cs, CHUNK, tc.cu_seqlens_list)
+    return stats_ok(o_split, o_ref)
+
+
 # ---------------------------------------------------------------------------
 # Stage registry and runner
 # ---------------------------------------------------------------------------
 
 _STAGES = {
-    "cumsum":   ("Gate cumsum",           test_gate_cumsum),
-    "kkt":      ("KKT (L matrix)",        test_kkt),
-    "inv":      ("Neumann (I+L)^{-1}",   test_neumann_inv),
-    "wy":       ("WY transform (u, w)",   test_wy),
-    "pipeline": ("Full pipeline (det.)",  test_pipeline),
+    "cumsum":   ("Gate cumsum",                test_gate_cumsum),
+    "kkt":      ("KKT (L matrix)",             test_kkt),
+    "inv":      ("Linalg (I+L)^{-1}",         test_neumann_inv),
+    "wy":       ("WY transform (u, w)",        test_wy),
+    "chunk_h":  ("chunk_h_kda (snapshots)",    test_chunk_h_kda),
+    "chunk_o":  ("chunk_o_kda (output)",       test_chunk_o_kda),
+    "pipeline": ("Full pipeline (det.)",       test_pipeline),
 }
 
 
