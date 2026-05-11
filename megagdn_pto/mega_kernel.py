@@ -18,6 +18,8 @@ import torch
 
 from megagdn_pto.compile import BLOCK_DIM, _KERNELS_PTO, compile_mega_kernel
 from megagdn_pto.kernel_libs import (
+    _prepare_initial_state,
+    _seed_initial_state_snapshots,
     chunk_gdn_causal_masks,
     precomputed_minus_identity,
     total_chunks,
@@ -44,7 +46,7 @@ def _load_mega_kernel(
     lib = ctypes.CDLL(os.path.abspath(lib_path))
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
-        + [ctypes.c_void_p] * 28
+        + [ctypes.c_void_p] * 29
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
@@ -65,6 +67,7 @@ def run_mega_kernel(
     block_dim: int | None = None,
     key_heads: int | None = None,
     return_final_state: bool = False,
+    initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run all seven GDN stages in a single fused NPU kernel launch.
 
@@ -80,6 +83,8 @@ def run_mega_kernel(
         block_dim:        AI-Core block count (auto-detected if None).
         key_heads:        Number of Q/K heads Hg (inferred from ``q`` if None).
         return_final_state: If True, also return ``[N_seq, H, D, D]`` final states.
+        initial_state:    Optional initial recurrent state, shaped
+                          ``[N_seq, H, D, D]`` or ``[N_seq*H, D, D]``.
 
     Returns:
         ``O * scale`` of shape ``[B, T, H, D]`` fp16, and optionally the final
@@ -102,6 +107,13 @@ def run_mega_kernel(
 
     tc = total_chunks(N_seq, T, C, cu_seqlens)
     num_matrices = tc * H
+    initial_state_arg = _prepare_initial_state(
+        initial_state,
+        batch=N_seq,
+        num_heads=H,
+        hidden_size=D,
+        device=dev,
+    )
 
     g_sum    = torch.empty(1, T, H, device=dev, dtype=torch.float32)
     g_t      = torch.empty(H, T, device=dev, dtype=torch.float32)
@@ -123,13 +135,22 @@ def run_mega_kernel(
     o_ws_qs   = torch.zeros(bd, C, D, device=dev, dtype=torch.float16)
     o_ws_gated = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
     o_out     = torch.empty_like(v)
+    _seed_initial_state_snapshots(
+        s,
+        initial_state_arg,
+        batch=N_seq,
+        num_heads=H,
+        seq_len=T,
+        chunk_size=C,
+        cu_seqlens=cu_seqlens,
+    )
 
     lib = _load_mega_kernel(num_heads=H, key_heads=kh, hidden_size=D, chunk_size=C)
     lib.call_kernel(
         bd, stream,
         _vp(q), _vp(k), _vp(v), _vp(g_in), _vp(beta),
         _vp(msk_lower), _vp(msk_full), _vp(minus_identity), _vp(cu_seqlens),
-        _vp(o_out),
+        _vp(initial_state_arg), _vp(o_out),
         _vp(g_sum), _vp(g_t), _vp(beta_t),
         _vp(A), _vp(A_inv_f32), _vp(A_inv),
         _vp(w), _vp(u), _vp(s), _vp(v_new), _vp(fs),

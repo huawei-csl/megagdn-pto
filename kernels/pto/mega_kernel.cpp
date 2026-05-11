@@ -289,6 +289,7 @@ extern "C" __global__ AICORE void launch_mega_kernel(
     __gm__ uint8_t *msk_full_ptr,
     __gm__ uint8_t *minus_id_ptr,
     __gm__ uint8_t *cu_seqlens_ptr,
+    __gm__ uint8_t *initial_state_ptr,
     __gm__ uint8_t *o_ptr,
     __gm__ uint8_t *g_sum_ptr,
     __gm__ uint8_t *g_t_ptr,
@@ -438,6 +439,7 @@ extern "C" __global__ AICORE void launch_mega_kernel(
         reinterpret_cast<__gm__ half *>(s_ptr),
         reinterpret_cast<__gm__ half *>(v_new_ptr),
         reinterpret_cast<__gm__ half *>(fs_ptr),
+        reinterpret_cast<__gm__ half *>(initial_state_ptr),
         reinterpret_cast<__gm__ half *>(h_ws_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
         batch_size, seq_len, total_tokens, ffts_addr);
@@ -477,6 +479,7 @@ extern "C" void call_kernel(
     uint8_t *g_in, uint8_t *beta,
     uint8_t *msk_lower, uint8_t *msk_full,
     uint8_t *minus_id, uint8_t *cu_seqlens,
+    uint8_t *initial_state,
     uint8_t *o,
     uint8_t *g_sum, uint8_t *g_t, uint8_t *beta_t,
     uint8_t *A, uint8_t *A_inv_f32, uint8_t *A_inv,
@@ -492,6 +495,7 @@ extern "C" void call_kernel(
     rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
     launch_mega_kernel<<<block_dim, nullptr, stream>>>(
         q, k, v, g_in, beta, msk_lower, msk_full, minus_id, cu_seqlens,
+        initial_state,
         o,
         g_sum, g_t, beta_t, A, A_inv_f32, A_inv,
         w, u, s, v_new, fs,
