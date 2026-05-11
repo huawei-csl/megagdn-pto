@@ -43,61 +43,14 @@ def _ensure_int32(cu: torch.Tensor | None) -> torch.Tensor | None:
     return cu if cu.dtype == torch.int32 else cu.to(torch.int32)
 
 
-def _prepare_initial_state(
-    initial_state: torch.Tensor | None,
-    *,
-    batch: int,
-    num_heads: int,
-    hidden_size: int,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """Return initial state as contiguous ``[batch*num_heads, D, D]`` fp16."""
+def _initial_state_arg(initial_state: torch.Tensor | None) -> torch.Tensor | None:
     if initial_state is None:
         return None
-
-    flat_shape = (batch * num_heads, hidden_size, hidden_size)
-    view_shape = (batch, num_heads, hidden_size, hidden_size)
-    if tuple(initial_state.shape) == view_shape:
-        initial_state = initial_state.reshape(flat_shape)
-    elif tuple(initial_state.shape) != flat_shape:
-        raise ValueError(
-            "initial_state must have shape "
-            f"{view_shape} or {flat_shape}, got {tuple(initial_state.shape)}"
-        )
-    if initial_state.device != device:
-        raise ValueError(
-            f"initial_state must be on {device}, got {initial_state.device}"
-        )
-    return initial_state.to(dtype=torch.float16).contiguous()
-
-
-def _seed_initial_state_snapshots(
-    s_out: torch.Tensor,
-    initial_state: torch.Tensor | None,
-    *,
-    batch: int,
-    num_heads: int,
-    seq_len: int,
-    chunk_size: int,
-    cu_seqlens: torch.Tensor | None,
-) -> None:
-    if initial_state is None:
-        return
-
-    chunks = s_out.view(-1, num_heads, initial_state.shape[-2], initial_state.shape[-1])
-    init = initial_state.view(batch, num_heads, initial_state.shape[-2], initial_state.shape[-1])
-    if cu_seqlens is None:
-        chunks_per_seq = (seq_len + chunk_size - 1) // chunk_size
-        for seq_idx in range(batch):
-            chunks[seq_idx * chunks_per_seq].copy_(init[seq_idx])
-        return
-
-    cu = cu_seqlens.cpu().tolist()
-    chunk_offset = 0
-    for seq_idx in range(batch):
-        chunks[chunk_offset].copy_(init[seq_idx])
-        seqlen = cu[seq_idx + 1] - cu[seq_idx]
-        chunk_offset += (seqlen + chunk_size - 1) // chunk_size
+    if initial_state.dim() == 4:
+        initial_state = initial_state.flatten(0, 1)
+    initial_state = initial_state.to(dtype=torch.float16).contiguous()
+    torch.npu.synchronize()
+    return initial_state
 
 
 def transpose_gates(g_sum: torch.Tensor) -> torch.Tensor:
@@ -413,22 +366,7 @@ def run_chunk_h(
     batch = k.shape[0] if batch_size_override is None else batch_size_override
     cu32 = _ensure_int32(cu_seqlens)
     T = g_sum.shape[1]
-    initial_state_arg = _prepare_initial_state(
-        initial_state,
-        batch=batch,
-        num_heads=H,
-        hidden_size=D,
-        device=k.device,
-    )
-    _seed_initial_state_snapshots(
-        s_out,
-        initial_state_arg,
-        batch=batch,
-        num_heads=H,
-        seq_len=k.shape[1],
-        chunk_size=chunk_size,
-        cu_seqlens=cu32,
-    )
+    initial_state_arg = _initial_state_arg(initial_state)
     ws = torch.zeros(bd * 4, D, D, device=k.device, dtype=torch.float16)
     lib = load_chunk_h(H, D, chunk_size, key_heads=kh)
     lib.call_kernel(

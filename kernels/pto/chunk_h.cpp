@@ -572,11 +572,15 @@ AICORE void chunk_h_kernel(
       GmTensor2D<half> init_global(InitialState_handle + init_offset,
                                    init_shape, init_stride);
       DynVecTile<half, HalfC, D> init_load(HalfC, D);
-      TASSIGN(init_load, S_UB_HALF);
+      // Use K_UB_HALF as a temporary load tile. It is dead until the first
+      // real K prefetch below, and S_UB_HALF remains V-produced for stores.
+      TASSIGN(init_load, K_UB_HALF);
       TLOAD(init_load, init_global);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      TCVT(s_ub, s_ub_half, pto::RoundMode::CAST_NONE);
+      TCVT(s_ub, k_ub_half, pto::RoundMode::CAST_NONE);
+      pipe_barrier(PIPE_V);
+      TCVT(s_ub_half, s_ub, pto::RoundMode::CAST_NONE);
     } else {
       // Start each sequence/head recurrence from S_0 = 0.
       TEXPANDS(s_ub, 0.0f);
@@ -596,7 +600,21 @@ AICORE void chunk_h_kernel(
       TASSIGN(s_store, S_UB_HALF);
       TSTORE(s_global, s_store);
     }
+    {
+      // Publish S_0 for chunk_o. Later iterations store S_i for i > 0.
+      int64_t s_out_offset = (chunk_offset * H + head) * DD;
+      GmShape2D s_out_shape(HalfC, D);
+      GmStride2D s_out_stride(D);
+      GmTensor2D<half> s_out_global(
+          S_handle + s_out_offset + vid * HalfC * D, s_out_shape,
+          s_out_stride);
+      DynVecTile<half, HalfC, D> s_out_store(HalfC, D);
+      TASSIGN(s_out_store, S_UB_HALF);
+      TSTORE(s_out_global, s_out_store);
+    }
     ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
 
     int64_t chunk_start_0 = bos;
     int64_t valid0 = slen;
@@ -608,6 +626,9 @@ AICORE void chunk_h_kernel(
         static_cast<int32_t>(valid0 - static_cast<int64_t>(vid) * HalfC);
     if (valid_rows_0 < 0) valid_rows_0 = 0;
     if (valid_rows_0 > HalfC) valid_rows_0 = HalfC;
+
+    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
 
     int64_t k_offset_0 =
         (chunk_start_0 * Hg + head_g) * D + vid * HalfC * BSND_K_STRIDE;
@@ -868,6 +889,8 @@ AICORE void chunk_h_kernel(
           TSTORE(s_out_global, s_out_store);
         }
         ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+        set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
       }
 
       if (ci + 1 < static_cast<int32_t>(num_chunks)) {
