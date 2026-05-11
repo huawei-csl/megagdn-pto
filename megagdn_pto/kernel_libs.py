@@ -43,6 +43,16 @@ def _ensure_int32(cu: torch.Tensor | None) -> torch.Tensor | None:
     return cu if cu.dtype == torch.int32 else cu.to(torch.int32)
 
 
+def _initial_state_arg(initial_state: torch.Tensor | None) -> torch.Tensor | None:
+    if initial_state is None:
+        return None
+    if initial_state.dim() == 4:
+        initial_state = initial_state.flatten(0, 1)
+    initial_state = initial_state.to(dtype=torch.float16).contiguous()
+    torch.npu.synchronize()
+    return initial_state
+
+
 def transpose_gates(g_sum: torch.Tensor) -> torch.Tensor:
     """``[1, T, H]`` → ``[H, T]`` contiguous (per-head gate layout for kernels)."""
     return g_sum.squeeze(0).t().contiguous()
@@ -317,7 +327,7 @@ def load_chunk_h(
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
-        + [ctypes.c_void_p] * 9
+        + [ctypes.c_void_p] * 10
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
     )
     lib.call_kernel.restype = None
@@ -335,6 +345,7 @@ def run_chunk_h(
     *,
     stream,
     g_t: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
     chunk_size: int = 128,
     cu_seqlens: torch.Tensor | None = None,
     batch_size_override: int | None = None,
@@ -345,6 +356,7 @@ def run_chunk_h(
 
     ``k``: ``[B, T, Hg, D]``; ``w``, ``u``: ``[B, T, H, D]``.
     ``s_out``: ``[total_chunks*H, D, D]``; ``final_state_out``: ``[N_seq*H, D, D]``.
+    ``initial_state``: optional ``[N_seq, H, D, D]`` or ``[N_seq*H, D, D]``.
     """
     hg = k.shape[2]
     kh = key_heads if key_heads is not None else hg
@@ -354,12 +366,14 @@ def run_chunk_h(
     batch = k.shape[0] if batch_size_override is None else batch_size_override
     cu32 = _ensure_int32(cu_seqlens)
     T = g_sum.shape[1]
+    initial_state_arg = _initial_state_arg(initial_state)
     ws = torch.zeros(bd * 4, D, D, device=k.device, dtype=torch.float16)
     lib = load_chunk_h(H, D, chunk_size, key_heads=kh)
     lib.call_kernel(
         bd, stream,
         _vp(k), _vp(w), _vp(u), _vp(g_t),
-        _vp(s_out), _vp(v_new_out), _vp(final_state_out), _vp(ws), _vp(cu32),
+        _vp(s_out), _vp(v_new_out), _vp(final_state_out),
+        _vp(initial_state_arg), _vp(ws), _vp(cu32),
         batch, k.shape[1], T,
     )
 

@@ -18,6 +18,7 @@ import torch
 
 from megagdn_pto.compile import BLOCK_DIM, _KERNELS_PTO, compile_mega_kernel
 from megagdn_pto.kernel_libs import (
+    _initial_state_arg,
     chunk_gdn_causal_masks,
     precomputed_minus_identity,
     total_chunks,
@@ -33,7 +34,18 @@ def _load_mega_kernel(
     hidden_size: int = 128,
     chunk_size: int = 128,
 ) -> ctypes.CDLL:
-    mtime = os.stat(os.path.join(_KERNELS_PTO, "mega_kernel.cpp")).st_mtime_ns
+    mtime = max(
+        os.stat(os.path.join(_KERNELS_PTO, name)).st_mtime_ns
+        for name in (
+            "mega_kernel.cpp",
+            "chunk_cumsum.cpp",
+            "scaled_dot_kkt.cpp",
+            "tri_inverse_impl.cpp",
+            "wy_fast.cpp",
+            "chunk_h.cpp",
+            "chunk_o.cpp",
+        )
+    )
     lib_path = compile_mega_kernel(
         num_heads=num_heads,
         key_heads=key_heads,
@@ -44,7 +56,7 @@ def _load_mega_kernel(
     lib = ctypes.CDLL(os.path.abspath(lib_path))
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
-        + [ctypes.c_void_p] * 28
+        + [ctypes.c_void_p] * 29
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
@@ -65,6 +77,7 @@ def run_mega_kernel(
     block_dim: int | None = None,
     key_heads: int | None = None,
     return_final_state: bool = False,
+    initial_state: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run all seven GDN stages in a single fused NPU kernel launch.
 
@@ -80,6 +93,8 @@ def run_mega_kernel(
         block_dim:        AI-Core block count (auto-detected if None).
         key_heads:        Number of Q/K heads Hg (inferred from ``q`` if None).
         return_final_state: If True, also return ``[N_seq, H, D, D]`` final states.
+        initial_state:    Optional initial recurrent state, shaped
+                          ``[N_seq, H, D, D]`` or ``[N_seq*H, D, D]``.
 
     Returns:
         ``O * scale`` of shape ``[B, T, H, D]`` fp16, and optionally the final
@@ -102,6 +117,7 @@ def run_mega_kernel(
 
     tc = total_chunks(N_seq, T, C, cu_seqlens)
     num_matrices = tc * H
+    initial_state_arg = _initial_state_arg(initial_state)
 
     g_sum    = torch.empty(1, T, H, device=dev, dtype=torch.float32)
     g_t      = torch.empty(H, T, device=dev, dtype=torch.float32)
@@ -111,7 +127,7 @@ def run_mega_kernel(
     A_inv    = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
     w        = torch.empty_like(v)
     u        = torch.empty_like(v)
-    s        = torch.zeros(tc * H, D, D, device=dev, dtype=torch.float16)
+    s        = torch.empty(tc * H, D, D, device=dev, dtype=torch.float16)
     v_new    = torch.empty_like(v)
     fs       = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
 
@@ -129,7 +145,7 @@ def run_mega_kernel(
         bd, stream,
         _vp(q), _vp(k), _vp(v), _vp(g_in), _vp(beta),
         _vp(msk_lower), _vp(msk_full), _vp(minus_identity), _vp(cu_seqlens),
-        _vp(o_out),
+        _vp(initial_state_arg), _vp(o_out),
         _vp(g_sum), _vp(g_t), _vp(beta_t),
         _vp(A), _vp(A_inv_f32), _vp(A_inv),
         _vp(w), _vp(u), _vp(s), _vp(v_new), _vp(fs),

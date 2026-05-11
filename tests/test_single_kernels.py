@@ -117,14 +117,29 @@ def ref_kkt(k: torch.Tensor, beta: torch.Tensor, g_cumsum: torch.Tensor,
 
 
 def ref_chunk_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor,
-                g_cumsum: torch.Tensor, cs: int, cu_seqlens=None):
+                g_cumsum: torch.Tensor, cs: int, cu_seqlens=None,
+                initial_state: torch.Tensor | None = None):
     """CPU reference for chunk_h: states S, v_new, final states."""
     B, T, Hg, Dd = k.shape
     H = w.shape[2]
     grp = H // Hg
     kf, wf, uf, gf = k.float(), w.float(), u.float(), g_cumsum.float()
     ranges = _seq_ranges(T, cu_seqlens)
-    tc = total_chunks(len(ranges), T, cs, torch.tensor(cu_seqlens) if cu_seqlens else None)
+    if initial_state is not None:
+        init = initial_state.float()
+        if tuple(init.shape) == (len(ranges) * H, Dd, Dd):
+            init = init.view(len(ranges), H, Dd, Dd)
+        elif tuple(init.shape) != (len(ranges), H, Dd, Dd):
+            raise ValueError(
+                "initial_state must have shape "
+                f"{(len(ranges), H, Dd, Dd)} or {(len(ranges) * H, Dd, Dd)}, "
+                f"got {tuple(init.shape)}"
+            )
+    else:
+        init = None
+    tc = total_chunks(
+        len(ranges), T, cs, torch.tensor(cu_seqlens) if cu_seqlens else None
+    )
     h_out = torch.zeros(tc, H, Dd, Dd, dtype=torch.float32)
     v_new = torch.zeros_like(uf)
     final = torch.zeros(len(ranges), H, Dd, Dd, dtype=torch.float32)
@@ -133,7 +148,11 @@ def ref_chunk_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor,
         nc = (eos - bos + cs - 1) // cs
         for h in range(H):
             hg = h // grp
-            S = torch.zeros(Dd, Dd, dtype=torch.float32)
+            S = (
+                init[si, h].clone()
+                if init is not None
+                else torch.zeros(Dd, Dd, dtype=torch.float32)
+            )
             for ci in range(nc):
                 s, e = bos + ci * cs, min(bos + (ci + 1) * cs, eos)
                 gc = gf[0, s:e, h]
@@ -325,11 +344,19 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     s_out = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
     v_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     fs_out = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
+    initial_state = 0.01 * torch.randn(
+        N_seq, H, D, D, device=dev, dtype=torch.float16
+    )
     run_chunk_h(k, w, u, g_sum, s_out, v_out, fs_out,
-                stream=stream, g_t=g_t, chunk_size=C,
+                stream=stream, g_t=g_t,
+                initial_state=initial_state, chunk_size=C,
                 cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
     torch.npu.synchronize()
-    h_ref, v_ref, fs_ref = ref_chunk_h(k.cpu(), w.cpu(), u.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
+    h_ref, v_ref, fs_ref = ref_chunk_h(
+        k.cpu(), w.cpu(), u.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list,
+        initial_state.cpu(),
+    )
+    
     ok_h = stats_ok(s_out.float().cpu().view(tc_n, H, D, D), h_ref.float())
     ok_v = stats_ok(v_out.float().cpu(), v_ref.float())
     ok_fs = stats_ok(fs_out.float().cpu().view(N_seq, H, D, D), fs_ref.float())
