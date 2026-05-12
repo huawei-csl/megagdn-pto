@@ -301,11 +301,17 @@ def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     msk = torch.tril(torch.ones(C, C, device=dev), diagonal=-1).float()
     A_out = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
     stream = torch.npu.current_stream()._as_parameter_
-    run_scaled_dot_kkt(k, beta, g_sum, msk, A_out,
+    for _ in range(20):
+        run_scaled_dot_kkt(k, beta, g_sum, msk, A_out,
                        stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C,
                        cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
-    torch.npu.synchronize()
-    ref = ref_kkt(k.cpu(), beta.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
+        torch.npu.synchronize()
+        ref = ref_kkt(k.cpu(), beta.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
+        resbool= stats_ok(A_out.float().cpu(), ref)
+        if not resbool:
+            print(f"max a_out: {(A_out.float().cpu()-ref).abs().max()}")
+            print('failed at it!', i)
+
     return stats_ok(A_out.float().cpu(), ref)
 
 
@@ -351,12 +357,23 @@ def test_wy(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     stream = torch.npu.current_stream()._as_parameter_
     w_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     u_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
-    run_wy_fast(k, v, beta, g_sum, A, w_out, u_out,
+    k = k + 0.0
+    for i in range(35):
+        torch.npu.synchronize()
+        #torch.npu.synchronize()
+        run_wy_fast(k, v, beta, g_sum, A, w_out, u_out,
                 stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C,
                 cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
-    torch.npu.synchronize()
-    w_ref, u_ref = ref_wy(k.cpu(), v.cpu(), beta.cpu(), A.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
-    return stats_ok(w_out.float().cpu(), w_ref.float()) and stats_ok(u_out.float().cpu(), u_ref.float())
+        
+        torch.npu.synchronize()
+        w_ref, u_ref = ref_wy(k.cpu(), v.cpu(), beta.cpu(), A.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
+        resbool= stats_ok(w_out.float().cpu(), w_ref.float()) and stats_ok(u_out.float().cpu(), u_ref.float())
+        if not resbool:
+            print(f"max w_ref: {(w_out.float().cpu()-w_ref).abs().max()}")
+            print(f"max u_ref: {(u_out.float().cpu()-u_ref).abs().max()}")
+            print('failed at it!', i)
+
+    #return stats_ok(w_out.float().cpu(), w_ref.float()) and stats_ok(u_out.float().cpu(), u_ref.float())
 
 
 def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
@@ -376,18 +393,29 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     s_out = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
     v_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     fs_out = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
-    run_chunk_h(k, w, u, g_sum, s_out, v_out, fs_out,
+    for _ in range(30):
+        k = k+0.0
+        #w=w+0.0
+        #s_out=s_out-0.0
+        #torch.npu.synchronize()
+        run_chunk_h(k, w, u, g_sum, s_out, v_out, fs_out,
                 stream=stream, g_t=g_t, chunk_size=C,
                 cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
-    torch.npu.synchronize()
-    msk = torch.tril(torch.ones(C, C, device=dev), diagonal=0).float()
-    o_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
-    run_chunk_o(q, k, v_out, s_out, g_sum, msk, o_out,
+        torch.npu.synchronize()
+        msk = torch.tril(torch.ones(C, C, device=dev), diagonal=0).float()
+        o_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
+        torch.npu.synchronize()
+        run_chunk_o(q, k, v_out, s_out, g_sum, msk, o_out,
                 stream=stream, g_t=g_t, chunk_size=C,
                 cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
-    torch.npu.synchronize()
-    s_re = s_out.float().cpu().view(tc_n, H, D, D)
-    o_ref = ref_chunk_o(q.cpu(), k.cpu(), v_out.cpu(), s_re, g_sum.cpu(), C, tc.cu_seqlens_list)
+        torch.npu.synchronize()
+        s_re = s_out.float().cpu().view(tc_n, H, D, D)
+        o_ref = ref_chunk_o(q.cpu(), k.cpu(), v_out.cpu(), s_re, g_sum.cpu(), C, tc.cu_seqlens_list)
+        resbool = stats_ok(o_out.float().cpu(), o_ref.float())
+        if not resbool:
+            print('f', end='')
+        else:
+            print('.', end='')
     return stats_ok(o_out.float().cpu(), o_ref.float())
 
 
@@ -399,8 +427,9 @@ def test_cumsum(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     g = torch.randn(1, T, H, device=dev, dtype=torch.float32)
     g_sum = torch.empty_like(g)
     stream = torch.npu.current_stream()._as_parameter_
-    run_chunk_cumsum(g, g_sum, stream=stream, chunk_size=C,
-                     cu_seqlens=cu, batch_size_override=N_seq)
+    for i in range(100):
+        run_chunk_cumsum(g, g_sum, stream=stream, chunk_size=C,
+                        cu_seqlens=cu, batch_size_override=N_seq)
     torch.npu.synchronize()
     ref = ref_cumsum(g.cpu(), C, tc.cu_seqlens_list)
     return stats_ok(g_sum.cpu(), ref)
@@ -474,13 +503,14 @@ def main() -> None:
             assert H % HG == 0, f"H={H} must be divisible by Hg={HG}"
             print(f"\n  H={H} (Hg={HG})")
             for i, tc in enumerate(cases):
-                t0 = time.time()
-                ok = fn(tc, dev, H, HG)
-                dt = time.time() - t0
-                status = "PASS" if ok else "FAIL"
-                if not ok:
-                    all_pass = False
-                print(f"    [{i+1:2d}/{len(cases)}] {status}  {tc.label}  ({dt:.2f}s)")
+                for _ in range(5):
+                    t0 = time.time()
+                    ok = fn(tc, dev, H, HG)
+                    dt = time.time() - t0
+                    status = "PASS" if ok else "FAIL"
+                    if not ok:
+                        all_pass = False
+                    print(f"    [{i+1:2d}/{len(cases)}] {status}  {tc.label}  ({dt:.2f}s)")
 
     print(f"\n{'ALL PASS' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)

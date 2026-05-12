@@ -21,6 +21,7 @@ from megagdn_pto.kernel_libs import (
     chunk_gdn_causal_masks,
     precomputed_minus_identity,
     total_chunks,
+    _record_current_stream,
     _vp,
 )
 
@@ -33,7 +34,16 @@ def _load_mega_kernel(
     hidden_size: int = 128,
     chunk_size: int = 128,
 ) -> ctypes.CDLL:
-    mtime = os.stat(os.path.join(_KERNELS_PTO, "mega_kernel.cpp")).st_mtime_ns
+    source_names = (
+        "mega_kernel.cpp",
+        "chunk_cumsum.cpp",
+        "scaled_dot_kkt.cpp",
+        "tri_inverse_impl.cpp",
+        "wy_fast.cpp",
+        "chunk_h.cpp",
+        "chunk_o.cpp",
+    )
+    mtime = max(os.stat(os.path.join(_KERNELS_PTO, name)).st_mtime_ns for name in source_names)
     lib_path = compile_mega_kernel(
         num_heads=num_heads,
         key_heads=key_heads,
@@ -65,6 +75,7 @@ def run_mega_kernel(
     block_dim: int | None = None,
     key_heads: int | None = None,
     return_final_state: bool = False,
+    return_debug: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run all seven GDN stages in a single fused NPU kernel launch.
 
@@ -80,6 +91,7 @@ def run_mega_kernel(
         block_dim:        AI-Core block count (auto-detected if None).
         key_heads:        Number of Q/K heads Hg (inferred from ``q`` if None).
         return_final_state: If True, also return ``[N_seq, H, D, D]`` final states.
+        return_debug:     If True, also return intermediate tensors for stage checks.
 
     Returns:
         ``O * scale`` of shape ``[B, T, H, D]`` fp16, and optionally the final
@@ -137,8 +149,31 @@ def run_mega_kernel(
         _vp(o_ws_qk), _vp(o_ws_qs), _vp(o_ws_gated),
         N_seq, T, T, num_matrices,
     )
+    _record_current_stream(
+        q, k, v, g_in, beta, msk_lower, msk_full, minus_identity, cu_seqlens,
+        o_out, g_sum, g_t, beta_t, A, A_inv_f32, A_inv, w, u, s, v_new, fs,
+        kkt_ws, wy_ws_a1, wy_ws_a2, h_ws, o_ws_qk, o_ws_qs, o_ws_gated,
+    )
 
     o_scaled = o_out * scale
+    if return_debug:
+        debug = {
+            "g_sum": g_sum,
+            "g_t": g_t,
+            "beta_t": beta_t,
+            "A": A,
+            "A_inv_f32": A_inv_f32,
+            "A_inv": A_inv,
+            "w": w,
+            "u": u,
+            "s": s.view(tc, H, D, D),
+            "v_new": v_new,
+            "fs": fs.view(N_seq, H, D, D),
+            "o": o_out,
+        }
+        if return_final_state:
+            return o_scaled, fs.view(N_seq, H, D, D), debug
+        return o_scaled, debug
     if return_final_state:
         return o_scaled, fs.view(N_seq, H, D, D)
     return o_scaled

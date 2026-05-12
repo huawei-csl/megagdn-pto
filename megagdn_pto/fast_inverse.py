@@ -14,7 +14,11 @@ from functools import lru_cache
 import torch
 
 from megagdn_pto.compile import BLOCK_DIM, compile_tri_inverse, _KERNELS_PTO
-from megagdn_pto.kernel_libs import precomputed_minus_identity, total_chunks
+from megagdn_pto.kernel_libs import (
+    _record_current_stream,
+    precomputed_minus_identity,
+    total_chunks,
+)
 
 
 def _vp(t: torch.Tensor | None) -> ctypes.c_void_p:
@@ -71,6 +75,7 @@ def launch_tri_inverse_kernel(
         matrix_size, num_matrices, heads_with_flag,
         _vp(cu_seqlens) if cu_seqlens is not None else ctypes.c_void_p(),
     )
+    _record_current_stream(tensor_out, tensor_in, minus_identity, cu_seqlens)
 
 
 @lru_cache(maxsize=1)

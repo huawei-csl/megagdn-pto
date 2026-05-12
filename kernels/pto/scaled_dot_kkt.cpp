@@ -92,6 +92,14 @@ using namespace pto;
 #define GDN_C 128             // C = chunk size (tokens processed per chunk)
 #endif
 
+#ifndef GDN_KKT_READY_FLAG_BASE
+#define GDN_KKT_READY_FLAG_BASE 5
+#endif
+
+#ifndef GDN_KKT_FREE_FLAG_BASE
+#define GDN_KKT_FREE_FLAG_BASE 7
+#endif
+
 // ── PTO type aliases (device-only, guarded by __CCE_AICORE__) ───────────────
 // These are only compiled for the NPU device compiler (__CCE_AICORE__ is defined
 // when compiling for AI Core hardware, similar to __CUDA_ARCH__ in CUDA).
@@ -292,7 +300,7 @@ AICORE void kkt_kernel(
     for (int64_t ci = 0; ci < num_chunks; ++ci) {
       int32_t slot = static_cast<int32_t>(ci & 1);
       // Wait for Vec to finish reading the previous KK^T from this slot
-      wait_flag_dev(2 + slot);
+      wait_flag_dev(GDN_KKT_FREE_FLAG_BASE + slot);
       pipe_barrier(PIPE_ALL);
 
       int64_t chunk_start = ci * ChunkSize;
@@ -389,12 +397,13 @@ AICORE void kkt_kernel(
       // The receiving side calls wait_flag_dev(flag_id) to wait for this signal.
       //
       // In this kernel:
-      //   Cube sets flag 0/1 → Vec waits on wait_flag_dev(0/1) (KK^T ready)
-      //   Vec sets flag 2/3 → Cube waits on wait_flag_dev(2/3) (workspace free)
+      //   Cube sets flag READY_BASE+0/1 → Vec waits for KK^T ready
+      //   Vec sets flag FREE_BASE+0/1 → Cube waits for workspace free
       //
       // Signal Vec that this slot's KK^T is ready
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (slot << 8));
+      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | ((GDN_KKT_READY_FLAG_BASE + slot) << 8));
     }
+
   }
 #endif
 
@@ -447,10 +456,10 @@ AICORE void kkt_kernel(
   wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
   // Initial cross-core sync: release both workspace slots so Cube can start.
-  // Vec tells Cube "slots 0 and 1 are free" by setting flags 2 and 3.
-  // Without this, Cube would hang on wait_flag_dev(2/3) at the first iteration.
-  ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
-  ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+  // Vec tells Cube "slots 0 and 1 are free" by setting the free flags.
+  // Without this, Cube would hang on the first workspace wait.
+  ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (GDN_KKT_FREE_FLAG_BASE << 8));
+  ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | ((GDN_KKT_FREE_FLAG_BASE + 1) << 8));
 
   for (int64_t work_idx = 0;
        work_idx < (total_work + block_num - 1) / block_num; ++work_idx) {
@@ -530,10 +539,13 @@ AICORE void kkt_kernel(
       }
 
       // Wait for Cube to finish writing KK^T for this slot
-      wait_flag_dev(slot);
+      wait_flag_dev(GDN_KKT_READY_FLAG_BASE + slot);
       pipe_barrier(PIPE_ALL);
 
       if (local_valid > 0) {
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
         // ── Compute gating coefficient ────────────────────────────────
         // Step 1: Convert beta from fp16→fp32 for precision
         // Step 2: g_v[i] = g[row_offset+i] + log(β[i])  — combined row gate
@@ -633,13 +645,15 @@ AICORE void kkt_kernel(
           TASSIGN(_st, AUbHalfAddr);
           TSTORE(_gm, _st);
         }
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       }
 
       pipe_barrier(PIPE_ALL);
       // Signal Cube that this workspace slot is free for reuse.
-      // Flag (2+slot): slot 0 → flag 2, slot 1 → flag 3.
-      // Cube is waiting on wait_flag_dev(2+slot) before writing the next chunk.
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | ((2 + slot) << 8));
+      // Flag (FREE_BASE+slot): one free flag per workspace slot.
+      // Cube is waiting on wait_flag_dev(FREE_BASE+slot) before writing the next chunk.
+      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | ((GDN_KKT_FREE_FLAG_BASE + slot) << 8));
     }
   }
 #endif

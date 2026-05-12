@@ -43,6 +43,17 @@ def _ensure_int32(cu: torch.Tensor | None) -> torch.Tensor | None:
     return cu if cu.dtype == torch.int32 else cu.to(torch.int32)
 
 
+def _record_current_stream(*tensors: torch.Tensor | None) -> None:
+    """Tell PyTorch's allocator about tensors used by raw ctypes launches."""
+    for t in tensors:
+        if t is None or t.device.type != "npu":
+            continue
+        try:
+            t.record_stream(torch.npu.current_stream(t.device))
+        except Exception:
+            t.record_stream(torch.npu.current_stream())
+
+
 def transpose_gates(g_sum: torch.Tensor) -> torch.Tensor:
     """``[1, T, H]`` → ``[H, T]`` contiguous (per-head gate layout for kernels)."""
     return g_sum.squeeze(0).t().contiguous()
@@ -170,6 +181,7 @@ def run_chunk_cumsum(
     cu32 = _ensure_int32(cu_seqlens)
     lib = load_chunk_cumsum(H, g.shape[2], chunk_size)
     lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T)
+    _record_current_stream(g, g_sum, cu32)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +244,7 @@ def run_scaled_dot_kkt(
         _vp(k), _vp(beta_t), _vp(g_t), _vp(mask), _vp(ws), _vp(A_out), _vp(cu32),
         batch, k.shape[1], T,
     )
+    _record_current_stream(k, beta, g_sum, mask, A_out, g_t, beta_t, ws, cu32)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +309,9 @@ def run_wy_fast(
         _vp(k), _vp(v), _vp(beta_t), _vp(g_t), _vp(A),
         _vp(ws_a1), _vp(ws_a2), _vp(w_out), _vp(u_out), _vp(cu32),
         batch, k.shape[1], T,
+    )
+    _record_current_stream(
+        k, v, beta, g_sum, A, w_out, u_out, g_t, beta_t, ws_a1, ws_a2, cu32
     )
 
 
@@ -362,6 +378,9 @@ def run_chunk_h(
         _vp(s_out), _vp(v_new_out), _vp(final_state_out), _vp(ws), _vp(cu32),
         batch, k.shape[1], T,
     )
+    _record_current_stream(
+        k, w, u, g_sum, s_out, v_new_out, final_state_out, g_t, ws, cu32
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -427,4 +446,7 @@ def run_chunk_o(
         _vp(q), _vp(k), _vp(v_new), _vp(s), _vp(g_t), _vp(mask),
         _vp(ws_qk), _vp(ws_qs), _vp(ws_gated), _vp(o_out), _vp(cu32),
         batch, q.shape[1], T,
+    )
+    _record_current_stream(
+        q, k, v_new, s, g_sum, mask, o_out, g_t, ws_qk, ws_qs, ws_gated, cu32
     )
