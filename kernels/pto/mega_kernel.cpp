@@ -364,12 +364,6 @@ extern "C" __global__ AICORE void launch_mega_kernel(
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
         batch_size, seq_len, total_tokens, ffts_addr);
 
-#if defined(__DAV_C220_CUBE__)
-    pipe_barrier(PIPE_ALL);
-    wait_flag_dev(2);
-    wait_flag_dev(3);
-#endif
-
 #ifdef MEGA_STOP_AFTER_KKT
     pipe_barrier(PIPE_ALL);
     return;
