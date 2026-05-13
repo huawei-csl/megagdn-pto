@@ -2,7 +2,7 @@
 """CPU float32 reference implementations and unit tests for each KDA stage.
 
 Matches the math of ``kda_naive.naive_chunk_kda`` exactly, which is used as
-ground truth in test_kda_e2e.py.  No CUDA extensions, no FLA imports.
+ground truth in test_kda_e2e.py.
 
 KDA pipeline stages:
   gate_cumsum → kkt (L matrix) → inversion → wy (u, w) → chunk_h_kda (snapshots + v_corr) → chunk_o_kda (output)
@@ -18,16 +18,21 @@ Key math (see kda_naive.py):
   - output: (q*exp(g_cs)) @ S + Aqk @ (u - w @ S)
   - state:  S_new[k,:] = exp(g_total[k]) * S[k,:] + sum_c k_rest[c,k]*v_corr[c,:]
 
+Stage device requirements:
+  - cumsum: runs on NPU (requires --device); calls gate_cumsum_kda PTO kernel.
+  - all others: CPU float32 reference only.
+
 Usage::
 
-    python tests/test_kda_single_kernels.py
-    python tests/test_kda_single_kernels.py --quick
-    python tests/test_kda_single_kernels.py --stage kkt,inv
+    python tests/test_kda_single_kernels.py --device npu:0
+    python tests/test_kda_single_kernels.py --device npu:0 --quick
+    python tests/test_kda_single_kernels.py --device npu:0 --stage kkt,inv
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -363,12 +368,10 @@ def ref_chunk_o_kda(
                 kc  = k[0, s:e, h, :]                # [c_len, K]
                 vc  = v_corr[0, s:e, h, :]           # [c_len, V]
                 S   = s_snapshots[ci_base + ci, h]   # [K, V]
-                inter = (qc * torch.exp(gc)) @ S     # [c_len, V]
-                delta_g = gc.unsqueeze(1) - gc.unsqueeze(0)          # [c_len, c_len, K]
-                Aqk = torch.tril(
-                    (qc.unsqueeze(1) * kc.unsqueeze(0)
-                     * torch.exp(delta_g)).sum(-1),
-                    diagonal=0)                                       # [c_len, c_len]
+                q_eff = qc * torch.exp(gc)            # [c_len, K]
+                k_eff = kc * torch.exp(-gc)           # [c_len, K]
+                inter = q_eff @ S                     # [c_len, V]
+                Aqk   = torch.tril(q_eff @ k_eff.T, diagonal=0)  # [c_len, c_len]
                 o[0, s:e, h, :] = inter + Aqk @ vc
         ci_base += nc
     return o
@@ -495,19 +498,45 @@ def _make_inputs(tc: TestCase, H: int, HV: int | None = None):
 # Per-stage test functions
 # ---------------------------------------------------------------------------
 
-def test_gate_cumsum(tc: TestCase, H: int) -> bool:
-    q, k, v, g_log, beta_sig, scale = _make_inputs(tc, H)
-    g_cs = ref_gate_cumsum(g_log, CHUNK, tc.cu_seqlens_list)
-    # First element of each chunk equals g (cumsum[0] == g[0])
-    for bos, eos in _seq_ranges(tc.T, tc.cu_seqlens_list):
-        for j in range(0, eos - bos, CHUNK):
-            s = bos + j
-            if not torch.allclose(g_cs[:, s], g_log[:, s].float(), atol=1e-5):
-                return False
-    return True
+def test_gate_cumsum(tc: TestCase, H: int, dev: "torch.device | None" = None) -> bool:
+    """Compare gate_cumsum_kda NPU kernel output to CPU float32 reference.
+
+    Runs the PTO kernel on ``dev`` and checks that it matches ``ref_gate_cumsum``
+    element-wise within tolerance.
+
+    Args:
+        tc:  Test case (defines T and optional cu_seqlens).
+        H:   Number of value/gate heads HV.
+        dev: NPU device (e.g. ``torch.device("npu:0")``).  Required.
+    """
+    if dev is None:
+        raise ValueError("test_gate_cumsum requires --device (NPU device).")
+
+    from megagdn_pto.kda_kernel_libs import run_gate_cumsum_kda
+
+    _, _, _, g_log, _, _ = _make_inputs(tc, H)
+    # g_log: [1, T, H, K]
+    g_dev   = g_log.to(dev)
+    g_sum   = torch.empty_like(g_dev)
+    cu      = (torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
+               if tc.cu_seqlens_list else None)
+    N_seq   = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
+    stream  = torch.npu.current_stream()._as_parameter_
+
+    run_gate_cumsum_kda(
+        g_dev, g_sum,
+        stream=stream,
+        chunk_size=CHUNK,
+        cu_seqlens=cu,
+        batch_size_override=N_seq,
+    )
+    torch.npu.synchronize()
+
+    ref = ref_gate_cumsum(g_log, CHUNK, tc.cu_seqlens_list)
+    return stats_ok(g_sum.cpu(), ref)
 
 
-def test_kkt(tc: TestCase, H: int) -> bool:
+def test_kkt(tc: TestCase, H: int, dev=None) -> bool:
     q, k, v, g_log, beta_sig, scale = _make_inputs(tc, H)
     kf   = k.float()
     g_cs = ref_gate_cumsum(g_log, CHUNK, tc.cu_seqlens_list)
@@ -524,7 +553,7 @@ def test_kkt(tc: TestCase, H: int) -> bool:
     return True
 
 
-def test_neumann_inv(tc: TestCase, H: int) -> bool:
+def test_neumann_inv(tc: TestCase, H: int, dev=None) -> bool:
     q, k, v, g_log, beta_sig, scale = _make_inputs(tc, H)
     kf   = k.float()
     g_cs = ref_gate_cumsum(g_log, CHUNK, tc.cu_seqlens_list)
@@ -546,7 +575,7 @@ def test_neumann_inv(tc: TestCase, H: int) -> bool:
     return True
 
 
-def test_wy(tc: TestCase, H: int) -> bool:
+def test_wy(tc: TestCase, H: int, dev=None) -> bool:
     q, k, v, g_log, beta_sig, scale = _make_inputs(tc, H)
     kf   = k.float()
     g_cs = ref_gate_cumsum(g_log, CHUNK, tc.cu_seqlens_list)
@@ -570,7 +599,7 @@ def test_wy(tc: TestCase, H: int) -> bool:
     return True
 
 
-def test_pipeline(tc: TestCase, H: int) -> bool:
+def test_pipeline(tc: TestCase, H: int, dev=None) -> bool:
     """Determinism: two identical runs must match exactly."""
     q, k, v, g_log, beta_sig, scale = _make_inputs(tc, H)
     o1 = cpu_pipeline_kda(q, k, v, g_log, beta_sig, tc.cu_seqlens_list, scale, CHUNK)
@@ -578,7 +607,7 @@ def test_pipeline(tc: TestCase, H: int) -> bool:
     return bool(torch.allclose(o1, o2))
 
 
-def test_chunk_h_kda(tc: TestCase, H: int) -> bool:
+def test_chunk_h_kda(tc: TestCase, H: int, dev=None) -> bool:
     """chunk_h structural checks: first snapshot is zero; v_corr at chunk start equals u."""
     q, k, v, g_log, beta_sig, scale = _make_inputs(tc, H)
     kf = k.float()
@@ -603,7 +632,7 @@ def test_chunk_h_kda(tc: TestCase, H: int) -> bool:
     return True
 
 
-def test_chunk_o_kda(tc: TestCase, H: int) -> bool:
+def test_chunk_o_kda(tc: TestCase, H: int, dev=None) -> bool:
     """chunk_h + chunk_o composed output matches ref_recurrent_kda."""
     q, k, v, g_log, beta_sig, scale = _make_inputs(tc, H)
     qf = q.float() * scale
@@ -640,6 +669,11 @@ def main() -> None:
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--H", type=int, default=4)
     parser.add_argument("--stage", default=",".join(_STAGES))
+    parser.add_argument(
+        "--device", default=os.getenv("GDN_NPU_DEVICE", "npu:0"),
+        help="NPU device for stages that run on device (e.g. cumsum). "
+             "CPU-only stages ignore this. Default: $GDN_NPU_DEVICE or npu:0.",
+    )
     args = parser.parse_args()
 
     stages = [s.strip() for s in args.stage.split(",") if s.strip()]
@@ -647,9 +681,16 @@ def main() -> None:
         if s not in _STAGES:
             sys.exit(f"Unknown stage {s!r}; choose from {list(_STAGES)}")
 
+    # Initialise NPU device only when a device stage is requested.
+    dev = None
+    _DEVICE_STAGES = {"cumsum"}
+    if any(s in _DEVICE_STAGES for s in stages):
+        torch.npu.set_device(args.device)
+        dev = torch.device(args.device)
+
     cases = _build_test_cases(args.quick)
     H = args.H
-    print(f"H={H}  K={K}  V={V_DIM}  CHUNK={CHUNK}  cases={len(cases)}")
+    print(f"device={args.device}  H={H}  K={K}  V={V_DIM}  CHUNK={CHUNK}  cases={len(cases)}")
 
     all_pass = True
     for stage in stages:
@@ -657,7 +698,7 @@ def main() -> None:
         print(f"\n{'='*60}\nStage: {name}\n{'='*60}")
         for i, tc in enumerate(cases):
             t0 = time.time()
-            ok = fn(tc, H)
+            ok = fn(tc, H, dev)
             dt = time.time() - t0
             status = "PASS" if ok else "FAIL"
             if not ok:
