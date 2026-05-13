@@ -28,7 +28,9 @@ _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_PACKAGE_DIR)
 _KERNELS_PTO = os.path.join(_REPO_ROOT, "kernels", "pto")
 _KERNEL_INCLUDE = os.path.join(_KERNELS_PTO, "include")
-_COMPILED_DIR = os.path.join(_KERNELS_PTO, "compiled_lib")
+_COMPILED_DIR = os.environ.get(
+    "GDN_COMPILED_DIR", os.path.join(_KERNELS_PTO, "compiled_lib")
+)
 _DRIVER_INC = "/usr/local/Ascend/driver/kernel/inc"
 
 ASCEND_TOOLKIT_HOME: str = (
