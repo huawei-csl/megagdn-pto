@@ -107,3 +107,111 @@ def run_gate_cumsum_kda(
 
     lib = load_gate_cumsum_kda(HV, K, chunk_size)
     lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T)
+
+
+# ---------------------------------------------------------------------------
+# kkt_kda — within-chunk gated attention matrix L [B, T, HV, C]
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def load_kkt_kda(
+    num_heads: int,
+    k_dim: int = 128,
+    chunk_size: int = 16,
+) -> ctypes.CDLL:
+    """Compile + load the KDA kkt kernel.
+
+    Template parameters injected at compile time:
+        GDN_H = num_heads  (HV, number of value/gate heads)
+        GDN_D = k_dim      (K, key/gate vector dimension)
+        GDN_C = chunk_size (C, tokens per chunk)
+
+    C signature::
+        void call_kernel(uint32_t block_dim, void *stream,
+                         uint8_t *k, uint8_t *g_cs, uint8_t *beta,
+                         uint8_t *mask, uint8_t *ws_in, uint8_t *ws_out,
+                         uint8_t *L_out, uint8_t *cu_seqlens,
+                         int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    """
+    lib_path = compile_chunk_kernel(
+        "kkt_kda.cpp",
+        "kkt_kda",
+        num_heads=num_heads,
+        hidden_size=k_dim,
+        chunk_size=chunk_size,
+        key_heads=None,
+        cpp_mtime_ns=_mtime("kkt_kda.cpp"),
+    )
+    lib = ctypes.CDLL(os.path.abspath(lib_path))
+    lib.call_kernel.argtypes = (
+        [ctypes.c_uint32, ctypes.c_void_p]
+        + [ctypes.c_void_p] * 8   # k, g_cs, beta, mask, ws_in, ws_out, L_out, cu_seqlens
+        + [ctypes.c_int64] * 3    # batch_size, seq_len, total_tokens
+    )
+    lib.call_kernel.restype = None
+    return lib
+
+
+def run_kkt_kda(
+    k: torch.Tensor,
+    g_cs: torch.Tensor,
+    beta_sig: torch.Tensor,
+    L_out: torch.Tensor,
+    *,
+    stream,
+    chunk_size: int = 16,
+    cu_seqlens: torch.Tensor | None = None,
+    batch_size_override: int | None = None,
+    block_dim: int | None = None,
+) -> None:
+    """Compute within-chunk gated attention matrix into ``L_out``.
+
+    Args:
+        k:        ``[B, T, HV, K]`` float32, key vectors.
+        g_cs:     ``[B, T, HV, K]`` float32, within-chunk cumulative gate sums.
+        beta_sig: ``[B, T, HV]`` float32, per-token sigmoid beta in (0, 1).
+        L_out:    ``[B, T, HV, C]`` float32, output (pre-allocated, will be overwritten).
+        stream:   NPU stream handle (``torch.npu.current_stream()._as_parameter_``).
+        chunk_size: Tokens per chunk C.  Must match the compiled kernel.
+        cu_seqlens: ``int32`` cumulative sequence lengths for packed varlen input.
+        batch_size_override: Number of sequences (use with ``cu_seqlens``).
+        block_dim: AI-Core count; auto-detected if ``None``.
+    """
+    assert k.dtype == torch.float32
+    assert g_cs.dtype == torch.float32
+    assert beta_sig.dtype == torch.float32
+    assert L_out.dtype == torch.float32
+
+    HV = k.shape[2]
+    K  = k.shape[3]
+    T  = k.shape[1]
+    bd = block_dim or BLOCK_DIM
+    batch = k.shape[0] if batch_size_override is None else batch_size_override
+    total_tokens = T  # B=1 packed format
+
+    # Transpose to head-major [B, HV, T, K] so that per-head token rows are
+    # contiguous in memory, satisfying the MTE2 TLOAD row-stride == column-count
+    # requirement (row stride K == column count K).
+    k_t    = k.permute(0, 2, 1, 3).contiguous()
+    g_cs_t = g_cs.permute(0, 2, 1, 3).contiguous()
+    beta_t = beta_sig.permute(0, 2, 1).contiguous()
+
+    # Strictly-lower-tri mask [C, C]: 1 below diagonal, 0 on/above diagonal.
+    dev  = k.device
+    rows = torch.arange(chunk_size, device=dev).unsqueeze(1)
+    cols = torch.arange(chunk_size, device=dev).unsqueeze(0)
+    mask = (rows > cols).to(torch.float32)
+
+    ws_in  = torch.zeros(bd * 2, 2 * chunk_size, K,          device=dev, dtype=torch.float16)
+    ws_out = torch.zeros(bd * 2, chunk_size,      chunk_size, device=dev, dtype=torch.float16)
+
+    cu32 = _ensure_int32(cu_seqlens)
+
+    lib = load_kkt_kda(HV, K, chunk_size)
+    lib.call_kernel(
+        bd, stream,
+        _vp(k_t), _vp(g_cs_t), _vp(beta_t),
+        _vp(mask), _vp(ws_in), _vp(ws_out), _vp(L_out),
+        _vp(cu32),
+        batch, T, total_tokens,
+    )
