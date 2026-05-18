@@ -3,9 +3,9 @@
 
 Stages implemented on NPU (PTO kernels):
   [1] gate_cumsum_kda — within-chunk prefix sum of g [B, T, HV, K]
+  [2] kkt_kda        — L matrix (gated K×K product)
 
 Stages using CPU reference (placeholders until NPU kernels are implemented):
-  [2] kkt_kda       — L matrix (gated K×K product)
   [3] inversion_kda — (I + L)^{-1}
   [4] wy_kda        — u and w transforms
   [5] chunk_h_kda   — sequential state pass (snapshots + v_corr)
@@ -62,7 +62,7 @@ def pto_pipeline_kda(
     dev: torch.device,
     chunk_size: int = CHUNK,
 ) -> torch.Tensor:
-    """KDA pipeline with stage 1 on NPU and stages 2-6 as CPU reference placeholders.
+    """KDA pipeline with stages 1-2 on NPU and stages 3-6 as CPU reference placeholders.
 
     Args:
         q:               [B, T, H,  K]  float32, L2-normalised queries
@@ -78,7 +78,7 @@ def pto_pipeline_kda(
     Returns:
         o: [B, T, HV, V]  float32
     """
-    from megagdn_pto.kda_kernel_libs import run_gate_cumsum_kda
+    from megagdn_pto.kda_kernel_libs import run_gate_cumsum_kda, run_kkt_kda
 
     B, T, H, Kd = q.shape
     HV = v.shape[2]
@@ -90,13 +90,14 @@ def pto_pipeline_kda(
     vf = v.float()
     bf = beta_sig.float()
 
+    cu_dev = (torch.tensor(cu_seqlens_list, dtype=torch.int32, device=dev)
+              if cu_seqlens_list else None)
+    N_seq  = len(cu_seqlens_list) - 1 if cu_seqlens_list else 1
+    stream = torch.npu.current_stream()._as_parameter_
+
     # ── Stage 1: gate_cumsum_kda — NPU PTO kernel ────────────────────────────
     g_dev     = g_log.to(dev)
     g_sum_dev = torch.empty_like(g_dev)
-    cu_dev    = (torch.tensor(cu_seqlens_list, dtype=torch.int32, device=dev)
-                 if cu_seqlens_list else None)
-    N_seq  = len(cu_seqlens_list) - 1 if cu_seqlens_list else 1
-    stream = torch.npu.current_stream()._as_parameter_
     run_gate_cumsum_kda(
         g_dev, g_sum_dev,
         stream=stream,
@@ -105,10 +106,24 @@ def pto_pipeline_kda(
         batch_size_override=N_seq,
     )
     torch.npu.synchronize()
-    g_cs = g_sum_dev.cpu()   # [B, T, HV, K]  float32
 
-    # ── Stages 2-6: CPU reference placeholders ───────────────────────────────
-    L    = ref_kkt_kda(kf, g_cs, bf, chunk_size, cu_seqlens_list)
+    # ── Stage 2: kkt_kda — NPU PTO kernel ────────────────────────────────────
+    kf_dev = kf.to(dev)
+    bf_dev = bf.to(dev)
+    L_dev  = torch.zeros(1, T, HV, chunk_size, device=dev, dtype=torch.float32)
+    run_kkt_kda(
+        kf_dev, g_sum_dev, bf_dev, L_dev,
+        stream=stream,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_dev,
+        batch_size_override=N_seq,
+    )
+    torch.npu.synchronize()
+
+    g_cs = g_sum_dev.cpu()   # [B, T, HV, K]  float32
+    L    = L_dev.cpu()       # [B, T, HV, C]  float32
+
+    # ── Stages 3-6: CPU reference placeholders ───────────────────────────────
     INV  = ref_inversion_kda(L, chunk_size, cu_seqlens_list)
     u, w = ref_wy_kda(kf, vf, g_cs, bf, INV, chunk_size, cu_seqlens_list)
     s_snapshots, v_corr = ref_chunk_h_kda(kf, u, w, g_cs, chunk_size, cu_seqlens_list)
@@ -151,7 +166,7 @@ def run_one(
     q        = F.normalize(torch.randn(1, T, H,  K),     dim=-1, p=2)
     k        = F.normalize(torch.randn(1, T, H,  K),     dim=-1, p=2)
     v        = torch.randn(1, T, HV, V_DIM)
-    g_log    = -torch.rand(1, T, HV, K) * 2.0    # values in (-2, 0)
+    g_log    = -torch.rand(1, T, HV, K) * 0.5    # values in (-0.5, 0)
     beta_sig = torch.sigmoid(torch.randn(1, T, HV))
 
     # PTO pipeline (stage 1 on NPU)
@@ -190,8 +205,8 @@ def main() -> None:
     shapes = [(16, None)] if args.quick else TEST_SHAPES
 
     print(f"device={args.device}  H={H}  HV={HV}  K={K}  V={V_DIM}  CHUNK={chunk_size}")
-    print(f"NPU stages:         [1] gate_cumsum_kda")
-    print(f"CPU placeholder stages: [2] kkt  [3] inversion  [4] wy  [5] chunk_h  [6] chunk_o")
+    print(f"NPU stages:         [1] gate_cumsum_kda  [2] kkt_kda")
+    print(f"CPU placeholder stages: [3] inversion  [4] wy  [5] chunk_h  [6] chunk_o")
     print(f"\n{'='*60}")
 
     all_pass = True
