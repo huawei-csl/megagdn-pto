@@ -5,9 +5,9 @@ Stages implemented on NPU (PTO kernels):
   [1] gate_cumsum_kda — within-chunk prefix sum of g [B, T, HV, K]
   [2] kkt_kda        — L matrix (gated K×K product)
   [3] solve_tril      — (I + L)^{-1} via PTO-ISA tri_inverse kernel
+  [4] wy_kda         — u and w transforms
 
 Stages using CPU reference (placeholders until NPU kernels are implemented):
-  [4] wy_kda        — u and w transforms
   [5] chunk_h_kda   — sequential state pass (snapshots + v_corr)
   [6] chunk_o_kda   — output pass
 
@@ -36,7 +36,6 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from test_kda_single_kernels import (
-    ref_wy_kda,
     ref_chunk_h_kda,
     ref_chunk_o_kda,
     cpu_pipeline_kda,
@@ -47,7 +46,7 @@ from test_kda_single_kernels import (
 )
 
 # ---------------------------------------------------------------------------
-# PTO pipeline (gate_cumsum on NPU; stages 2-6 are CPU reference placeholders)
+# PTO pipeline (stages 1-4 on NPU; stages 5-6 are CPU reference placeholders)
 # ---------------------------------------------------------------------------
 
 def pto_pipeline_kda(
@@ -62,7 +61,7 @@ def pto_pipeline_kda(
     chunk_size: int = CHUNK,
     tri_inv_func=None,
 ) -> torch.Tensor:
-    """KDA pipeline with stages 1-3 on NPU and stages 4-6 as CPU reference placeholders.
+    """KDA pipeline with stages 1-4 on NPU and stages 5-6 as CPU reference placeholders.
 
     Args:
         q:               [B, T, H,  K]  float32, L2-normalised queries
@@ -79,11 +78,12 @@ def pto_pipeline_kda(
     Returns:
         o: [B, T, HV, V]  float32
     """
-    from megagdn_pto.kda_kernel_libs import run_gate_cumsum_kda, run_kkt_kda
+    from megagdn_pto.kda_kernel_libs import run_gate_cumsum_kda, run_kkt_kda, run_wy_kda
 
     B, T, H, Kd = q.shape
     HV = v.shape[2]
     G  = HV // H
+    Vd = v.shape[3]
 
     # GQA expansion + scale (mirrors cpu_pipeline_kda)
     qf = q.float().repeat_interleave(G, dim=2) * scale   # [B, T, HV, K]
@@ -125,11 +125,25 @@ def pto_pipeline_kda(
     A_inv_dev = solve_tril(L_dev.to(torch.float16), cu_dev, chunk_size, HV, tri_inv_func)
     torch.npu.synchronize()
 
-    g_cs = g_sum_dev.cpu()          # [B, T, HV, K]  float32
-    INV  = A_inv_dev.float().cpu()  # [B, T, HV, C]  float32
+    # ── Stage 4: wy_kda — NPU PTO kernel ─────────────────────────────────────
+    vf_dev  = vf.to(dev)
+    INV_dev = A_inv_dev.float()   # [B, T, HV, C] float32
+    u_dev   = torch.zeros(1, T, HV, Vd, device=dev, dtype=torch.float32)
+    w_dev   = torch.zeros(1, T, HV, Kd, device=dev, dtype=torch.float32)
+    run_wy_kda(
+        kf_dev, vf_dev, g_sum_dev, bf_dev, INV_dev, u_dev, w_dev,
+        stream=stream,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_dev,
+        batch_size_override=N_seq,
+    )
+    torch.npu.synchronize()
 
-    # ── Stages 4-6: CPU reference placeholders ───────────────────────────────
-    u, w = ref_wy_kda(kf, vf, g_cs, bf, INV, chunk_size, cu_seqlens_list)
+    g_cs = g_sum_dev.cpu()   # [B, T, HV, K]  float32
+    u    = u_dev.cpu()       # [B, T, HV, V]  float32
+    w    = w_dev.cpu()       # [B, T, HV, K]  float32
+
+    # ── Stages 5-6: CPU reference placeholders ───────────────────────────────
     s_snapshots, v_corr = ref_chunk_h_kda(kf, u, w, g_cs, chunk_size, cu_seqlens_list)
     return ref_chunk_o_kda(qf, kf, v_corr, s_snapshots, g_cs, chunk_size, cu_seqlens_list)
 
@@ -213,8 +227,8 @@ def main() -> None:
     shapes = [(256, None)] if args.quick else TEST_SHAPES
 
     print(f"device={args.device}  H={H}  HV={HV}  K={K}  V={V_DIM}  CHUNK={chunk_size}")
-    print(f"NPU stages:         [1] gate_cumsum_kda  [2] kkt_kda  [3] solve_tril")
-    print(f"CPU placeholder stages: [4] wy  [5] chunk_h  [6] chunk_o")
+    print(f"NPU stages:             [1] gate_cumsum_kda  [2] kkt_kda  [3] solve_tril  [4] wy_kda")
+    print(f"CPU placeholder stages: [5] chunk_h  [6] chunk_o")
     print(f"\n{'='*60}")
 
     all_pass = True
