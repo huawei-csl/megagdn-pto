@@ -40,6 +40,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from megagdn_pto.fast_inverse import load_tri_inverse, solve_tril
+
 CHUNK = 128   # small chunk for fast CPU tests
 K = 128      # key/query dimension
 V_DIM = 128  # value dimension
@@ -570,8 +572,25 @@ def test_kkt(tc: TestCase, H: int, dev=None) -> bool:
 
 
 def test_inv(tc: TestCase, H: int, dev=None) -> bool:
-    # TODO
-    return True
+    """Compare PTO-ISA tri_inverse output to ref_inversion_kda CPU reference."""
+    if dev is None:
+        raise ValueError("test_inv requires --device (NPU device).")
+
+    _, k, _, g_log, beta_sig, _ = _make_inputs(tc, H)
+
+    g_cs = ref_gate_cumsum(g_log, CHUNK, tc.cu_seqlens_list)
+    L_ref = ref_kkt_kda(k.float(), g_cs, beta_sig, CHUNK, tc.cu_seqlens_list)
+
+    L_fp16 = L_ref.to(torch.float16).to(dev)
+    cu = (torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
+          if tc.cu_seqlens_list else None)
+
+    tri_inv = load_tri_inverse()
+    A_inv = solve_tril(L_fp16, cu, CHUNK, H, tri_inv)
+    torch.npu.synchronize()
+
+    ref = ref_inversion_kda(L_ref, CHUNK, tc.cu_seqlens_list)
+    return stats_ok(A_inv.float().cpu(), ref)
 
 
 def test_wy(tc: TestCase, H: int, dev=None) -> bool:
@@ -622,7 +641,7 @@ def main() -> None:
 
     # Initialise NPU device only when a device stage is requested.
     dev = None
-    _DEVICE_STAGES = {"cumsum", "kkt"}
+    _DEVICE_STAGES = {"cumsum", "kkt", "inv"}
     if any(s in _DEVICE_STAGES for s in stages):
         torch.npu.set_device(args.device)
         dev = torch.device(args.device)

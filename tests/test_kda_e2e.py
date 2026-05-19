@@ -4,9 +4,9 @@
 Stages implemented on NPU (PTO kernels):
   [1] gate_cumsum_kda — within-chunk prefix sum of g [B, T, HV, K]
   [2] kkt_kda        — L matrix (gated K×K product)
+  [3] solve_tril      — (I + L)^{-1} via PTO-ISA tri_inverse kernel
 
 Stages using CPU reference (placeholders until NPU kernels are implemented):
-  [3] inversion_kda — (I + L)^{-1}
   [4] wy_kda        — u and w transforms
   [5] chunk_h_kda   — sequential state pass (snapshots + v_corr)
   [6] chunk_o_kda   — output pass
@@ -28,15 +28,14 @@ import time
 import torch
 import torch.nn.functional as F
 
+from megagdn_pto.fast_inverse import load_tri_inverse, solve_tril
+
 # Both helper modules are in the same tests/ directory
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from test_kda_single_kernels import (
-    ref_gate_cumsum,
-    ref_kkt_kda,
-    ref_inversion_kda,
     ref_wy_kda,
     ref_chunk_h_kda,
     ref_chunk_o_kda,
@@ -61,8 +60,9 @@ def pto_pipeline_kda(
     scale: float,
     dev: torch.device,
     chunk_size: int = CHUNK,
+    tri_inv_func=None,
 ) -> torch.Tensor:
-    """KDA pipeline with stages 1-2 on NPU and stages 3-6 as CPU reference placeholders.
+    """KDA pipeline with stages 1-3 on NPU and stages 4-6 as CPU reference placeholders.
 
     Args:
         q:               [B, T, H,  K]  float32, L2-normalised queries
@@ -74,6 +74,7 @@ def pto_pipeline_kda(
         scale:           float, query scale (typically K**-0.5)
         dev:             NPU device
         chunk_size:      int, must match compiled kernel
+        tri_inv_func:    pre-loaded tri_inverse callable (auto-loaded if None)
 
     Returns:
         o: [B, T, HV, V]  float32
@@ -120,11 +121,14 @@ def pto_pipeline_kda(
     )
     torch.npu.synchronize()
 
-    g_cs = g_sum_dev.cpu()   # [B, T, HV, K]  float32
-    L    = L_dev.cpu()       # [B, T, HV, C]  float32
+    # ── Stage 3: solve_tril — PTO-ISA tri_inverse kernel ─────────────────────
+    A_inv_dev = solve_tril(L_dev.to(torch.float16), cu_dev, chunk_size, HV, tri_inv_func)
+    torch.npu.synchronize()
 
-    # ── Stages 3-6: CPU reference placeholders ───────────────────────────────
-    INV  = ref_inversion_kda(L, chunk_size, cu_seqlens_list)
+    g_cs = g_sum_dev.cpu()          # [B, T, HV, K]  float32
+    INV  = A_inv_dev.float().cpu()  # [B, T, HV, C]  float32
+
+    # ── Stages 4-6: CPU reference placeholders ───────────────────────────────
     u, w = ref_wy_kda(kf, vf, g_cs, bf, INV, chunk_size, cu_seqlens_list)
     s_snapshots, v_corr = ref_chunk_h_kda(kf, u, w, g_cs, chunk_size, cu_seqlens_list)
     return ref_chunk_o_kda(qf, kf, v_corr, s_snapshots, g_cs, chunk_size, cu_seqlens_list)
@@ -157,6 +161,7 @@ def run_one(
     dev: torch.device,
     scale: float,
     chunk_size: int,
+    tri_inv_func,
 ) -> tuple[bool, str]:
     cu_list = T_or_cu if isinstance(T_or_cu, list) else None
     T       = T_total if cu_list else T_or_cu
@@ -169,8 +174,9 @@ def run_one(
     g_log    = -torch.rand(1, T, HV, K) * 0.5    # values in (-0.5, 0)
     beta_sig = torch.sigmoid(torch.randn(1, T, HV))
 
-    # PTO pipeline (stage 1 on NPU)
-    o_pto = pto_pipeline_kda(q, k, v, g_log, beta_sig, cu_list, scale, dev, chunk_size)
+    # PTO pipeline (stages 1-3 on NPU)
+    o_pto = pto_pipeline_kda(q, k, v, g_log, beta_sig, cu_list, scale, dev, chunk_size,
+                             tri_inv_func)
 
     # CPU reference pipeline (all stages on CPU)
     o_cpu = cpu_pipeline_kda(q, k, v, g_log, beta_sig, cu_list, scale, chunk_size)
@@ -201,18 +207,19 @@ def main() -> None:
     torch.npu.set_device(args.device)
     dev   = torch.device(args.device)
     scale = K ** -0.5
+    tri_inv_func = load_tri_inverse()
 
     shapes = [(16, None)] if args.quick else TEST_SHAPES
 
     print(f"device={args.device}  H={H}  HV={HV}  K={K}  V={V_DIM}  CHUNK={chunk_size}")
-    print(f"NPU stages:         [1] gate_cumsum_kda  [2] kkt_kda")
-    print(f"CPU placeholder stages: [3] inversion  [4] wy  [5] chunk_h  [6] chunk_o")
+    print(f"NPU stages:         [1] gate_cumsum_kda  [2] kkt_kda  [3] solve_tril")
+    print(f"CPU placeholder stages: [4] wy  [5] chunk_h  [6] chunk_o")
     print(f"\n{'='*60}")
 
     all_pass = True
     for i, (T_or_cu, T_total) in enumerate(shapes):
         t0 = time.time()
-        ok, label = run_one(T_or_cu, T_total, H, HV, dev, scale, chunk_size)
+        ok, label = run_one(T_or_cu, T_total, H, HV, dev, scale, chunk_size, tri_inv_func)
         dt = time.time() - t0
         status = "PASS" if ok else "FAIL"
         if not ok:
