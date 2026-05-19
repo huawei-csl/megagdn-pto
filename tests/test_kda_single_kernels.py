@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -463,17 +464,48 @@ class TestCase:
     T: int
 
 
+def _cu_from_seqlens(seqlens: list[int]) -> list[int]:
+    cu = [0]
+    for s in seqlens:
+        cu.append(cu[-1] + s)
+    return cu
+
+
+def _rand_cu(n_seq: int, total: int, rng: random.Random) -> list[int]:
+    if n_seq == 1:
+        return [0, total]
+    bnd = sorted(rng.sample(range(1, total), n_seq - 1))
+    return [0] + bnd + [total]
+
+
+def _align_cu(raw: list[int], cs: int) -> list[int]:
+    aligned = [0]
+    for i in range(1, len(raw) - 1):
+        val = ((raw[i] + cs - 1) // cs) * cs
+        aligned.append(max(val, aligned[-1] + cs))
+    total = max(raw[-1], aligned[-1] + cs)
+    aligned.append(((total + cs - 1) // cs) * cs)
+    return aligned
+
+
 def _build_test_cases(quick: bool) -> list[TestCase]:
     if quick:
-        return [TestCase("quick T=16", None, 16)]
+        return [TestCase("quick T=128", None, 128)]
     cases = []
-    for T in [16, 32, 64, 128]:
+    for T in [128, 256, 385, 512, 1024]:
         cases.append(TestCase(f"fixed T={T}", None, T))
-    for seqlens in [[16, 16], [32, 16], [16, 32, 16]]:
-        cu = [0]
-        for s in seqlens:
-            cu.append(cu[-1] + s)
+    for seqlens in [[128], [256], [384], [512], [256, 256], [128, 256], [384, 128],
+                    [128, 128, 128], [256, 128, 384]]:
+        cu = _cu_from_seqlens(seqlens)
         cases.append(TestCase(f"varlen {seqlens}", cu, cu[-1]))
+    for seqlens in [[1, 63, 64, 65, 127, 128, 129, 447],
+                    [1, 17, 31, 32, 33, 95, 127, 128, 129, 191, 192, 193, 367]]:
+        cu = _cu_from_seqlens(seqlens)
+        cases.append(TestCase(f"varlen {seqlens}", cu, cu[-1]))
+    rng = random.Random(42)
+    for n_seq, total in [(3, 768), (7, 1792), (10, 2560)]:
+        cu = _align_cu(_rand_cu(n_seq, total, rng), CHUNK)
+        cases.append(TestCase(f"varlen rand {n_seq}seq T={cu[-1]}", cu, cu[-1]))
     return cases
 
 

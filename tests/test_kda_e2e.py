@@ -139,13 +139,13 @@ def pto_pipeline_kda(
 # ---------------------------------------------------------------------------
 
 TEST_SHAPES: list[tuple] = [
-    (16,  None),
-    (32,  None),
-    (64,  None),
-    (128, None),
-    ([0, 16, 32],       32),
-    ([0, 32, 48],       48),
-    ([0, 16, 32, 48],   48),
+    (256, None),
+    (512, None),
+    (1024, None),
+    ([0, 256, 512], 512),
+    ([0, 128, 384, 768], 768),
+    ([0, 384, 512], 512),
+    ([0, 128, 256, 512], 512),
 ]
 
 
@@ -168,6 +168,7 @@ def run_one(
     label   = f"varlen {cu_list}" if cu_list else f"T={T}"
 
     torch.manual_seed(0)
+    torch.npu.manual_seed(0)
     q        = F.normalize(torch.randn(1, T, H,  K),     dim=-1, p=2)
     k        = F.normalize(torch.randn(1, T, H,  K),     dim=-1, p=2)
     v        = torch.randn(1, T, HV, V_DIM)
@@ -209,7 +210,7 @@ def main() -> None:
     scale = K ** -0.5
     tri_inv_func = load_tri_inverse()
 
-    shapes = [(16, None)] if args.quick else TEST_SHAPES
+    shapes = [(256, None)] if args.quick else TEST_SHAPES
 
     print(f"device={args.device}  H={H}  HV={HV}  K={K}  V={V_DIM}  CHUNK={chunk_size}")
     print(f"NPU stages:         [1] gate_cumsum_kda  [2] kkt_kda  [3] solve_tril")
