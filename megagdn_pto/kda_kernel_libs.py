@@ -215,3 +215,119 @@ def run_kkt_kda(
         _vp(cu32),
         batch, T, total_tokens,
     )
+
+
+# ---------------------------------------------------------------------------
+# wy_kda — WY decomposition (u, w) for KDA, per-dim gate
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def load_wy_kda(
+    num_heads: int,
+    k_dim: int = 128,
+    chunk_size: int = 128,
+) -> ctypes.CDLL:
+    """Compile + load the KDA wy kernel.
+
+    Template parameters injected at compile time:
+        GDN_H = num_heads  (HV)
+        GDN_D = k_dim      (K, also used as V_DIM)
+        GDN_C = chunk_size (C)
+
+    C signature::
+        void call_kernel(uint32_t block_dim, void *stream,
+                         uint8_t *k, uint8_t *v, uint8_t *beta, uint8_t *g_cs, uint8_t *A,
+                         uint8_t *ws_a2, uint8_t *ws_keff,
+                         uint8_t *u, uint8_t *w,
+                         uint8_t *cu_seqlens,
+                         int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    """
+    lib_path = compile_chunk_kernel(
+        "wy_kda.cpp",
+        "wy_kda",
+        num_heads=num_heads,
+        hidden_size=k_dim,
+        chunk_size=chunk_size,
+        key_heads=None,
+        cpp_mtime_ns=_mtime("wy_kda.cpp"),
+    )
+    lib = ctypes.CDLL(os.path.abspath(lib_path))
+    lib.call_kernel.argtypes = (
+        [ctypes.c_uint32, ctypes.c_void_p]
+        + [ctypes.c_void_p] * 10   # k, v, beta, g_cs, A, ws_a2, ws_keff, u, w, cu_seqlens
+        + [ctypes.c_int64] * 3     # batch_size, seq_len, total_tokens
+    )
+    lib.call_kernel.restype = None
+    return lib
+
+
+def run_wy_kda(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_cs: torch.Tensor,
+    beta_sig: torch.Tensor,
+    INV: torch.Tensor,
+    u_out: torch.Tensor,
+    w_out: torch.Tensor,
+    *,
+    stream,
+    chunk_size: int = 128,
+    cu_seqlens: torch.Tensor | None = None,
+    batch_size_override: int | None = None,
+    block_dim: int | None = None,
+) -> None:
+    """Compute the WY auxiliary tensors u, w for KDA.
+
+    Math (per chunk, matches ``ref_wy_kda``):
+        u = INV @ (beta * v)
+        w = INV @ (beta * exp(g_cs) * k)
+
+    Args:
+        k:        ``[B, T, HV, K]`` float32 (BSND; GQA-expanded).
+        v:        ``[B, T, HV, V]`` float32 (cast to fp16 internally for the GEMM).
+        g_cs:     ``[B, T, HV, K]`` float32, within-chunk cumulative gate sum (per-dim).
+        beta_sig: ``[B, T, HV]``    float32, post-sigmoid beta in (0, 1).
+        INV:      ``[B, T, HV, C]`` float32, full lower-tri inverse (I+L)^{-1}.
+        u_out:    ``[B, T, HV, V]`` float32 (overwritten).
+        w_out:    ``[B, T, HV, K]`` float32 (overwritten).
+        stream:   NPU stream handle.
+        chunk_size: Tokens per chunk C; must match the compiled kernel.
+        cu_seqlens: ``int32`` cumulative sequence lengths for packed varlen input.
+        batch_size_override: Number of sequences (use with ``cu_seqlens``).
+        block_dim: AI-Core count; auto-detected if ``None``.
+    """
+    assert k.dtype == torch.float32
+    assert v.dtype == torch.float32
+    assert g_cs.dtype == torch.float32
+    assert beta_sig.dtype == torch.float32
+    assert INV.dtype == torch.float32
+    assert u_out.dtype == torch.float32
+    assert w_out.dtype == torch.float32
+
+    HV = k.shape[2]
+    K  = k.shape[3]
+    T  = k.shape[1]
+    bd = block_dim or BLOCK_DIM
+    batch = k.shape[0] if batch_size_override is None else batch_size_override
+
+    # Head-major permutes (match kkt_kda convention, kkt_kda lines 195-197).
+    k_t    = k.permute(0, 2, 1, 3).contiguous()        # [B, HV, T, K]
+    g_cs_t = g_cs.permute(0, 2, 1, 3).contiguous()
+    beta_t = beta_sig.permute(0, 2, 1).contiguous()    # [B, HV, T]
+    # V stays BSND for Cube's MTE2 load; cast to fp16 to match the GEMM dtype.
+    v_fp16 = v.to(torch.float16).contiguous()
+
+    ws_a2   = torch.zeros(bd, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
+    ws_keff = torch.zeros(bd, chunk_size, K,          device=k.device, dtype=torch.float16)
+
+    cu32 = _ensure_int32(cu_seqlens)
+
+    lib = load_wy_kda(HV, K, chunk_size)
+    lib.call_kernel(
+        bd, stream,
+        _vp(k_t), _vp(v_fp16), _vp(beta_t), _vp(g_cs_t), _vp(INV),
+        _vp(ws_a2), _vp(ws_keff),
+        _vp(u_out), _vp(w_out),
+        _vp(cu32),
+        batch, T, T,
+    )
