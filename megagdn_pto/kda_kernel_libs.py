@@ -331,3 +331,114 @@ def run_wy_kda(
         _vp(cu32),
         batch, T, T,
     )
+
+
+# ---------------------------------------------------------------------------
+# chunk_h_kda — sequential state recurrence (snapshots + v_corr)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def load_chunk_h_kda(
+    num_heads: int,
+    k_dim: int = 128,
+    chunk_size: int = 128,
+) -> ctypes.CDLL:
+    """Compile + load the KDA chunk_h kernel.
+
+    Template parameters injected at compile time:
+        GDN_H = num_heads  (HV)
+        GDN_D = k_dim      (K, also used as V_DIM)
+        GDN_C = chunk_size (C)
+
+    C signature::
+        void call_kernel(uint32_t block_dim, void *stream,
+                         uint8_t *K, uint8_t *W, uint8_t *U, uint8_t *G,
+                         uint8_t *S, uint8_t *V_corr,
+                         uint8_t *workspace, uint8_t *cu_seqlens,
+                         int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    """
+    lib_path = compile_chunk_kernel(
+        "chunk_h_kda.cpp",
+        "chunk_h_kda",
+        num_heads=num_heads,
+        hidden_size=k_dim,
+        chunk_size=chunk_size,
+        key_heads=None,
+        cpp_mtime_ns=_mtime("chunk_h_kda.cpp"),
+    )
+    lib = ctypes.CDLL(os.path.abspath(lib_path))
+    lib.call_kernel.argtypes = (
+        [ctypes.c_uint32, ctypes.c_void_p]
+        + [ctypes.c_void_p] * 8   # K, W, U, G, S, V_corr, workspace, cu_seqlens
+        + [ctypes.c_int64] * 3    # batch_size, seq_len, total_tokens
+    )
+    lib.call_kernel.restype = None
+    return lib
+
+
+def run_chunk_h_kda(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g_cs: torch.Tensor,
+    s_snapshots_out: torch.Tensor,
+    v_corr_out: torch.Tensor,
+    *,
+    stream,
+    chunk_size: int = 128,
+    cu_seqlens: torch.Tensor | None = None,
+    batch_size_override: int | None = None,
+    block_dim: int | None = None,
+) -> None:
+    """Sequential recurrent state pass for KDA.
+
+    Math per chunk (matches ``ref_chunk_h_kda``):
+        v_corr  = u - w @ S                              # [c_len, V]
+        k_rest  = k * exp(g_total - g_cs)                # [c_len, K]
+        S_new   = exp(g_total).unsqueeze(-1) * S + k_rest^T @ v_corr
+
+    Args:
+        k:               ``[B, T, HV, K]`` float32, keys (GQA-expanded).
+        w:               ``[B, T, HV, K]`` float32, from wy_kda (cast to fp16 here).
+        u:               ``[B, T, HV, V]`` float32, from wy_kda.
+        g_cs:            ``[B, T, HV, K]`` float32, within-chunk cumulative gate sum.
+        s_snapshots_out: ``[total_chunks, HV, K, V]`` float32 (output).
+        v_corr_out:      ``[B, T, HV, V]`` float32 (output).
+        stream:          NPU stream handle.
+        chunk_size:      Tokens per chunk C; must match the compiled kernel.
+        cu_seqlens:      ``int32`` cumulative sequence lengths for packed varlen input.
+        batch_size_override: Number of sequences (use with ``cu_seqlens``).
+        block_dim:       AI-Core count; auto-detected if ``None``.
+    """
+    assert k.dtype == torch.float32
+    assert w.dtype == torch.float32
+    assert u.dtype == torch.float32
+    assert g_cs.dtype == torch.float32
+    assert s_snapshots_out.dtype == torch.float32
+    assert v_corr_out.dtype == torch.float32
+
+    HV = k.shape[2]
+    K  = k.shape[3]
+    T  = k.shape[1]
+    bd = block_dim or BLOCK_DIM
+    batch = k.shape[0] if batch_size_override is None else batch_size_override
+
+    # Head-major permutes for K and g_cs (matches wy_kda's MTE2 row-stride
+    # requirement).  W and U stay in BSND so Cube's K^T @ V_corr and Vec's
+    # U load can use the BSND stride.
+    k_t    = k.permute(0, 2, 1, 3).contiguous()         # [B, HV, T, K]
+    g_cs_t = g_cs.permute(0, 2, 1, 3).contiguous()
+    # Cast W to fp16 once here so the Cube W @ S GEMM has fp16 inputs.
+    w_fp16 = w.to(torch.float16).contiguous()
+
+    # Per-AI-core workspace: 5 slots × K*V half-elements.
+    ws = torch.zeros(bd * 5, K, K, device=k.device, dtype=torch.float16)
+    cu32 = _ensure_int32(cu_seqlens)
+
+    lib = load_chunk_h_kda(HV, K, chunk_size)
+    lib.call_kernel(
+        bd, stream,
+        _vp(k_t), _vp(w_fp16), _vp(u), _vp(g_cs_t),
+        _vp(s_snapshots_out), _vp(v_corr_out), _vp(ws), _vp(cu32),
+        batch, T, T,
+    )
