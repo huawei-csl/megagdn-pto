@@ -442,3 +442,125 @@ def run_chunk_h_kda(
         _vp(s_snapshots_out), _vp(v_corr_out), _vp(ws), _vp(cu32),
         batch, T, T,
     )
+
+
+# ---------------------------------------------------------------------------
+# chunk_o_kda — output stage (q_eff @ S + tril(q_eff @ k_eff^T) @ v_corr)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def load_chunk_o_kda(
+    num_heads: int,
+    k_dim: int = 128,
+    chunk_size: int = 128,
+) -> ctypes.CDLL:
+    """Compile + load the KDA chunk_o kernel.
+
+    Template parameters injected at compile time:
+        GDN_H = num_heads  (HV)
+        GDN_D = k_dim      (K, also used as V_DIM)
+        GDN_C = chunk_size (C)
+
+    C signature::
+        void call_kernel(uint32_t block_dim, void *stream,
+                         uint8_t *Q, uint8_t *K, uint8_t *V_corr, uint8_t *S,
+                         uint8_t *G, uint8_t *Mask,
+                         uint8_t *workspace, uint8_t *O,
+                         uint8_t *cu_seqlens,
+                         int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    """
+    lib_path = compile_chunk_kernel(
+        "chunk_o_kda.cpp",
+        "chunk_o_kda",
+        num_heads=num_heads,
+        hidden_size=k_dim,
+        chunk_size=chunk_size,
+        key_heads=None,
+        cpp_mtime_ns=_mtime("chunk_o_kda.cpp"),
+    )
+    lib = ctypes.CDLL(os.path.abspath(lib_path))
+    lib.call_kernel.argtypes = (
+        [ctypes.c_uint32, ctypes.c_void_p]
+        + [ctypes.c_void_p] * 9   # Q, K, V_corr, S, G, Mask, workspace, O, cu_seqlens
+        + [ctypes.c_int64] * 3    # batch_size, seq_len, total_tokens
+    )
+    lib.call_kernel.restype = None
+    return lib
+
+
+def run_chunk_o_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v_corr: torch.Tensor,
+    s_snapshots: torch.Tensor,
+    g_cs: torch.Tensor,
+    o_out: torch.Tensor,
+    *,
+    stream,
+    chunk_size: int = 128,
+    cu_seqlens: torch.Tensor | None = None,
+    batch_size_override: int | None = None,
+    block_dim: int | None = None,
+) -> None:
+    """Output stage of the KDA pipeline.
+
+    Math per chunk (matches ``ref_chunk_o_kda``):
+        q_eff = q * exp(g_cs)              # [c_len, K]
+        k_eff = k * exp(-g_cs)             # [c_len, K]
+        Aqk   = tril(q_eff @ k_eff^T,      # inclusive diagonal
+                     diagonal=0)
+        o     = q_eff @ S + Aqk @ v_corr   # [c_len, V]
+
+    Args:
+        q:            ``[B, T, HV, K]`` float32 (BSND; scale and GQA already applied).
+        k:            ``[B, T, HV, K]`` float32, keys.
+        v_corr:       ``[B, T, HV, V]`` float32, from chunk_h_kda.
+        s_snapshots:  ``[total_chunks, HV, K, V]`` float32, from chunk_h_kda.
+        g_cs:         ``[B, T, HV, K]`` float32, within-chunk cumulative gate.
+        o_out:        ``[B, T, HV, V]`` float32 (output, overwritten).
+        stream:       NPU stream handle.
+        chunk_size:   Tokens per chunk C; must match the compiled kernel.
+        cu_seqlens:   ``int32`` cumulative sequence lengths for packed varlen input.
+        batch_size_override: Number of sequences (use with ``cu_seqlens``).
+        block_dim:    AI-Core count; auto-detected if ``None``.
+    """
+    assert q.dtype == torch.float32
+    assert k.dtype == torch.float32
+    assert v_corr.dtype == torch.float32
+    assert s_snapshots.dtype == torch.float32
+    assert g_cs.dtype == torch.float32
+    assert o_out.dtype == torch.float32
+
+    HV = q.shape[2]
+    K  = q.shape[3]
+    T  = q.shape[1]
+    bd = block_dim or BLOCK_DIM
+    batch = q.shape[0] if batch_size_override is None else batch_size_override
+
+    # Head-major permutes for Q, K, g_cs (matches chunk_h_kda's MTE2 row-stride
+    # requirement: row stride K == column count K).
+    q_t    = q.permute(0, 2, 1, 3).contiguous()         # [B, HV, T, K]
+    k_t    = k.permute(0, 2, 1, 3).contiguous()
+    g_cs_t = g_cs.permute(0, 2, 1, 3).contiguous()
+
+    # Causal mask [C, C] fp32, INCLUSIVE diagonal (matches torch.tril(..., diagonal=0)
+    # used by ref_chunk_o_kda — differs from kkt_kda's strict-lower mask).
+    dev  = q.device
+    rows = torch.arange(chunk_size, device=dev).unsqueeze(1)
+    cols = torch.arange(chunk_size, device=dev).unsqueeze(0)
+    mask = (rows >= cols).to(torch.float32)
+
+    # Per-AI-core workspace: 7 slots × K*V half-elements.
+    #   WS_Q, WS_K [C, K], WS_V [C, V], WS_S [K, V], WS_QK [C, C],
+    #   WS_QS, WS_QKV [C, V] — all are K*V fp16 elements when K==V==C.
+    ws = torch.zeros(bd * 7, K, K, device=dev, dtype=torch.float16)
+    cu32 = _ensure_int32(cu_seqlens)
+
+    lib = load_chunk_o_kda(HV, K, chunk_size)
+    lib.call_kernel(
+        bd, stream,
+        _vp(q_t), _vp(k_t), _vp(v_corr), _vp(s_snapshots),
+        _vp(g_cs_t), _vp(mask),
+        _vp(ws), _vp(o_out), _vp(cu32),
+        batch, T, T,
+    )

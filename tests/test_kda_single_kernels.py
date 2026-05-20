@@ -706,8 +706,48 @@ def test_chunk_h_kda(tc: TestCase, H: int, dev=None) -> bool:
 
 
 def test_chunk_o_kda(tc: TestCase, H: int, dev=None) -> bool:
-    # TODO
-    return True
+    """Compare chunk_o_kda NPU kernel output to ref_chunk_o_kda CPU reference."""
+    if dev is None:
+        raise ValueError("test_chunk_o_kda requires --device (NPU device).")
+
+    from megagdn_pto.kda_kernel_libs import run_chunk_o_kda
+
+    q, k, v, g_log, beta_sig, scale = _make_inputs(tc, H)
+
+    # Apply scale (matches cpu_pipeline_kda lines 416-418).  No GQA expansion
+    # needed since _make_inputs gives H == HV.
+    qf = q.float() * scale
+    kf = k.float()
+
+    # Reference pipeline up through chunk_h_kda.
+    g_cs    = ref_gate_cumsum(g_log, CHUNK, tc.cu_seqlens_list)
+    L_ref   = ref_kkt_kda(kf, g_cs, beta_sig, CHUNK, tc.cu_seqlens_list)
+    INV_ref = ref_inversion_kda(L_ref, CHUNK, tc.cu_seqlens_list)
+    u_ref, w_ref = ref_wy_kda(kf, v.float(), g_cs, beta_sig,
+                              INV_ref, CHUNK, tc.cu_seqlens_list)
+    s_ref, vcorr_ref = ref_chunk_h_kda(kf, u_ref, w_ref, g_cs,
+                                       CHUNK, tc.cu_seqlens_list)
+    o_ref = ref_chunk_o_kda(qf, kf, vcorr_ref, s_ref, g_cs,
+                            CHUNK, tc.cu_seqlens_list)
+
+    # NPU run.
+    o_npu = torch.zeros(1, tc.T, H, V_DIM, device=dev, dtype=torch.float32)
+    cu = (torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
+          if tc.cu_seqlens_list else None)
+    N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
+    stream = torch.npu.current_stream()._as_parameter_
+
+    torch.npu.synchronize()
+    run_chunk_o_kda(
+        qf.to(dev), kf.to(dev), vcorr_ref.to(dev),
+        s_ref.to(dev), g_cs.to(dev),
+        o_npu,
+        stream=stream, chunk_size=CHUNK, cu_seqlens=cu,
+        batch_size_override=N_seq,
+    )
+    torch.npu.synchronize()
+
+    return stats_ok(o_npu.cpu(), o_ref)
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +783,7 @@ def main() -> None:
 
     # Initialise NPU device only when a device stage is requested.
     dev = None
-    _DEVICE_STAGES = {"cumsum", "kkt", "inv", "wy", "chunk_h"}
+    _DEVICE_STAGES = {"cumsum", "kkt", "inv", "wy", "chunk_h", "chunk_o"}
     if any(s in _DEVICE_STAGES for s in stages):
         torch.npu.set_device(args.device)
         dev = torch.device(args.device)
