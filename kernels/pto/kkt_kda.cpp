@@ -457,11 +457,15 @@ AICORE void kkt_kda_kernel(
                 wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
             }
 
+            // Drain Vec pipes before moving to the next chunk so the L_out
+            // TSTORE is guaranteed in HBM before pre-compute reuses the UB
+            // pool addresses (and so any cross-core sig below sees a
+            // well-defined state).
+            pipe_barrier(PIPE_ALL);
             // Signal Cube: ws_out[slot] is free for reuse (only when needed).
             // Both vids must sig (mode-2 V→C reduce); both share same condition.
             if (ci < num_chunks - 2)
             {
-                pipe_barrier(PIPE_ALL);
                 ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | ((4 + slot) << 8));
             }
         }
@@ -559,6 +563,10 @@ AICORE void kkt_kda_kernel(
                 TASSIGN(_l0a, 0x0);
                 TASSIGN(_l0b, 0x0);
                 auto _we = EVENT_ID1;
+                // FIX→M: ensure previous iteration's TSTORE has finished reading
+                // L0C before this iteration's TMATMUL overwrites it.
+                set_flag(PIPE_FIX, PIPE_M, _we);
+                wait_flag(PIPE_FIX, PIPE_M, _we);
                 set_flag(PIPE_MTE2, PIPE_MTE1, _we);
                 wait_flag(PIPE_MTE2, PIPE_MTE1, _we);
                 set_flag(PIPE_M, PIPE_MTE1, _we);
@@ -593,6 +601,9 @@ AICORE void kkt_kda_kernel(
                 TSTORE(_gm, _l0);
             }
 
+            // Drain FIX so the cross-core sig is emitted only after the
+            // TSTORE has actually committed ws_out[slot] to HBM.
+            pipe_barrier(PIPE_ALL);
             // Signal Vec: ws_out[slot] ready (GEMM done; ws_in[slot] also free).
             // Mode-2 C→V broadcast: each vid increments its own counter.
             ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | ((2 + slot) << 8));
