@@ -12,6 +12,9 @@
 
 See full report [in English](blog/mega_gdn_en.md) or [in Chinese](blog/mega_gdn_zh.md).
 
+**Updates:**
+- (2026/05/19) This work is presented on [CANN official account](https://mp.weixin.qq.com/s/PRTgUvSQ69Z61RsDpgoUDQ) and [NeuralTalk account](https://mp.weixin.qq.com/s/uSClZLlZUgdVJ2DWhOxbAw)!
+
 # To reproduce
 
 ## NPU Environment
