@@ -212,7 +212,11 @@ def run_one(
     q        = F.normalize(torch.randn(1, T, H,  K),     dim=-1, p=2)
     k        = F.normalize(torch.randn(1, T, H,  K),     dim=-1, p=2)
     v        = torch.randn(1, T, HV, V_DIM)
-    g_log    = -torch.rand(1, T, HV, K) * 0.5    # values in (-0.5, 0)
+    # Values in (-0.05, 0): cumulative |g_cs| stays under ~7 so the fp16
+    # workspaces in kkt_kda / chunk_o_kda (which stage exp(g_cs) and
+    # exp(-g_cs) separately for Cube-core GEMMs) don't overflow.  Larger
+    # magnitudes blow up exp(-g_cs) past fp16 max (~65504) -> inf -> NaN.
+    g_log    = -torch.rand(1, T, HV, K) * 0.05
     beta_sig = torch.sigmoid(torch.randn(1, T, HV))
 
     # PTO pipeline (all stages on NPU)
