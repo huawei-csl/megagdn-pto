@@ -204,6 +204,12 @@ def run_kkt_kda(
 
     ws_in  = torch.zeros(bd * 2, 2 * chunk_size, K,          device=dev, dtype=torch.float16)
     ws_out = torch.zeros(bd * 2, chunk_size,      chunk_size, device=dev, dtype=torch.float16)
+    # Force the workspace zero-fill (and any pending stream work) to fully
+    # complete before launching the kkt_kda kernel.  Without this barrier,
+    # cold-start runs can race the FFTS V↔C handshake against the zero-fill,
+    # producing all-zero output for the first kkt_kda launch that follows a
+    # different launch shape.
+    torch.npu.synchronize()
 
     cu32 = _ensure_int32(cu_seqlens)
 
@@ -320,6 +326,8 @@ def run_wy_kda(
     ws_a2   = torch.zeros(bd, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
     ws_keff = torch.zeros(bd, chunk_size, K,          device=k.device, dtype=torch.float16)
 
+    torch.npu.synchronize()
+
     cu32 = _ensure_int32(cu_seqlens)
 
     lib = load_wy_kda(HV, K, chunk_size)
@@ -434,6 +442,8 @@ def run_chunk_h_kda(
     # Per-AI-core workspace: 5 slots × K*V half-elements.
     ws = torch.zeros(bd * 5, K, K, device=k.device, dtype=torch.float16)
     cu32 = _ensure_int32(cu_seqlens)
+
+    torch.npu.synchronize()
 
     lib = load_chunk_h_kda(HV, K, chunk_size)
     lib.call_kernel(
@@ -555,6 +565,8 @@ def run_chunk_o_kda(
     #   WS_QS, WS_QKV [C, V] — all are K*V fp16 elements when K==V==C.
     ws = torch.zeros(bd * 7, K, K, device=dev, dtype=torch.float16)
     cu32 = _ensure_int32(cu_seqlens)
+
+    torch.npu.synchronize()
 
     lib = load_chunk_o_kda(HV, K, chunk_size)
     lib.call_kernel(
