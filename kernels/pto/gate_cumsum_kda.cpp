@@ -4,8 +4,8 @@
 // Mathematical operation (per chunk of C tokens, per head h, per key-dim d):
 //   g_sum[t, h, d] = Σ_{i=0}^{t} g[i, h, d]    for t = 0 .. valid-1
 //
-// Input:  g     [total_tokens, HV, K]  float  — raw per-dim gate values
-// Output: g_sum [total_tokens, HV, K]  float  — cumulative sums
+// Input:  g     [total_tokens, HV, K]  half  — raw per-dim gate values
+// Output: g_sum [total_tokens, HV, K]  half  — cumulative sums
 //
 // Difference from GDN chunk_cumsum (kernels/pto/chunk_cumsum.cpp):
 //   - GDN: gate shape [T, H], row width = H (~16-64).
@@ -19,8 +19,8 @@
 //   order and reuse the same UB region for each slice.  Strided 2D DMA
 //   (row_stride > col_count) is supported — see chunk_h.cpp's BSND loads.
 //
-// UB memory budget (per column tile): 2*ChunkSize*CTC*4 + CTC*4
-//   With ColTile=128: 132 KB for C=128, 66 KB for C=64 (fits 256 KB UB).
+// UB memory budget (per column tile): 2*ChunkSize*CTC*2 + CTC*2
+//   With ColTile=128: 66 KB for C=128, 33 KB for C=64 (fits 256 KB UB).
 //   Number of column tiles per chunk = RowWidth / ColTile
 //   (e.g. HV=4,K=128 → 4 tiles; HV=8 → 8 tiles).
 //
@@ -64,7 +64,7 @@ using UbND = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::RowMajor,
 
 template <int32_t NumHeads, int32_t KDim, int32_t ChunkSize>
 AICORE void gate_cumsum_kda_kernel(
-    __gm__ float *g_ptr, __gm__ float *g_sum_ptr,
+    __gm__ half *g_ptr, __gm__ half *g_sum_ptr,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
     uint64_t ffts_addr)
@@ -85,7 +85,7 @@ AICORE void gate_cumsum_kda_kernel(
   constexpr int32_t RowWidth = NumHeads * KDim;
 
   // ColTile: number of HV*K columns processed in one UB-resident slice.
-  // 128 is safe for ChunkSize up to 128 (per-tile UB ≈ 132 KB) and divides
+  // 128 is safe for ChunkSize up to 128 (per-tile UB ≈ 66 KB) and divides
   // RowWidth = HV*KDim whenever KDim is a multiple of 128 (the typical case).
   constexpr int32_t ColTileTarget = 128;
   constexpr int32_t ColTile = (RowWidth < ColTileTarget) ? RowWidth : ColTileTarget;
@@ -96,12 +96,12 @@ AICORE void gate_cumsum_kda_kernel(
                 "is divisible by it.");
   constexpr int32_t NumColTiles = RowWidth / ColTile;
 
-  // Per-tile UB layout:
+  // Per-tile UB layout (fp16):
   //   [0          .. BlockBytes)           = g input  (ChunkSize × CTC)
   //   [BlockBytes .. 2*BlockBytes)         = g_sum output (ChunkSize × CTC)
-  //   [2*BlockBytes .. 2*BlockBytes+CTC*4) = row accumulator (1 × CTC)
-  constexpr int32_t BlockBytes = ChunkSize * CTC * static_cast<int32_t>(sizeof(float));
-  constexpr int32_t RowBytes = CTC * static_cast<int32_t>(sizeof(float));
+  //   [2*BlockBytes .. 2*BlockBytes+CTC*2) = row accumulator (1 × CTC)
+  constexpr int32_t BlockBytes = ChunkSize * CTC * static_cast<int32_t>(sizeof(half));
+  constexpr int32_t RowBytes = CTC * static_cast<int32_t>(sizeof(half));
   constexpr int32_t GUbAddr = 0;
   constexpr int32_t SUbAddr = BlockBytes;
   constexpr int32_t AccUbAddr = BlockBytes * 2;
@@ -111,10 +111,10 @@ AICORE void gate_cumsum_kda_kernel(
   // chunk_h.cpp's per-head BSND loads at e.g. lines 599-604.
   using GmShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
   using GmStride = Stride<1, 1, 1, RowWidth, 1>;
-  using GmFloat = GlobalTensor<float, GmShape, GmStride>;
+  using GmHalf = GlobalTensor<half, GmShape, GmStride>;
 
   // Row accumulator — pre-assigned, re-initialised at each column tile.
-  UbND<float, 1, CTC> acc_ub;
+  UbND<half, 1, CTC> acc_ub;
   TASSIGN(acc_ub, AccUbAddr);
 
   int64_t num_seqs = batch_size;
@@ -145,14 +145,14 @@ AICORE void gate_cumsum_kda_kernel(
           GmShape gs;
           gs.shape[3] = valid;
           gs.shape[4] = ColTile;
-          GmFloat g_gm(g_ptr + chunk_start * RowWidth + col_off, gs);
-          UbND<float, ChunkSize, CTC, DYNAMIC, DYNAMIC, PadValue::Zero>
+          GmHalf g_gm(g_ptr + chunk_start * RowWidth + col_off, gs);
+          UbND<half, ChunkSize, CTC, DYNAMIC, DYNAMIC, PadValue::Zero>
               g_load(valid, ColTile);
           TASSIGN(g_load, GUbAddr);
           TLOAD(g_load, g_gm);
           if (valid != ChunkSize || ColTile != CTC)
           {
-            UbND<float, ChunkSize, CTC, ChunkSize, CTC, PadValue::Zero> g_pad;
+            UbND<half, ChunkSize, CTC, ChunkSize, CTC, PadValue::Zero> g_pad;
             TASSIGN(g_pad, GUbAddr);
             TFILLPAD_INPLACE(g_pad, g_load);
           }
@@ -162,12 +162,12 @@ AICORE void gate_cumsum_kda_kernel(
 
         // ── Vec: prefix sum (all ColTile cols in parallel) ───────────────
         // Row 0: acc = g[0]; g_sum[0] = acc
-        UbND<float, 1, CTC> g_row_0;
+        UbND<half, 1, CTC> g_row_0;
         TASSIGN(g_row_0, GUbAddr);
         TMOV(acc_ub, g_row_0);
         pipe_barrier(PIPE_V);
 
-        UbND<float, 1, CTC> s_row_0;
+        UbND<half, 1, CTC> s_row_0;
         TASSIGN(s_row_0, SUbAddr);
         TMOV(s_row_0, acc_ub);
         pipe_barrier(PIPE_V);
@@ -175,12 +175,12 @@ AICORE void gate_cumsum_kda_kernel(
         // Rows 1..valid-1: acc += g[i]; g_sum[i] = acc
         for (int32_t i = 1; i < valid; ++i)
         {
-          UbND<float, 1, CTC> g_row_i;
+          UbND<half, 1, CTC> g_row_i;
           TASSIGN(g_row_i, GUbAddr + i * RowBytes);
           TADD(acc_ub, acc_ub, g_row_i);
           pipe_barrier(PIPE_V);
 
-          UbND<float, 1, CTC> s_row_i;
+          UbND<half, 1, CTC> s_row_i;
           TASSIGN(s_row_i, SUbAddr + i * RowBytes);
           TMOV(s_row_i, acc_ub);
           pipe_barrier(PIPE_V);
@@ -203,8 +203,8 @@ AICORE void gate_cumsum_kda_kernel(
           GmShape ss;
           ss.shape[3] = valid;
           ss.shape[4] = ColTile;
-          GmFloat gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss);
-          UbND<float, ChunkSize, CTC, DYNAMIC, DYNAMIC>
+          GmHalf gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss);
+          UbND<half, ChunkSize, CTC, DYNAMIC, DYNAMIC>
               s_store(valid, ColTile);
           TASSIGN(s_store, SUbAddr);
           TSTORE(gs_gm, s_store);
@@ -243,14 +243,14 @@ AICORE void gate_cumsum_kda_kernel(
               GmShape gs;
               gs.shape[3] = valid;
               gs.shape[4] = ColTile;
-              GmFloat g_gm(g_ptr + chunk_start * RowWidth + col_off, gs);
-              UbND<float, ChunkSize, CTC, DYNAMIC, DYNAMIC, PadValue::Zero>
+              GmHalf g_gm(g_ptr + chunk_start * RowWidth + col_off, gs);
+              UbND<half, ChunkSize, CTC, DYNAMIC, DYNAMIC, PadValue::Zero>
                   g_load(valid, ColTile);
               TASSIGN(g_load, GUbAddr);
               TLOAD(g_load, g_gm);
               if (valid != ChunkSize || ColTile != CTC)
               {
-                UbND<float, ChunkSize, CTC, ChunkSize, CTC, PadValue::Zero> g_pad;
+                UbND<half, ChunkSize, CTC, ChunkSize, CTC, PadValue::Zero> g_pad;
                 TASSIGN(g_pad, GUbAddr);
                 TFILLPAD_INPLACE(g_pad, g_load);
               }
@@ -258,24 +258,24 @@ AICORE void gate_cumsum_kda_kernel(
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-            UbND<float, 1, CTC> g_row_0;
+            UbND<half, 1, CTC> g_row_0;
             TASSIGN(g_row_0, GUbAddr);
             TMOV(acc_ub, g_row_0);
             pipe_barrier(PIPE_V);
 
-            UbND<float, 1, CTC> s_row_0;
+            UbND<half, 1, CTC> s_row_0;
             TASSIGN(s_row_0, SUbAddr);
             TMOV(s_row_0, acc_ub);
             pipe_barrier(PIPE_V);
 
             for (int32_t i = 1; i < valid; ++i)
             {
-              UbND<float, 1, CTC> g_row_i;
+              UbND<half, 1, CTC> g_row_i;
               TASSIGN(g_row_i, GUbAddr + i * RowBytes);
               TADD(acc_ub, acc_ub, g_row_i);
               pipe_barrier(PIPE_V);
 
-              UbND<float, 1, CTC> s_row_i;
+              UbND<half, 1, CTC> s_row_i;
               TASSIGN(s_row_i, SUbAddr + i * RowBytes);
               TMOV(s_row_i, acc_ub);
               pipe_barrier(PIPE_V);
@@ -293,8 +293,8 @@ AICORE void gate_cumsum_kda_kernel(
               GmShape ss;
               ss.shape[3] = valid;
               ss.shape[4] = ColTile;
-              GmFloat gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss);
-              UbND<float, ChunkSize, CTC, DYNAMIC, DYNAMIC>
+              GmHalf gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss);
+              UbND<half, ChunkSize, CTC, DYNAMIC, DYNAMIC>
                   s_store(valid, ColTile);
               TASSIGN(s_store, SUbAddr);
               TSTORE(gs_gm, s_store);
@@ -318,8 +318,8 @@ extern "C" __global__ AICORE void launch_gate_cumsum_kda(
     uint64_t ffts_addr)
 {
   gate_cumsum_kda_kernel<GDN_H, GDN_D, GDN_C>(
-      reinterpret_cast<__gm__ float *>(g_ptr),
-      reinterpret_cast<__gm__ float *>(g_sum_ptr),
+      reinterpret_cast<__gm__ half *>(g_ptr),
+      reinterpret_cast<__gm__ half *>(g_sum_ptr),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
       batch_size, seq_len, ffts_addr);
 }

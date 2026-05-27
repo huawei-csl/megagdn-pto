@@ -272,11 +272,11 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 
 template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
 AICORE void wy_kda_kernel(
-    __gm__ float *K_handle, __gm__ half *V_handle,
-    __gm__ float *Beta_handle, __gm__ float *G_handle,
-    __gm__ float *A_handle,
+    __gm__ half *K_handle, __gm__ half *V_handle,
+    __gm__ half *Beta_handle, __gm__ half *G_handle,
+    __gm__ half *A_handle,
     __gm__ half *workspace_a2_handle, __gm__ half *workspace_keff_handle,
-    __gm__ float *U_handle, __gm__ float *W_handle,
+    __gm__ half *U_handle, __gm__ half *W_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
     uint64_t ffts_addr)
@@ -329,7 +329,7 @@ AICORE void wy_kda_kernel(
   int64_t num_seqs = batch_size;
 
   // ── UB tile declarations (TASSIGNed to fixed addresses) ──────────────────
-  TileUbDataND<float, 1, ChunkSize, 1, ChunkSize,
+  TileUbDataND<half, 1, ChunkSize, 1, ChunkSize,
                pto::PadValue::Zero> beta_ub;
   TASSIGN(beta_ub, BetaUbAddr);
   TileUbDataND<float, 1, ChunkSize, 1, ChunkSize> beta_r_ub;
@@ -419,11 +419,11 @@ AICORE void wy_kda_kernel(
             {
               GmShape2D beta_shape(1, valid_rows);
               GmStride2D beta_stride(1);
-              GmTensor2D<float> beta_global(
+              GmTensor2D<half> beta_global(
                   Beta_handle + static_cast<int64_t>(head_idx) * total_tokens +
                       chunk_token_start,
                   beta_shape, beta_stride);
-              DynVecTile<float, 1, ChunkSize, pto::PadValue::Zero> beta_load(
+              DynVecTile<half, 1, ChunkSize, pto::PadValue::Zero> beta_load(
                   1, valid_rows);
               TASSIGN(beta_load, BetaUbAddr);
               TLOAD(beta_load, beta_global);
@@ -443,14 +443,18 @@ AICORE void wy_kda_kernel(
                   static_cast<int64_t>(ChunkSize);
               GmShape2D a_shape(local_rows, ChunkSize);
               GmStride2D a_stride(NumHeads * ChunkSize);
-              GmTensor2D<float> a_global(A_handle + a_gm_offset, a_shape,
-                                         a_stride);
-              DynVecTile<float, HalfChunk, ChunkSize,
+              GmTensor2D<half> a_global(A_handle + a_gm_offset, a_shape,
+                                        a_stride);
+              TileUbDataND<half, HalfChunk, ChunkSize,
+                           HalfChunk, ChunkSize,
+                           pto::PadValue::Zero> a_stg_full;
+              TASSIGN(a_stg_full, A2HalfUbAddr);
+              DynVecTile<half, HalfChunk, ChunkSize,
                          pto::PadValue::Zero> a_load(local_rows, ChunkSize);
-              TASSIGN(a_load, InvUbAddr);
+              TASSIGN(a_load, A2HalfUbAddr);
               TLOAD(a_load, a_global);
               if (local_rows != HalfChunk) {
-                TFILLPAD_INPLACE(inv_ub, a_load);
+                TFILLPAD_INPLACE(a_stg_full, a_load);
               }
             } else {
               // Fully empty lower-half stripe: emit zeros so the workspace tile
@@ -464,7 +468,12 @@ AICORE void wy_kda_kernel(
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
             if (local_rows > 0) {
-              TMOV(beta_r_ub, beta_ub);
+              TCVT(beta_r_ub, beta_ub, pto::RoundMode::CAST_NONE);
+              pipe_barrier(PIPE_V);
+              TileUbDataND<half, HalfChunk, ChunkSize,
+                           HalfChunk, ChunkSize> a_stg_cvt;
+              TASSIGN(a_stg_cvt, A2HalfUbAddr);
+              TCVT(inv_ub, a_stg_cvt, pto::RoundMode::CAST_NONE);
               pipe_barrier(PIPE_V);
               // Replicate beta_j across rows: beta_2d[i,j] = beta[j].
               TCOLEXPAND(beta_2d_ub, beta_r_ub);
@@ -490,7 +499,7 @@ AICORE void wy_kda_kernel(
             ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (10 << 8));
 
             // ─── Phase 2: build K_eff = k * exp(g_cs) ──────────────────────
-            // k and g_cs are head-major [HV, total_tokens, K] fp32; per-head
+            // k and g_cs are head-major [HV, total_tokens, K] fp16; per-head
             // contiguous K-major rows mean stride K between successive tokens.
             if (local_rows > 0) {
               int64_t hk_base =
@@ -502,43 +511,63 @@ AICORE void wy_kda_kernel(
               {
                 GmShape2D k_shape(local_rows, HiddenSize);
                 GmStride2D k_stride(HiddenSize);
-                GmTensor2D<float> k_global(K_handle + hk_base, k_shape,
-                                           k_stride);
-                DynVecTile<float, HalfChunk, HiddenSize,
+                GmTensor2D<half> k_global(K_handle + hk_base, k_shape,
+                                          k_stride);
+                TileUbDataND<half, HalfChunk, HiddenSize,
+                             HalfChunk, HiddenSize,
+                             pto::PadValue::Zero> k_stg_full;
+                TASSIGN(k_stg_full, KeffHalfUbAddr);
+                DynVecTile<half, HalfChunk, HiddenSize,
                            pto::PadValue::Zero> k_load(local_rows, HiddenSize);
-                TASSIGN(k_load, KUbAddr);
+                TASSIGN(k_load, KeffHalfUbAddr);
                 TLOAD(k_load, k_global);
                 if (local_rows != HalfChunk) {
-                  TFILLPAD_INPLACE(k_ub, k_load);
+                  TFILLPAD_INPLACE(k_stg_full, k_load);
                 }
+              }
+              set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+              wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+              {
+                TileUbDataND<half, HalfChunk, HiddenSize,
+                             HalfChunk, HiddenSize> k_stg_cvt;
+                TASSIGN(k_stg_cvt, KeffHalfUbAddr);
+                TCVT(k_ub, k_stg_cvt, pto::RoundMode::CAST_NONE);
+                pipe_barrier(PIPE_V);
               }
               {
                 GmShape2D g_shape(local_rows, HiddenSize);
                 GmStride2D g_stride(HiddenSize);
-                GmTensor2D<float> g_global(G_handle + hk_base, g_shape,
-                                           g_stride);
-                DynVecTile<float, HalfChunk, HiddenSize,
+                GmTensor2D<half> g_global(G_handle + hk_base, g_shape,
+                                          g_stride);
+                TileUbDataND<half, HalfChunk, HiddenSize,
+                             HalfChunk, HiddenSize,
+                             pto::PadValue::Zero> g_stg_full;
+                TASSIGN(g_stg_full, KeffHalfUbAddr);
+                DynVecTile<half, HalfChunk, HiddenSize,
                            pto::PadValue::Zero> g_load(local_rows, HiddenSize);
-                TASSIGN(g_load, GcsUbAddr);
+                TASSIGN(g_load, KeffHalfUbAddr);
                 TLOAD(g_load, g_global);
                 if (local_rows != HalfChunk) {
-                  TFILLPAD_INPLACE(gcs_ub, g_load);
+                  TFILLPAD_INPLACE(g_stg_full, g_load);
                 }
               }
-            } else {
-              TEXPANDS(keff_ub, 0.0f);
-              pipe_barrier(PIPE_V);
-              TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
-            }
-
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-
-            if (local_rows > 0) {
+              set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+              wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+              {
+                TileUbDataND<half, HalfChunk, HiddenSize,
+                             HalfChunk, HiddenSize> g_stg_cvt;
+                TASSIGN(g_stg_cvt, KeffHalfUbAddr);
+                TCVT(gcs_ub, g_stg_cvt, pto::RoundMode::CAST_NONE);
+                pipe_barrier(PIPE_V);
+              }
               // exp(g_cs) in-place over gcs_ub, then K_eff = k * exp(g_cs).
               TEXP(gcs_ub, gcs_ub);
               pipe_barrier(PIPE_V);
               TMUL(keff_ub, k_ub, gcs_ub);
+              pipe_barrier(PIPE_V);
+              TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
+            } else {
+              TEXPANDS(keff_ub, 0.0f);
               pipe_barrier(PIPE_V);
               TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
             }
@@ -593,11 +622,11 @@ AICORE void wy_kda_kernel(
             {
               GmShape2D beta_shape(1, valid_rows);
               GmStride2D beta_stride(1);
-              GmTensor2D<float> beta_global(
+              GmTensor2D<half> beta_global(
                   Beta_handle + static_cast<int64_t>(head_idx) * total_tokens +
                       chunk_token_start,
                   beta_shape, beta_stride);
-              DynVecTile<float, 1, ChunkSize, pto::PadValue::Zero> beta_load(
+              DynVecTile<half, 1, ChunkSize, pto::PadValue::Zero> beta_load(
                   1, valid_rows);
               TASSIGN(beta_load, BetaUbAddr);
               TLOAD(beta_load, beta_global);
@@ -614,14 +643,18 @@ AICORE void wy_kda_kernel(
                   static_cast<int64_t>(ChunkSize);
               GmShape2D a_shape(local_rows, ChunkSize);
               GmStride2D a_stride(NumHeads * ChunkSize);
-              GmTensor2D<float> a_global(A_handle + a_gm_offset, a_shape,
-                                         a_stride);
-              DynVecTile<float, HalfChunk, ChunkSize,
+              GmTensor2D<half> a_global(A_handle + a_gm_offset, a_shape,
+                                        a_stride);
+              TileUbDataND<half, HalfChunk, ChunkSize,
+                           HalfChunk, ChunkSize,
+                           pto::PadValue::Zero> a_stg_full;
+              TASSIGN(a_stg_full, A2HalfUbAddr);
+              DynVecTile<half, HalfChunk, ChunkSize,
                          pto::PadValue::Zero> a_load(local_rows, ChunkSize);
-              TASSIGN(a_load, InvUbAddr);
+              TASSIGN(a_load, A2HalfUbAddr);
               TLOAD(a_load, a_global);
               if (local_rows != HalfChunk) {
-                TFILLPAD_INPLACE(inv_ub, a_load);
+                TFILLPAD_INPLACE(a_stg_full, a_load);
               }
             } else {
               TEXPANDS(a2_ub, 0.0f);
@@ -633,7 +666,12 @@ AICORE void wy_kda_kernel(
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
             if (local_rows > 0) {
-              TMOV(beta_r_ub, beta_ub);
+              TCVT(beta_r_ub, beta_ub, pto::RoundMode::CAST_NONE);
+              pipe_barrier(PIPE_V);
+              TileUbDataND<half, HalfChunk, ChunkSize,
+                           HalfChunk, ChunkSize> a_stg_cvt;
+              TASSIGN(a_stg_cvt, A2HalfUbAddr);
+              TCVT(inv_ub, a_stg_cvt, pto::RoundMode::CAST_NONE);
               pipe_barrier(PIPE_V);
               TCOLEXPAND(beta_2d_ub, beta_r_ub);
               TMUL(a2_ub, inv_ub, beta_2d_ub);
@@ -667,42 +705,62 @@ AICORE void wy_kda_kernel(
               {
                 GmShape2D k_shape(local_rows, HiddenSize);
                 GmStride2D k_stride(HiddenSize);
-                GmTensor2D<float> k_global(K_handle + hk_base, k_shape,
-                                           k_stride);
-                DynVecTile<float, HalfChunk, HiddenSize,
+                GmTensor2D<half> k_global(K_handle + hk_base, k_shape,
+                                          k_stride);
+                TileUbDataND<half, HalfChunk, HiddenSize,
+                             HalfChunk, HiddenSize,
+                             pto::PadValue::Zero> k_stg_full;
+                TASSIGN(k_stg_full, KeffHalfUbAddr);
+                DynVecTile<half, HalfChunk, HiddenSize,
                            pto::PadValue::Zero> k_load(local_rows, HiddenSize);
-                TASSIGN(k_load, KUbAddr);
+                TASSIGN(k_load, KeffHalfUbAddr);
                 TLOAD(k_load, k_global);
                 if (local_rows != HalfChunk) {
-                  TFILLPAD_INPLACE(k_ub, k_load);
+                  TFILLPAD_INPLACE(k_stg_full, k_load);
                 }
+              }
+              set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+              wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+              {
+                TileUbDataND<half, HalfChunk, HiddenSize,
+                             HalfChunk, HiddenSize> k_stg_cvt;
+                TASSIGN(k_stg_cvt, KeffHalfUbAddr);
+                TCVT(k_ub, k_stg_cvt, pto::RoundMode::CAST_NONE);
+                pipe_barrier(PIPE_V);
               }
               {
                 GmShape2D g_shape(local_rows, HiddenSize);
                 GmStride2D g_stride(HiddenSize);
-                GmTensor2D<float> g_global(G_handle + hk_base, g_shape,
-                                           g_stride);
-                DynVecTile<float, HalfChunk, HiddenSize,
+                GmTensor2D<half> g_global(G_handle + hk_base, g_shape,
+                                          g_stride);
+                TileUbDataND<half, HalfChunk, HiddenSize,
+                             HalfChunk, HiddenSize,
+                             pto::PadValue::Zero> g_stg_full;
+                TASSIGN(g_stg_full, KeffHalfUbAddr);
+                DynVecTile<half, HalfChunk, HiddenSize,
                            pto::PadValue::Zero> g_load(local_rows, HiddenSize);
-                TASSIGN(g_load, GcsUbAddr);
+                TASSIGN(g_load, KeffHalfUbAddr);
                 TLOAD(g_load, g_global);
                 if (local_rows != HalfChunk) {
-                  TFILLPAD_INPLACE(gcs_ub, g_load);
+                  TFILLPAD_INPLACE(g_stg_full, g_load);
                 }
               }
-            } else {
-              TEXPANDS(keff_ub, 0.0f);
-              pipe_barrier(PIPE_V);
-              TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
-            }
-
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-
-            if (local_rows > 0) {
+              set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+              wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+              {
+                TileUbDataND<half, HalfChunk, HiddenSize,
+                             HalfChunk, HiddenSize> g_stg_cvt;
+                TASSIGN(g_stg_cvt, KeffHalfUbAddr);
+                TCVT(gcs_ub, g_stg_cvt, pto::RoundMode::CAST_NONE);
+                pipe_barrier(PIPE_V);
+              }
               TEXP(gcs_ub, gcs_ub);
               pipe_barrier(PIPE_V);
               TMUL(keff_ub, k_ub, gcs_ub);
+              pipe_barrier(PIPE_V);
+              TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
+            } else {
+              TEXPANDS(keff_ub, 0.0f);
               pipe_barrier(PIPE_V);
               TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
             }
@@ -807,9 +865,9 @@ AICORE void wy_kda_kernel(
             {
               GmShape2D u_shape(valid_rows, HiddenSize);
               GmStride2D u_stride(BSND_STRIDE);
-              GmTensor2D<float> u_global(U_handle + v_off, u_shape, u_stride);
+              GmTensor2D<half> u_global(U_handle + v_off, u_shape, u_stride);
               DynAccTile<float, ChunkSize, HiddenSize> u_store(valid_rows,
-                                                                HiddenSize);
+                                                               HiddenSize);
               TASSIGN(u_store, 0);
               TSTORE(u_global, u_store);
             }
@@ -837,9 +895,9 @@ AICORE void wy_kda_kernel(
             {
               GmShape2D w_shape(valid_rows, HiddenSize);
               GmStride2D w_stride(BSND_STRIDE);
-              GmTensor2D<float> w_global(W_handle + v_off, w_shape, w_stride);
+              GmTensor2D<half> w_global(W_handle + v_off, w_shape, w_stride);
               DynAccTile<float, ChunkSize, HiddenSize> w_store(valid_rows,
-                                                                HiddenSize);
+                                                               HiddenSize);
               TASSIGN(w_store, 65536);
               TSTORE(w_global, w_store);
             }
@@ -905,9 +963,9 @@ AICORE void wy_kda_kernel(
             {
               GmShape2D u_shape(valid_rows, HiddenSize);
               GmStride2D u_stride(BSND_STRIDE);
-              GmTensor2D<float> u_global(U_handle + v_off, u_shape, u_stride);
+              GmTensor2D<half> u_global(U_handle + v_off, u_shape, u_stride);
               DynAccTile<float, ChunkSize, HiddenSize> u_store(valid_rows,
-                                                                HiddenSize);
+                                                               HiddenSize);
               TASSIGN(u_store, 0);
               TSTORE(u_global, u_store);
             }
@@ -934,9 +992,9 @@ AICORE void wy_kda_kernel(
             {
               GmShape2D w_shape(valid_rows, HiddenSize);
               GmStride2D w_stride(BSND_STRIDE);
-              GmTensor2D<float> w_global(W_handle + v_off, w_shape, w_stride);
+              GmTensor2D<half> w_global(W_handle + v_off, w_shape, w_stride);
               DynAccTile<float, ChunkSize, HiddenSize> w_store(valid_rows,
-                                                                HiddenSize);
+                                                               HiddenSize);
               TASSIGN(w_store, 65536);
               TSTORE(w_global, w_store);
             }
@@ -964,15 +1022,15 @@ extern "C" __global__ AICORE void launch_wy_kda(
     uint64_t ffts_addr)
 {
   wy_kda_kernel<GDN_H, GDN_D, GDN_C>(
-      reinterpret_cast<__gm__ float *>(K_handle),
+      reinterpret_cast<__gm__ half *>(K_handle),
       reinterpret_cast<__gm__ half *>(V_handle),
-      reinterpret_cast<__gm__ float *>(Beta_handle),
-      reinterpret_cast<__gm__ float *>(G_handle),
-      reinterpret_cast<__gm__ float *>(A_handle),
+      reinterpret_cast<__gm__ half *>(Beta_handle),
+      reinterpret_cast<__gm__ half *>(G_handle),
+      reinterpret_cast<__gm__ half *>(A_handle),
       reinterpret_cast<__gm__ half *>(workspace_a2_handle),
       reinterpret_cast<__gm__ half *>(workspace_keff_handle),
-      reinterpret_cast<__gm__ float *>(U_handle),
-      reinterpret_cast<__gm__ float *>(W_handle),
+      reinterpret_cast<__gm__ half *>(U_handle),
+      reinterpret_cast<__gm__ half *>(W_handle),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
       batch_size, seq_len, total_tokens, ffts_addr);
 }

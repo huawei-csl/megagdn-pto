@@ -86,8 +86,8 @@ def run_gate_cumsum_kda(
     """Compute within-chunk cumulative sum of KDA gate logits into ``g_sum``.
 
     Args:
-        g:       ``[B, T, HV, K]`` float32, raw per-dimension gate values.
-        g_sum:   ``[B, T, HV, K]`` float32, output (cumulative sums).
+        g:       ``[B, T, HV, K]`` float16, raw per-dimension gate values.
+        g_sum:   ``[B, T, HV, K]`` float16, output (cumulative sums).
         stream:  NPU stream handle (``torch.npu.current_stream()._as_parameter_``).
         chunk_size: Tokens per chunk C.  Must match the compiled kernel.
         cu_seqlens: ``int32`` cumulative sequence lengths for packed varlen input.
@@ -95,7 +95,7 @@ def run_gate_cumsum_kda(
         batch_size_override: Number of sequences (use with ``cu_seqlens``).
         block_dim: AI-Core count; auto-detected if ``None``.
     """
-    assert g.dtype == torch.float32 and g_sum.dtype == torch.float32
+    assert g.dtype == torch.float16 and g_sum.dtype == torch.float16
     assert g.shape == g_sum.shape
 
     HV = g.shape[2]
@@ -167,20 +167,20 @@ def run_kkt_kda(
     """Compute within-chunk gated attention matrix into ``L_out``.
 
     Args:
-        k:        ``[B, T, HV, K]`` float32, key vectors.
-        g_cs:     ``[B, T, HV, K]`` float32, within-chunk cumulative gate sums.
-        beta_sig: ``[B, T, HV]`` float32, per-token sigmoid beta in (0, 1).
-        L_out:    ``[B, T, HV, C]`` float32, output (pre-allocated, will be overwritten).
+        k:        ``[B, T, HV, K]`` float16, key vectors.
+        g_cs:     ``[B, T, HV, K]`` float16, within-chunk cumulative gate sums.
+        beta_sig: ``[B, T, HV]`` float16, per-token sigmoid beta in (0, 1).
+        L_out:    ``[B, T, HV, C]`` float16, output (pre-allocated, will be overwritten).
         stream:   NPU stream handle (``torch.npu.current_stream()._as_parameter_``).
         chunk_size: Tokens per chunk C.  Must match the compiled kernel.
         cu_seqlens: ``int32`` cumulative sequence lengths for packed varlen input.
         batch_size_override: Number of sequences (use with ``cu_seqlens``).
         block_dim: AI-Core count; auto-detected if ``None``.
     """
-    assert k.dtype == torch.float32
-    assert g_cs.dtype == torch.float32
-    assert beta_sig.dtype == torch.float32
-    assert L_out.dtype == torch.float32
+    assert k.dtype == torch.float16
+    assert g_cs.dtype == torch.float16
+    assert beta_sig.dtype == torch.float16
+    assert L_out.dtype == torch.float16
 
     HV = k.shape[2]
     K  = k.shape[3]
@@ -289,26 +289,26 @@ def run_wy_kda(
         w = INV @ (beta * exp(g_cs) * k)
 
     Args:
-        k:        ``[B, T, HV, K]`` float32 (BSND; GQA-expanded).
-        v:        ``[B, T, HV, V]`` float32 (cast to fp16 internally for the GEMM).
-        g_cs:     ``[B, T, HV, K]`` float32, within-chunk cumulative gate sum (per-dim).
-        beta_sig: ``[B, T, HV]``    float32, post-sigmoid beta in (0, 1).
-        INV:      ``[B, T, HV, C]`` float32, full lower-tri inverse (I+L)^{-1}.
-        u_out:    ``[B, T, HV, V]`` float32 (overwritten).
-        w_out:    ``[B, T, HV, K]`` float32 (overwritten).
+        k:        ``[B, T, HV, K]`` float16 (BSND; GQA-expanded).
+        v:        ``[B, T, HV, V]`` float16.
+        g_cs:     ``[B, T, HV, K]`` float16, within-chunk cumulative gate sum (per-dim).
+        beta_sig: ``[B, T, HV]``    float16, post-sigmoid beta in (0, 1).
+        INV:      ``[B, T, HV, C]`` float16, full lower-tri inverse (I+L)^{-1}.
+        u_out:    ``[B, T, HV, V]`` float16 (overwritten).
+        w_out:    ``[B, T, HV, K]`` float16 (overwritten).
         stream:   NPU stream handle.
         chunk_size: Tokens per chunk C; must match the compiled kernel.
         cu_seqlens: ``int32`` cumulative sequence lengths for packed varlen input.
         batch_size_override: Number of sequences (use with ``cu_seqlens``).
         block_dim: AI-Core count; auto-detected if ``None``.
     """
-    assert k.dtype == torch.float32
-    assert v.dtype == torch.float32
-    assert g_cs.dtype == torch.float32
-    assert beta_sig.dtype == torch.float32
-    assert INV.dtype == torch.float32
-    assert u_out.dtype == torch.float32
-    assert w_out.dtype == torch.float32
+    assert k.dtype == torch.float16
+    assert v.dtype == torch.float16
+    assert g_cs.dtype == torch.float16
+    assert beta_sig.dtype == torch.float16
+    assert INV.dtype == torch.float16
+    assert u_out.dtype == torch.float16
+    assert w_out.dtype == torch.float16
 
     HV = k.shape[2]
     K  = k.shape[3]
@@ -320,9 +320,6 @@ def run_wy_kda(
     k_t    = k.permute(0, 2, 1, 3).contiguous()        # [B, HV, T, K]
     g_cs_t = g_cs.permute(0, 2, 1, 3).contiguous()
     beta_t = beta_sig.permute(0, 2, 1).contiguous()    # [B, HV, T]
-    # V stays BSND for Cube's MTE2 load; cast to fp16 to match the GEMM dtype.
-    v_fp16 = v.to(torch.float16).contiguous()
-
     ws_a2   = torch.zeros(bd, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
     ws_keff = torch.zeros(bd, chunk_size, K,          device=k.device, dtype=torch.float16)
 
@@ -333,7 +330,7 @@ def run_wy_kda(
     lib = load_wy_kda(HV, K, chunk_size)
     lib.call_kernel(
         bd, stream,
-        _vp(k_t), _vp(v_fp16), _vp(beta_t), _vp(g_cs_t), _vp(INV),
+        _vp(k_t), _vp(v.contiguous()), _vp(beta_t), _vp(g_cs_t), _vp(INV),
         _vp(ws_a2), _vp(ws_keff),
         _vp(u_out), _vp(w_out),
         _vp(cu32),
@@ -406,24 +403,24 @@ def run_chunk_h_kda(
         S_new   = exp(g_total).unsqueeze(-1) * S + k_rest^T @ v_corr
 
     Args:
-        k:               ``[B, T, HV, K]`` float32, keys (GQA-expanded).
-        w:               ``[B, T, HV, K]`` float32, from wy_kda (cast to fp16 here).
-        u:               ``[B, T, HV, V]`` float32, from wy_kda.
-        g_cs:            ``[B, T, HV, K]`` float32, within-chunk cumulative gate sum.
-        s_snapshots_out: ``[total_chunks, HV, K, V]`` float32 (output).
-        v_corr_out:      ``[B, T, HV, V]`` float32 (output).
+        k:               ``[B, T, HV, K]`` float16, keys (GQA-expanded).
+        w:               ``[B, T, HV, K]`` float16, from wy_kda.
+        u:               ``[B, T, HV, V]`` float16, from wy_kda.
+        g_cs:            ``[B, T, HV, K]`` float16, within-chunk cumulative gate sum.
+        s_snapshots_out: ``[total_chunks, HV, K, V]`` float16 (output).
+        v_corr_out:      ``[B, T, HV, V]`` float16 (output).
         stream:          NPU stream handle.
         chunk_size:      Tokens per chunk C; must match the compiled kernel.
         cu_seqlens:      ``int32`` cumulative sequence lengths for packed varlen input.
         batch_size_override: Number of sequences (use with ``cu_seqlens``).
         block_dim:       AI-Core count; auto-detected if ``None``.
     """
-    assert k.dtype == torch.float32
-    assert w.dtype == torch.float32
-    assert u.dtype == torch.float32
-    assert g_cs.dtype == torch.float32
-    assert s_snapshots_out.dtype == torch.float32
-    assert v_corr_out.dtype == torch.float32
+    assert k.dtype == torch.float16
+    assert w.dtype == torch.float16
+    assert u.dtype == torch.float16
+    assert g_cs.dtype == torch.float16
+    assert s_snapshots_out.dtype == torch.float16
+    assert v_corr_out.dtype == torch.float16
 
     HV = k.shape[2]
     K  = k.shape[3]
@@ -436,8 +433,6 @@ def run_chunk_h_kda(
     # U load can use the BSND stride.
     k_t    = k.permute(0, 2, 1, 3).contiguous()         # [B, HV, T, K]
     g_cs_t = g_cs.permute(0, 2, 1, 3).contiguous()
-    # Cast W to fp16 once here so the Cube W @ S GEMM has fp16 inputs.
-    w_fp16 = w.to(torch.float16).contiguous()
 
     # Per-AI-core workspace: 5 slots × K*V half-elements.
     ws = torch.zeros(bd * 5, K, K, device=k.device, dtype=torch.float16)
@@ -448,7 +443,7 @@ def run_chunk_h_kda(
     lib = load_chunk_h_kda(HV, K, chunk_size)
     lib.call_kernel(
         bd, stream,
-        _vp(k_t), _vp(w_fp16), _vp(u), _vp(g_cs_t),
+        _vp(k_t), _vp(w.contiguous()), _vp(u), _vp(g_cs_t),
         _vp(s_snapshots_out), _vp(v_corr_out), _vp(ws), _vp(cu32),
         batch, T, T,
     )
@@ -522,24 +517,24 @@ def run_chunk_o_kda(
         o     = q_eff @ S + Aqk @ v_corr   # [c_len, V]
 
     Args:
-        q:            ``[B, T, HV, K]`` float32 (BSND; scale and GQA already applied).
-        k:            ``[B, T, HV, K]`` float32, keys.
-        v_corr:       ``[B, T, HV, V]`` float32, from chunk_h_kda.
-        s_snapshots:  ``[total_chunks, HV, K, V]`` float32, from chunk_h_kda.
-        g_cs:         ``[B, T, HV, K]`` float32, within-chunk cumulative gate.
-        o_out:        ``[B, T, HV, V]`` float32 (output, overwritten).
+        q:            ``[B, T, HV, K]`` float16 (BSND; scale and GQA already applied).
+        k:            ``[B, T, HV, K]`` float16, keys.
+        v_corr:       ``[B, T, HV, V]`` float16, from chunk_h_kda.
+        s_snapshots:  ``[total_chunks, HV, K, V]`` float16, from chunk_h_kda.
+        g_cs:         ``[B, T, HV, K]`` float16, within-chunk cumulative gate.
+        o_out:        ``[B, T, HV, V]`` float16 (output, overwritten).
         stream:       NPU stream handle.
         chunk_size:   Tokens per chunk C; must match the compiled kernel.
         cu_seqlens:   ``int32`` cumulative sequence lengths for packed varlen input.
         batch_size_override: Number of sequences (use with ``cu_seqlens``).
         block_dim:    AI-Core count; auto-detected if ``None``.
     """
-    assert q.dtype == torch.float32
-    assert k.dtype == torch.float32
-    assert v_corr.dtype == torch.float32
-    assert s_snapshots.dtype == torch.float32
-    assert g_cs.dtype == torch.float32
-    assert o_out.dtype == torch.float32
+    assert q.dtype == torch.float16
+    assert k.dtype == torch.float16
+    assert v_corr.dtype == torch.float16
+    assert s_snapshots.dtype == torch.float16
+    assert g_cs.dtype == torch.float16
+    assert o_out.dtype == torch.float16
 
     HV = q.shape[2]
     K  = q.shape[3]
