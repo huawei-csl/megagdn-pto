@@ -85,10 +85,10 @@ def pto_pipeline_kda(
     Vd = v.shape[3]
 
     # GQA expansion + scale (mirrors cpu_pipeline_kda)
-    qf = q.float().repeat_interleave(G, dim=2) * scale   # [B, T, HV, K]
-    kf = k.float().repeat_interleave(G, dim=2)           # [B, T, HV, K]
-    vf = v.float()
-    bf = beta_sig.float()
+    qf = q.half().repeat_interleave(G, dim=2) * scale    # [B, T, HV, K] fp16
+    kf = k.half().repeat_interleave(G, dim=2)            # [B, T, HV, K] fp16
+    vf = v.half()
+    bf = beta_sig.half()
 
     cu_dev = (torch.tensor(cu_seqlens_list, dtype=torch.int32, device=dev)
               if cu_seqlens_list else None)
@@ -96,7 +96,7 @@ def pto_pipeline_kda(
     stream = torch.npu.current_stream()._as_parameter_
 
     # ── Stage 1: gate_cumsum_kda — NPU PTO kernel ────────────────────────────
-    g_dev     = g_log.to(dev)
+    g_dev     = g_log.half().to(dev)
     g_sum_dev = torch.empty_like(g_dev)
     run_gate_cumsum_kda(
         g_dev, g_sum_dev,
@@ -110,7 +110,7 @@ def pto_pipeline_kda(
     # ── Stage 2: kkt_kda — NPU PTO kernel ────────────────────────────────────
     kf_dev = kf.to(dev)
     bf_dev = bf.to(dev)
-    L_dev  = torch.zeros(1, T, HV, chunk_size, device=dev, dtype=torch.float32)
+    L_dev  = torch.zeros(1, T, HV, chunk_size, device=dev, dtype=torch.float16)
     run_kkt_kda(
         kf_dev, g_sum_dev, bf_dev, L_dev,
         stream=stream,
@@ -121,14 +121,14 @@ def pto_pipeline_kda(
     torch.npu.synchronize()
 
     # ── Stage 3: solve_tril — PTO-ISA tri_inverse kernel ─────────────────────
-    A_inv_dev = solve_tril(L_dev.to(torch.float16), cu_dev, chunk_size, HV, tri_inv_func)
+    A_inv_dev = solve_tril(L_dev, cu_dev, chunk_size, HV, tri_inv_func)
     torch.npu.synchronize()
 
     # ── Stage 4: wy_kda — NPU PTO kernel ─────────────────────────────────────
     vf_dev  = vf.to(dev)
-    INV_dev = A_inv_dev.float()   # [B, T, HV, C] float32
-    u_dev   = torch.zeros(1, T, HV, Vd, device=dev, dtype=torch.float32)
-    w_dev   = torch.zeros(1, T, HV, Kd, device=dev, dtype=torch.float32)
+    INV_dev = A_inv_dev            # [B, T, HV, C] float16
+    u_dev   = torch.zeros(1, T, HV, Vd, device=dev, dtype=torch.float16)
+    w_dev   = torch.zeros(1, T, HV, Kd, device=dev, dtype=torch.float16)
     run_wy_kda(
         kf_dev, vf_dev, g_sum_dev, bf_dev, INV_dev, u_dev, w_dev,
         stream=stream,
@@ -146,8 +146,8 @@ def pto_pipeline_kda(
             (cu_seqlens_list[i + 1] - cu_seqlens_list[i] + chunk_size - 1) // chunk_size
             for i in range(len(cu_seqlens_list) - 1)
         )
-    s_snapshots_dev = torch.zeros(n_chunks, HV, Kd, Vd, device=dev, dtype=torch.float32)
-    v_corr_dev      = torch.zeros(1, T, HV, Vd, device=dev, dtype=torch.float32)
+    s_snapshots_dev = torch.zeros(n_chunks, HV, Kd, Vd, device=dev, dtype=torch.float16)
+    v_corr_dev      = torch.zeros(1, T, HV, Vd, device=dev, dtype=torch.float16)
     run_chunk_h_kda(
         kf_dev, w_dev, u_dev, g_sum_dev,
         s_snapshots_dev, v_corr_dev,
@@ -160,7 +160,7 @@ def pto_pipeline_kda(
 
     # ── Stage 6: chunk_o_kda — NPU PTO kernel ────────────────────────────────
     qf_dev = qf.to(dev)
-    o_dev  = torch.zeros(1, T, HV, Vd, device=dev, dtype=torch.float32)
+    o_dev  = torch.zeros(1, T, HV, Vd, device=dev, dtype=torch.float16)
     run_chunk_o_kda(
         qf_dev, kf_dev, v_corr_dev,
         s_snapshots_dev, g_sum_dev,

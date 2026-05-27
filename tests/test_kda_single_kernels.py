@@ -553,7 +553,7 @@ def test_gate_cumsum(tc: TestCase, H: int, dev: "torch.device | None" = None) ->
 
     _, _, _, g_log, _, _ = _make_inputs(tc, H)
     # g_log: [1, T, H, K]
-    g_dev   = g_log.to(dev)
+    g_dev   = g_log.half().to(dev)
     g_sum   = torch.empty_like(g_dev)
     cu      = (torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
                if tc.cu_seqlens_list else None)
@@ -585,7 +585,7 @@ def test_kkt(tc: TestCase, H: int, dev=None) -> bool:
 
     g_cs = ref_gate_cumsum(g_log, CHUNK, tc.cu_seqlens_list)
 
-    L_npu  = torch.zeros(1, tc.T, H, CHUNK, device=dev, dtype=torch.float32)
+    L_npu  = torch.zeros(1, tc.T, H, CHUNK, device=dev, dtype=torch.float16)
     cu     = (torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
               if tc.cu_seqlens_list else None)
     N_seq  = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
@@ -593,7 +593,7 @@ def test_kkt(tc: TestCase, H: int, dev=None) -> bool:
     torch.npu.synchronize()
 
     run_kkt_kda(
-        k.to(dev), g_cs.to(dev), beta_sig.to(dev), L_npu,
+        k.half().to(dev), g_cs.half().to(dev), beta_sig.half().to(dev), L_npu,
         stream=stream, chunk_size=CHUNK, cu_seqlens=cu,
         batch_size_override=N_seq,
     )
@@ -645,13 +645,13 @@ def test_wy(tc: TestCase, H: int, dev=None) -> bool:
     u_ref, w_ref = ref_wy_kda(k.float(), v.float(), g_cs, beta_sig,
                               INV_ref, CHUNK, tc.cu_seqlens_list)
 
-    k_d    = k.float().to(dev)
-    v_d    = v.float().to(dev)
-    g_cs_d = g_cs.to(dev)
-    beta_d = beta_sig.to(dev)
-    INV_d  = INV_ref.to(dev)
-    u_npu  = torch.zeros(1, tc.T, H, V_DIM, device=dev, dtype=torch.float32)
-    w_npu  = torch.zeros(1, tc.T, H, K,     device=dev, dtype=torch.float32)
+    k_d    = k.half().to(dev)
+    v_d    = v.half().to(dev)
+    g_cs_d = g_cs.half().to(dev)
+    beta_d = beta_sig.half().to(dev)
+    INV_d  = INV_ref.half().to(dev)
+    u_npu  = torch.zeros(1, tc.T, H, V_DIM, device=dev, dtype=torch.float16)
+    w_npu  = torch.zeros(1, tc.T, H, K,     device=dev, dtype=torch.float16)
     cu     = (torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
               if tc.cu_seqlens_list else None)
     N_seq  = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
@@ -686,8 +686,8 @@ def test_chunk_h_kda(tc: TestCase, H: int, dev=None) -> bool:
     s_ref, vcorr_ref = ref_chunk_h_kda(k.float(), u_ref, w_ref, g_cs,
                                        CHUNK, tc.cu_seqlens_list)
 
-    s_npu     = torch.zeros_like(s_ref, device=dev)
-    vcorr_npu = torch.zeros(1, tc.T, H, V_DIM, device=dev, dtype=torch.float32)
+    s_npu     = torch.zeros_like(s_ref, device=dev, dtype=torch.float16)
+    vcorr_npu = torch.zeros(1, tc.T, H, V_DIM, device=dev, dtype=torch.float16)
     cu = (torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
           if tc.cu_seqlens_list else None)
     N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
@@ -695,7 +695,7 @@ def test_chunk_h_kda(tc: TestCase, H: int, dev=None) -> bool:
 
     torch.npu.synchronize()
     run_chunk_h_kda(
-        k.float().to(dev), w_ref.to(dev), u_ref.to(dev), g_cs.to(dev),
+        k.half().to(dev), w_ref.half().to(dev), u_ref.half().to(dev), g_cs.half().to(dev),
         s_npu, vcorr_npu,
         stream=stream, chunk_size=CHUNK, cu_seqlens=cu,
         batch_size_override=N_seq,
@@ -727,11 +727,14 @@ def test_chunk_o_kda(tc: TestCase, H: int, dev=None) -> bool:
                               INV_ref, CHUNK, tc.cu_seqlens_list)
     s_ref, vcorr_ref = ref_chunk_h_kda(kf, u_ref, w_ref, g_cs,
                                        CHUNK, tc.cu_seqlens_list)
-    o_ref = ref_chunk_o_kda(qf, kf, vcorr_ref, s_ref, g_cs,
+    # Round-trip through fp16 to match what the NPU kernel actually receives.
+    # s_ref accumulates across chunks; the rounding error in s_ref.half() propagates
+    # through q_eff @ S and causes the NPU output to diverge from a float32 reference.
+    o_ref = ref_chunk_o_kda(qf, kf, vcorr_ref.half().float(), s_ref.half().float(), g_cs,
                             CHUNK, tc.cu_seqlens_list)
 
     # NPU run.
-    o_npu = torch.zeros(1, tc.T, H, V_DIM, device=dev, dtype=torch.float32)
+    o_npu = torch.zeros(1, tc.T, H, V_DIM, device=dev, dtype=torch.float16)
     cu = (torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
           if tc.cu_seqlens_list else None)
     N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
@@ -739,8 +742,8 @@ def test_chunk_o_kda(tc: TestCase, H: int, dev=None) -> bool:
 
     torch.npu.synchronize()
     run_chunk_o_kda(
-        qf.to(dev), kf.to(dev), vcorr_ref.to(dev),
-        s_ref.to(dev), g_cs.to(dev),
+        qf.half().to(dev), kf.half().to(dev), vcorr_ref.half().to(dev),
+        s_ref.half().to(dev), g_cs.half().to(dev),
         o_npu,
         stream=stream, chunk_size=CHUNK, cu_seqlens=cu,
         batch_size_override=N_seq,
