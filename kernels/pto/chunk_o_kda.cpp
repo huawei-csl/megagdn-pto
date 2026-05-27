@@ -578,8 +578,12 @@ AICORE void chunk_o_kda_kernel(
       }
 
       // ── (A.3) Load K and compute k_eff = K * exp(-g_cs) ─────────────
+      // WAR on SLOT_D: the K staging TLOAD (MTE2) must wait for the WS_Q
+      // store (MTE3) that just read SLOT_D, else it corrupts q_eff in WS_Q.
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+      set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
       if (valid_rows > 0) {
         GmShape2D k_shape(valid_rows, K_DIM);
         GmStride2D k_stride(HM_STRIDE);
@@ -634,8 +638,13 @@ AICORE void chunk_o_kda_kernel(
       }
 
       // ── (A.4) Load V_corr fp16 (BSND), store to WS_V ────────────────
+      // WAR on SLOT_D: the V staging TLOAD (MTE2) must wait for the WS_K
+      // store (MTE3) that just read SLOT_D.  MTE3→V also covers the
+      // valid_rows==0 branch, which writes SLOT_D via the V pipe.
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+      set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
       {
         TileUbDataND<half, HalfC, V_DIM, HalfC, V_DIM,
                      pto::PadValue::Zero> vh_ub;
@@ -679,8 +688,12 @@ AICORE void chunk_o_kda_kernel(
       }
 
       // ── (A.5) Load S fp16 from snapshots, store to WS_S ─────────────
+      // WAR on SLOT_D: the S staging TLOAD (MTE2) must wait for the WS_V
+      // store (MTE3) that just read SLOT_D.
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+      set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
       {
         TileUbDataND<half, HalfC, V_DIM, HalfC, V_DIM> sh_ub;
         TASSIGN(sh_ub, SLOT_D_ADDR);
