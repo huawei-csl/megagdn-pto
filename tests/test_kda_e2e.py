@@ -175,6 +175,53 @@ def pto_pipeline_kda(
 
 
 # ---------------------------------------------------------------------------
+# Fused mega-kernel pipeline (all 6 stages in a single NPU launch)
+# ---------------------------------------------------------------------------
+
+def mega_pipeline_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_log: torch.Tensor,
+    beta_sig: torch.Tensor,
+    cu_seqlens_list,
+    scale: float,
+    dev: torch.device,
+    chunk_size: int = CHUNK,
+) -> torch.Tensor:
+    """KDA pipeline fused into one NPU launch via ``run_mega_kernel_kda``.
+
+    Input prep mirrors ``pto_pipeline_kda`` exactly (same GQA expansion + scale), so the
+    only difference under test is staged dispatch vs. the fused mega-kernel.
+    """
+    from megagdn_pto.kda_mega_kernel import run_mega_kernel_kda
+
+    H  = q.shape[2]
+    HV = v.shape[2]
+    G  = HV // H
+
+    qf = q.half().repeat_interleave(G, dim=2) * scale    # [B, T, HV, K] fp16
+    kf = k.half().repeat_interleave(G, dim=2)            # [B, T, HV, K] fp16
+    vf = v.half()
+    bf = beta_sig.half()
+    g_dev = g_log.half().to(dev)
+
+    cu_dev = (torch.tensor(cu_seqlens_list, dtype=torch.int32, device=dev)
+              if cu_seqlens_list else None)
+    N_seq  = len(cu_seqlens_list) - 1 if cu_seqlens_list else 1
+    stream = torch.npu.current_stream()._as_parameter_
+
+    o_dev = run_mega_kernel_kda(
+        qf.to(dev), kf.to(dev), vf.to(dev), g_dev, bf.to(dev), cu_dev,
+        stream=stream,
+        chunk_size=chunk_size,
+        batch_size_override=N_seq,
+    )
+    torch.npu.synchronize()
+    return o_dev.cpu()
+
+
+# ---------------------------------------------------------------------------
 # Test shapes
 # ---------------------------------------------------------------------------
 
@@ -219,14 +266,23 @@ def run_one(
     g_log    = -torch.rand(1, T, HV, K) * 0.05
     beta_sig = torch.sigmoid(torch.randn(1, T, HV))
 
-    # PTO pipeline (all stages on NPU)
+    # PTO staged pipeline (all stages on NPU)
     o_pto = pto_pipeline_kda(q, k, v, g_log, beta_sig, cu_list, scale, dev, chunk_size,
                              tri_inv_func)
+
+    # Fused mega-kernel pipeline (single NPU launch)
+    o_mega = mega_pipeline_kda(q, k, v, g_log, beta_sig, cu_list, scale, dev, chunk_size)
 
     # CPU reference pipeline (all stages on CPU)
     o_cpu = cpu_pipeline_kda(q, k, v, g_log, beta_sig, cu_list, scale, chunk_size)
 
-    ok = stats_ok(o_pto.float(), o_cpu.float())
+    ok_pto  = stats_ok(o_pto.float(), o_cpu.float())
+    ok_mega = stats_ok(o_mega.float(), o_cpu.float())
+    ok_xchk = stats_ok(o_mega.float(), o_pto.float())
+    ok = ok_pto and ok_mega and ok_xchk
+    label = (f"{label}  [staged={'ok' if ok_pto else 'X'} "
+             f"mega={'ok' if ok_mega else 'X'} "
+             f"mega~staged={'ok' if ok_xchk else 'X'}]")
     return ok, label
 
 

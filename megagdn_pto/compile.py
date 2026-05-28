@@ -170,6 +170,37 @@ def compile_mega_kernel(
 
 
 @lru_cache(maxsize=None)
+def compile_mega_kernel_kda(
+    *,
+    num_heads: int = 16,
+    hidden_size: int = 128,
+    chunk_size: int = 128,
+    cpp_mtime_ns: int = 0,
+) -> str:
+    """Compile the fused KDA mega-kernel and return the path to the resulting ``.so``.
+
+    Template parameters injected at compile time:
+        GDN_H = num_heads   (HV, value/gate heads)
+        GDN_D = hidden_size (K == V, per-head dimension)
+        GDN_C = chunk_size  (C, tokens per chunk)
+    """
+    os.makedirs(_COMPILED_DIR, exist_ok=True)
+    cpp_path = os.path.join(_KERNELS_PTO, "mega_kernel_kda.cpp")
+    lib_path = os.path.join(
+        _COMPILED_DIR,
+        f"mega_kernel_kda_H{num_heads}_D{hidden_size}_C{chunk_size}.so",
+    )
+    flags = _common_flags(
+        num_heads=num_heads, key_heads=num_heads,
+        hidden_size=hidden_size, chunk_size=chunk_size,
+    )
+    print(f"[megagdn_pto] Compiling mega_kernel_kda (HV={num_heads} K={hidden_size}) …")
+    _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=600)
+    print(f"[megagdn_pto] Compiled → {lib_path}")
+    return lib_path
+
+
+@lru_cache(maxsize=None)
 def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
     """Compile the triangular-inverse CubeCore kernel and return the ``.so`` path."""
     os.makedirs(_COMPILED_DIR, exist_ok=True)
