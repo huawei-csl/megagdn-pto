@@ -93,6 +93,10 @@
 #include <runtime/rt_ffts.h>
 using namespace pto;
 
+#ifndef GDN_A5_DIRECT_CHUNK_H_C2V
+#define GDN_A5_DIRECT_CHUNK_H_C2V 0
+#endif
+
 #ifdef __CCE_AICORE__
 
 namespace {
@@ -368,6 +372,7 @@ AICORE void chunk_h_kernel(
   constexpr int32_t WS_UB = U_UB + HalfC * D * sizeof(float);
   constexpr int32_t KV_UB = U_UB_HALF;
   constexpr int32_t S_UB_HALF = WS_UB + HalfC * D * sizeof(float);
+  constexpr int32_t DIRECT_WS_UB = S_UB_HALF;
 
   TileUbDataND<float, 1, 64, 1, 64> zero_ub;
   TASSIGN(zero_ub, ZERO_UB);
@@ -393,6 +398,8 @@ AICORE void chunk_h_kernel(
   TASSIGN(ws_ub, WS_UB);
   TileUbDataND<float, HalfC, D, HalfC, D> kv_ub;
   TASSIGN(kv_ub, KV_UB);
+  TileUbDataND<float, HalfC, D, HalfC, D> direct_ws_ub;
+  TASSIGN(direct_ws_ub, DIRECT_WS_UB);
 
   auto vid = get_subblockid();
 
@@ -468,6 +475,12 @@ AICORE void chunk_h_kernel(
       gemm_v0<half, float, C, D, D, C, D, D, D, false, false>(
           w_l1, s_l1, ws_l0, (bool)1);
 
+#if GDN_A5_DIRECT_CHUNK_H_C2V
+      TMOV<TileUbDataND<float, HalfC, D, HalfC, D>,
+           TileAcc<float, C, D, C, D>,
+           AccToVecMode::DualModeSplitM>(direct_ws_ub, ws_l0);
+      pipe_barrier(PIPE_ALL);
+#else
       {
         GmShape2D ws_shape(C, D);
         GmStride2D ws_stride(D);
@@ -478,6 +491,7 @@ AICORE void chunk_h_kernel(
         // Save ws_i so the Vec phase can do `v_new = U_i - ws_i`.
         TSTORE(ws_global, ws_store);
       }
+#endif
       ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
 
       wait_flag_dev(PIPE_S, 1);
@@ -512,6 +526,12 @@ AICORE void chunk_h_kernel(
       gemm_v0<half, float, D, D, C, D, D, C, C, true, false>(
           k_l1, v_l1, kv_l0, (bool)1);
 
+#if GDN_A5_DIRECT_CHUNK_H_C2V
+      TMOV<TileUbDataND<float, HalfC, D, HalfC, D>,
+           TileAcc<float, D, D, D, D>,
+           AccToVecMode::DualModeSplitM>(kv_ub, kv_l0);
+      pipe_barrier(PIPE_ALL);
+#else
       {
         GmShape2D kv_shape(D, D);
         GmStride2D kv_stride(D);
@@ -522,6 +542,7 @@ AICORE void chunk_h_kernel(
         // Save kv = k_tilde^T @ v_i_new so Vec can finish the state update.
         TSTORE(kv_global, kv_store);
       }
+#endif
       ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
     }
   }
@@ -699,6 +720,9 @@ AICORE void chunk_h_kernel(
       pipe_barrier(PIPE_ALL);
 
       wait_flag_dev(PIPE_S, 0);
+#if GDN_A5_DIRECT_CHUNK_H_C2V
+      TMOV(ws_ub, direct_ws_ub);
+#else
       {
         GmShape2D ws_shape(HalfC, D);
         GmStride2D ws_stride(D);
@@ -713,6 +737,7 @@ AICORE void chunk_h_kernel(
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       TCVT(ws_ub, u_ub_half, pto::RoundMode::CAST_NONE);
+#endif
       // v_i_new = U_i - W_i @ S_i.
       // In PyTorch notation:
       //   u_ub = u_ub - ws_ub
@@ -802,6 +827,7 @@ AICORE void chunk_h_kernel(
       }
 
       wait_flag_dev(PIPE_S, 2);
+#if !GDN_A5_DIRECT_CHUNK_H_C2V
       {
         GmShape2D kv_shape(HalfC, D);
         GmStride2D kv_stride(D);
@@ -816,6 +842,7 @@ AICORE void chunk_h_kernel(
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       TCVT(kv_ub, s_ub_half, pto::RoundMode::CAST_NONE);
+#endif
       pipe_barrier(PIPE_ALL);
       // Finish S_{i+1} = exp(g_last) * S_i + k_i_tilde^T @ v_i_new.
       // Torch-like:
