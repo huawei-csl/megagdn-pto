@@ -162,6 +162,9 @@ def solve_tril(
     Returns:
         ``A_inv`` of the same shape and fp16 dtype.
     """
+    if os.environ.get("MEGAGDN_PTO_ARCH", "").lower() in {"a5", "dav3510", "dav_3510", "ascend950"}:
+        return solve_tril_torch_reference(A_fp16, cu_seqlens, chunk_size, out_fp16=out_fp16)
+
     if tri_inv_func is None:
         tri_inv_func = load_tri_inverse()
 
@@ -197,3 +200,35 @@ def solve_tril(
         dest = out_fp16
     dest.copy_(tensor_out)
     return dest
+
+
+def solve_tril_torch_reference(
+    A_fp16: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    chunk_size: int,
+    *,
+    out_fp16: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Torch fallback for A5 while the PTO triangular inverse is being ported.
+
+    This keeps the A5 pipeline numerically valid. It is intentionally separate
+    from ``launch_tri_inverse_kernel`` so benchmarks can label it clearly.
+    """
+    if cu_seqlens is None:
+        T = A_fp16.shape[1]
+        cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device=A_fp16.device)
+    cu_cpu = cu_seqlens.detach().cpu().tolist()
+    out = out_fp16 if out_fp16 is not None else torch.zeros_like(A_fp16)
+    out.zero_()
+    eye = torch.eye(chunk_size, dtype=torch.float32, device=A_fp16.device)
+    Af = A_fp16.float()
+    for seq_idx in range(len(cu_cpu) - 1):
+        start = cu_cpu[seq_idx]
+        end = cu_cpu[seq_idx + 1]
+        for s in range(start, end, chunk_size):
+            e = min(s + chunk_size, end)
+            valid = e - s
+            mats = eye[:valid, :valid].unsqueeze(0) + Af[0, s:e, :, :valid].permute(1, 0, 2)
+            inv = torch.linalg.inv(mats).to(A_fp16.dtype)
+            out[0, s:e, :, :valid] = inv.permute(1, 0, 2)
+    return out

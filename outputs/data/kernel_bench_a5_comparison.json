@@ -1,0 +1,128 @@
+{
+  "note": "A5 PTO-only benchmark. Triton skipped. solve_tril excluded because A5 PTO tri_inverse compiles but is numerically invalid; A5 solve_tril currently uses a torch fallback for correctness only.",
+  "flop_model": "rough stage-level model for matmul-heavy kernels: kkt=2*chunks*H*C*C*D; wy_fast=4*chunks*H*C*C*D; chunk_h=4*chunks*H*C*D*D; chunk_o=6*chunks*H*C*D*D. cumsum omitted.",
+  "a2_source": "outputs/data/kernel_bench.json",
+  "a5_source": "outputs/data/kernel_bench_a5.json",
+  "results": [
+    {
+      "H": 16,
+      "Hg": 16,
+      "stages": {
+        "cumsum": {
+          "a2_ms": 0.3222746678550417,
+          "a5_ms": 4.400000034365803e-05,
+          "a5_vs_a2_speedup": null,
+          "note": "cumsum timing is too small/noisy in short A5 run; use raw ms only."
+        },
+        "kkt": {
+          "a2_ms": 4.667700004577637,
+          "a5_ms": 5.441117127736409,
+          "a5_vs_a2_speedup": 0.8578569244142469,
+          "a2_tflops_est": 29.44468439214451,
+          "a5_tflops_est": 25.25932639299327
+        },
+        "wy_fast": {
+          "a2_ms": 6.9654133478800455,
+          "a5_ms": 6.769626935323079,
+          "a5_vs_a2_speedup": 1.0289213001584145,
+          "a2_tflops_est": 39.463258419209296,
+          "a5_tflops_est": 40.60458716118032
+        },
+        "chunk_h": {
+          "a2_ms": 10.12075875600179,
+          "a5_ms": 12.796378135681152,
+          "a5_vs_a2_speedup": 0.7909080716973561,
+          "a2_tflops_est": 27.159812181175894,
+          "a5_tflops_est": 21.480914679876193
+        },
+        "chunk_o": {
+          "a2_ms": 11.120432027180989,
+          "a5_ms": 13.919346809387207,
+          "a5_vs_a2_speedup": 0.7989191001176413,
+          "a2_tflops_est": 37.07741384581095,
+          "a5_tflops_est": 29.62185410438466
+        }
+      }
+    },
+    {
+      "H": 32,
+      "Hg": 16,
+      "stages": {
+        "cumsum": {
+          "a2_ms": 0.3445186674594879,
+          "a5_ms": 1.6400870084762573,
+          "a5_vs_a2_speedup": null,
+          "note": "cumsum timing is too small/noisy in short A5 run; use raw ms only."
+        },
+        "kkt": {
+          "a2_ms": 9.416963958740235,
+          "a5_ms": 10.910836219787598,
+          "a5_vs_a2_speedup": 0.8630836142203183,
+          "a2_tflops_est": 29.189652646899592,
+          "a5_tflops_est": 25.193110904321784
+        },
+        "wy_fast": {
+          "a2_ms": 13.090013376871745,
+          "a5_ms": 13.078093528747559,
+          "a5_vs_a2_speedup": 1.000911436219506,
+          "a2_tflops_est": 41.9981094029547,
+          "a5_tflops_est": 42.03638800101532
+        },
+        "chunk_h": {
+          "a2_ms": 20.45930264790853,
+          "a5_ms": 25.933888753255207,
+          "a5_vs_a2_speedup": 0.7889022291475855,
+          "a2_tflops_est": 26.870701477413224,
+          "a5_tflops_est": 21.19835629429061
+        },
+        "chunk_o": {
+          "a2_ms": 21.95917599995931,
+          "a5_ms": 27.919905344645183,
+          "a5_vs_a2_speedup": 0.7865061048343026,
+          "a2_tflops_est": 37.55303572563597,
+          "a5_tflops_est": 29.53569185327336
+        }
+      }
+    },
+    {
+      "H": 48,
+      "Hg": 16,
+      "stages": {
+        "cumsum": {
+          "a2_ms": 0.4387173314889272,
+          "a5_ms": 1.6556663513183594,
+          "a5_vs_a2_speedup": null,
+          "note": "cumsum timing is too small/noisy in short A5 run; use raw ms only."
+        },
+        "kkt": {
+          "a2_ms": 13.679545338948568,
+          "a5_ms": 16.39369837443034,
+          "a5_vs_a2_speedup": 0.83443924772246,
+          "a2_tflops_est": 30.141123129439574,
+          "a5_tflops_est": 25.1509361096396
+        },
+        "wy_fast": {
+          "a2_ms": 20.870687993367515,
+          "a5_ms": 19.669288635253906,
+          "a5_vs_a2_speedup": 1.0610799597480258,
+          "a2_tflops_est": 39.51157341310741,
+          "a5_tflops_est": 41.92493872676118
+        },
+        "chunk_h": {
+          "a2_ms": 30.182602564493816,
+          "a5_ms": 39.46956125895182,
+          "a5_vs_a2_speedup": 0.7647058037071113,
+          "a2_tflops_est": 27.321491546990778,
+          "a5_tflops_est": 20.892903151918635
+        },
+        "chunk_o": {
+          "a2_ms": 33.228416188557944,
+          "a5_ms": 41.753744761149086,
+          "a5_vs_a2_speedup": 0.7958188272366945,
+          "a2_tflops_est": 37.2256858174883,
+          "a5_tflops_est": 29.62490163035519
+        }
+      }
+    }
+  ]
+}

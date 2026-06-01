@@ -26,7 +26,15 @@ import torch
 # ---------------------------------------------------------------------------
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_PACKAGE_DIR)
-_KERNELS_PTO = os.path.join(_REPO_ROOT, "kernels", "pto")
+PTO_ARCH = os.environ.get("MEGAGDN_PTO_ARCH", "a5").lower()
+if PTO_ARCH in {"a5", "dav3510", "dav_3510", "ascend950"}:
+    _KERNELS_PTO = os.path.join(_REPO_ROOT, "kernels", "pto_a5")
+    _AICORE_ARCH = "dav-c310"
+elif PTO_ARCH in {"a2", "a3", "a2a3", "dav2201", "dav_2201", "ascend910b"}:
+    _KERNELS_PTO = os.path.join(_REPO_ROOT, "kernels", "pto")
+    _AICORE_ARCH = "dav-c220"
+else:
+    raise RuntimeError(f"Unsupported MEGAGDN_PTO_ARCH={PTO_ARCH!r}; expected a5 or a2a3.")
 _KERNEL_INCLUDE = os.path.join(_KERNELS_PTO, "include")
 _COMPILED_DIR = os.path.join(_KERNELS_PTO, "compiled_lib")
 _DRIVER_INC = "/usr/local/Ascend/driver/kernel/inc"
@@ -85,7 +93,7 @@ def _common_flags(
     """Return bisheng flags shared by all chunk-GDN kernels."""
     flags = [
         "-fPIC", "-shared", "-xcce", "-DMEMORY_BASE", "-O2", "-std=gnu++17",
-        "--cce-aicore-arch=dav-c220",
+        f"--cce-aicore-arch={_AICORE_ARCH}",
         "-mllvm", "-cce-aicore-stack-size=0x8000",
         "-mllvm", "-cce-aicore-function-stack-size=0x8000",
         "-mllvm", "-cce-aicore-record-overflow=true",
@@ -177,8 +185,18 @@ def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
         "-fPIC", "-shared", "-xcce", "-DMEMORY_BASE", "-O2", "-std=c++17",
         f"-I{_KERNEL_INCLUDE}",
         f"-I{os.path.join(PTO_LIB_PATH, 'include')}",
-        "--cce-soc-version=Ascend910B4",
-        "--cce-soc-core-type=CubeCore",
+        f"-I{ASCEND_TOOLKIT_HOME}/include",
+        f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc",
+        f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc/runtime",
+        f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc/profiling",
+        f"--cce-aicore-arch={_AICORE_ARCH}",
+        "-mllvm", "-cce-aicore-stack-size=0x8000",
+        "-mllvm", "-cce-aicore-function-stack-size=0x8000",
+        "-mllvm", "-cce-aicore-record-overflow=true",
+        "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
+        "-Wno-macro-redefined", "-Wno-ignored-attributes",
     ]
+    if os.path.isdir(_DRIVER_INC):
+        flags.append(f"-I{_DRIVER_INC}")
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=180)
     return lib_path
