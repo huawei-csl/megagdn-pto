@@ -52,15 +52,15 @@ from tests.test_single_kernels import (
     ref_cumsum,
     ref_kkt,
     ref_wy,
-    _seq_ranges,
-    stats_ok,
 )
+from tests.utils import NumericalAccuracy
 from megagdn_pto.mega_kernel import run_mega_kernel
 
 C_PTO = 128
 C_TRITON = 64
 D = 128
 
+ACCURACY = NumericalAccuracy()
 # Cross-backend agreement thresholds (tighter than vs-CPU)
 MAX_RMSE_CROSS = 0.02
 MIN_R2_CROSS = 0.999
@@ -71,6 +71,7 @@ MIN_PEARSON_CROSS = 0.999
 # Full CPU reference pipeline
 # ---------------------------------------------------------------------------
 
+
 def cpu_pipeline(q, k, v, g_in, beta, cu_seqlens_list, H, Hg, scale=1.0):
     """Complete CPU fp32 reference for the GDN pipeline."""
     cu = cu_seqlens_list
@@ -80,8 +81,7 @@ def cpu_pipeline(q, k, v, g_in, beta, cu_seqlens_list, H, Hg, scale=1.0):
     w, u = ref_wy(k, v, beta, A_inv, g_sum, C_PTO, cu)
     _, v_new, _ = ref_chunk_h(k, w.float(), u.float(), g_sum, C_PTO, cu)
     N_seq = 1 if cu is None else len(cu) - 1
-    tc = total_chunks(N_seq, q.shape[1], C_PTO,
-                      torch.tensor(cu) if cu else None)
+    tc = total_chunks(N_seq, q.shape[1], C_PTO, torch.tensor(cu) if cu else None)
     _, _, h_states_list = ref_chunk_h(k, w.float(), u.float(), g_sum, C_PTO, cu)
     h_states, v_new, _ = ref_chunk_h(k, w.float(), u.float(), g_sum, C_PTO, cu)
     o = ref_chunk_o(q, k, v_new.float(), h_states, g_sum, C_PTO, cu)
@@ -91,6 +91,7 @@ def cpu_pipeline(q, k, v, g_in, beta, cu_seqlens_list, H, Hg, scale=1.0):
 # ---------------------------------------------------------------------------
 # PTO pipeline
 # ---------------------------------------------------------------------------
+
 
 def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None):
     """Full six-stage PTO pipeline on NPU."""
@@ -111,9 +112,20 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
     # 2. scaled_dot_kkt
     msk_lower = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
     A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
-    run_scaled_dot_kkt(k, beta, g_sum, msk_lower, A,
-                       stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
-                       cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
+    run_scaled_dot_kkt(
+        k,
+        beta,
+        g_sum,
+        msk_lower,
+        A,
+        stream=stream,
+        g_t=g_t,
+        beta_t=beta_t,
+        chunk_size=C_PTO,
+        cu_seqlens=cu32,
+        batch_size_override=N_seq,
+        key_heads=Hg,
+    )
 
     # 3. solve_tril
     A_inv = solve_tril(A, cu32, C_PTO, H, tri_inv_func)
@@ -121,25 +133,62 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
     # 4. wy_fast
     w = torch.empty_like(v)
     u = torch.empty_like(v)
-    run_wy_fast(k, v, beta, g_sum, A_inv, w, u,
-                stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
-                cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
+    run_wy_fast(
+        k,
+        v,
+        beta,
+        g_sum,
+        A_inv,
+        w,
+        u,
+        stream=stream,
+        g_t=g_t,
+        beta_t=beta_t,
+        chunk_size=C_PTO,
+        cu_seqlens=cu32,
+        batch_size_override=N_seq,
+        key_heads=Hg,
+    )
 
     # 5. chunk_h
     tc_n = total_chunks(N_seq, T, C_PTO, cu32)
     s = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
     v_new = torch.empty_like(v)
     fs = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
-    run_chunk_h(k, w, u, g_sum, s, v_new, fs,
-                stream=stream, g_t=g_t, chunk_size=C_PTO,
-                cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
+    run_chunk_h(
+        k,
+        w,
+        u,
+        g_sum,
+        s,
+        v_new,
+        fs,
+        stream=stream,
+        g_t=g_t,
+        chunk_size=C_PTO,
+        cu_seqlens=cu32,
+        batch_size_override=N_seq,
+        key_heads=Hg,
+    )
 
     # 6. chunk_o
     msk_full = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
     o = torch.empty_like(v)
-    run_chunk_o(q, k, v_new, s, g_sum, msk_full, o,
-                stream=stream, g_t=g_t, chunk_size=C_PTO,
-                cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg)
+    run_chunk_o(
+        q,
+        k,
+        v_new,
+        s,
+        g_sum,
+        msk_full,
+        o,
+        stream=stream,
+        g_t=g_t,
+        chunk_size=C_PTO,
+        cu_seqlens=cu32,
+        batch_size_override=N_seq,
+        key_heads=Hg,
+    )
 
     return (o * scale).to(q.dtype)
 
@@ -148,9 +197,11 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
 # Triton pipeline
 # ---------------------------------------------------------------------------
 
+
 def _triton_available() -> bool:
     try:
         from fla_vendor.chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa
+
         return True
     except Exception:
         return False
@@ -160,7 +211,9 @@ def triton_pipeline(q, k, v, g_in, beta, cu_long, H, Hg, scale=1.0):
     """Full six-stage Triton pipeline (C=64, bf16)."""
     from fla_vendor.chunk import chunk_gated_delta_rule_fwd
 
-    _, o_tri, _, _, _, _, _ = chunk_gated_delta_rule_fwd(q, k, v, g_in, beta, scale, None, None, cu_long)
+    _, o_tri, _, _, _, _, _ = chunk_gated_delta_rule_fwd(
+        q, k, v, g_in, beta, scale, None, None, cu_long
+    )
     torch.npu.synchronize()
     return o_tri.float()
 
@@ -168,6 +221,7 @@ def triton_pipeline(q, k, v, g_in, beta, cu_long, H, Hg, scale=1.0):
 # ---------------------------------------------------------------------------
 # Cross-backend check
 # ---------------------------------------------------------------------------
+
 
 def _r2(ref, pred):
     r = ref.numpy().ravel().astype(np.float64)
@@ -209,14 +263,19 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
 
     torch.manual_seed(0)
     torch.npu.manual_seed(0)
-    q = F.normalize(torch.randn(1, T, Hg, D, device=dev, dtype=torch.float16), dim=-1, p=2)
-    k = F.normalize(torch.randn(1, T, Hg, D, device=dev, dtype=torch.float16), dim=-1, p=2)
+    q = F.normalize(
+        torch.randn(1, T, Hg, D, device=dev, dtype=torch.float16), dim=-1, p=2
+    )
+    k = F.normalize(
+        torch.randn(1, T, Hg, D, device=dev, dtype=torch.float16), dim=-1, p=2
+    )
     v = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
     beta = torch.rand(1, T, H, device=dev, dtype=torch.float16)
     g_in = F.logsigmoid(torch.randn(1, T, H, device=dev, dtype=torch.float32))
 
     cu32 = (
-        torch.tensor(cu_list, dtype=torch.int32, device=dev) if cu_list
+        torch.tensor(cu_list, dtype=torch.int32, device=dev)
+        if cu_list
         else torch.tensor([0, T], dtype=torch.int32, device=dev)
     )
     cu_cpu = cu32.cpu().tolist() if cu_list else None
@@ -226,21 +285,33 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
 
     # CPU reference pipeline
     o_cpu = cpu_pipeline(
-        q.cpu().float(), k.cpu().float(), v.cpu().float(),
-        g_in.cpu(), beta.cpu().float(), cu_cpu, H, Hg, scale,
+        q.cpu().float(),
+        k.cpu().float(),
+        v.cpu().float(),
+        g_in.cpu(),
+        beta.cpu().float(),
+        cu_cpu,
+        H,
+        Hg,
+        scale,
     )
 
     # PTO mega kernel
     o_mega = run_mega_kernel(
-        q, k, v, g_in, beta, cu32,
+        q,
+        k,
+        v,
+        g_in,
+        beta,
+        cu32,
         stream=torch.npu.current_stream()._as_parameter_,
         chunk_size=C_PTO,
         scale=scale,
         key_heads=Hg,
     )
 
-    ok_pto = stats_ok(o_pto.float().cpu(), o_cpu)
-    ok_mega = stats_ok(o_mega.float().cpu(), o_cpu)
+    ok_pto = ACCURACY.stats_ok(o_pto.float().cpu(), o_cpu)
+    ok_mega = ACCURACY.stats_ok(o_mega.float().cpu(), o_cpu)
 
     ok_cross = True
     if triton_ok:
@@ -268,7 +339,7 @@ def main() -> None:
     dev = torch.device(args.device)
     heads = [int(x) for x in args.H_list.split(",")] if args.H_list else [args.H]
     Hg = args.hg
-    scale = D ** -0.5
+    scale = D**-0.5
     triton_ok = not args.no_triton and _triton_available()
     tri_inv_func = load_tri_inverse()
 
@@ -281,12 +352,15 @@ def main() -> None:
         print(f"\n{'='*60}\nH={H}  Hg={Hg}\n{'='*60}")
         for T_or_cu, T_total in TEST_SHAPES:
             ok, label, ok_pto, ok_cross, ok_mega = run_one(
-                T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok)
+                T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok
+            )
             if not ok:
                 all_pass = False
             cross_str = f"  cross={'PASS' if ok_cross else 'FAIL'}" if triton_ok else ""
             status = "PASS" if ok else "FAIL"
-            print(f"  {status}  {label}  pto_vs_cpu={'PASS' if ok_pto else 'FAIL'}  mega_vs_cpu={'PASS' if ok_mega else 'FAIL'}{cross_str}")
+            print(
+                f"  {status}  {label}  pto_vs_cpu={'PASS' if ok_pto else 'FAIL'}  mega_vs_cpu={'PASS' if ok_mega else 'FAIL'}{cross_str}"
+            )
 
     print(f"\n{'ALL PASS' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)
