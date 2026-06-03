@@ -4,13 +4,14 @@
 Tests each stage against CPU fp32 reference implementations across a wide
 range of packed-varlen shapes, value-head counts H, and GQA key-head counts Hg:
 
-  cumsum, scaled_dot_kkt, solve_tril, wy_fast, chunk_h, chunk_o
+  cumsum, scaled_dot_kkt, solve_tril, wy_fast, chunk_h, chunk_h_torch_cpp, chunk_o
 
 Usage::
 
     python tests/test_single_kernels.py --device npu:0
     python tests/test_single_kernels.py --device npu:0 --quick
     python tests/test_single_kernels.py --device npu:0 --H-list 32,64 --stage kkt,chunk_h
+    python tests/test_single_kernels.py --device npu:0 --stage chunk_h_torch_cpp
 """
 
 from __future__ import annotations
@@ -21,6 +22,10 @@ import random
 import sys
 import time
 from dataclasses import dataclass
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import numpy as np
 import torch
@@ -38,9 +43,11 @@ from megagdn_pto.kernel_libs import (
     transpose_beta,
     transpose_gates,
 )
+from megagdn_pto.torch_cpp_launchers import run_chunk_h_torch_cpp
 
 C = 128  # PTO chunk size
 D = 128  # head dimension
+CHUNK_H_LAUNCHER = "ctypes"
 
 # Accuracy thresholds
 RTOL = 1e-2
@@ -48,6 +55,14 @@ ATOL = 1e-5
 MAX_RMSE_RATIO = 0.05
 MIN_R2 = 0.99
 HARD_FAIL_MAX = 1.0
+
+
+def _chunk_h_runner_for_launcher(launcher: str):
+    if launcher == "ctypes":
+        return run_chunk_h
+    if launcher == "torch-cpp":
+        return run_chunk_h_torch_cpp
+    raise ValueError(f"Unknown chunk_h launcher {launcher!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +132,8 @@ def ref_kkt(k: torch.Tensor, beta: torch.Tensor, g_cumsum: torch.Tensor,
 
 
 def ref_chunk_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor,
-                g_cumsum: torch.Tensor, cs: int, cu_seqlens=None):
+                g_cumsum: torch.Tensor, cs: int, cu_seqlens=None,
+                initial_state: torch.Tensor | None = None):
     """CPU reference for chunk_h: states S, v_new, final states."""
     B, T, Hg, Dd = k.shape
     H = w.shape[2]
@@ -133,7 +149,10 @@ def ref_chunk_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor,
         nc = (eos - bos + cs - 1) // cs
         for h in range(H):
             hg = h // grp
-            S = torch.zeros(Dd, Dd, dtype=torch.float32)
+            if initial_state is None:
+                S = torch.zeros(Dd, Dd, dtype=torch.float32)
+            else:
+                S = initial_state[si, h].float().clone()
             for ci in range(nc):
                 s, e = bos + ci * cs, min(bos + (ci + 1) * cs, eos)
                 gc = gf[0, s:e, h]
@@ -212,10 +231,41 @@ def _r2(y_ref: torch.Tensor, y_pred: torch.Tensor) -> float:
     return float("nan") if ss_tot < 1e-30 else 1.0 - ss_res / ss_tot
 
 
+def _print_zero_slice_debug(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    if actual.ndim < 2 or actual.shape[0] <= 1:
+        return
+    a = actual.float()
+    e = expected.float()
+    a_max = a.abs().flatten(1).amax(dim=1)
+    e_max = e.abs().flatten(1).amax(dim=1)
+    a_zero = a_max == 0
+    e_zero = e_max == 0
+
+    def idxs(mask: torch.Tensor) -> list[int]:
+        return mask.nonzero(as_tuple=False).flatten().tolist()
+
+    print("leading-slice zero/nonzero debug:")
+    print(f"  actual zero slices: {idxs(a_zero)}")
+    print(f"  ref zero slices:    {idxs(e_zero)}")
+    print(f"  actual zero, ref nonzero: {idxs(a_zero & ~e_zero)}")
+    print(f"  actual nonzero, ref zero: {idxs(~a_zero & e_zero)}")
+    print(f"  actual per-slice abs max: {[round(x, 6) for x in a_max.tolist()]}")
+    print(f"  ref per-slice abs max:    {[round(x, 6) for x in e_max.tolist()]}")
+
+
 def stats_ok(actual: torch.Tensor, expected: torch.Tensor) -> bool:
     diff = (actual - expected).abs()
     mx = diff.max().item()
-    if mx > HARD_FAIL_MAX:
+    print()
+    print(f'max diff: {mx}')
+    if (actual==0).all():
+        print('actual is all zeros!')
+    else:
+        print(f'actual max: {actual.max().item():.3f}, min: {actual.min().item():.2f}')
+    print(f'ref max: {expected.max().item():.3f}, min: {expected.min().item():.2f}')
+    if mx > 3e-3:
+        _print_zero_slice_debug(actual, expected)
+        print('@@@@@@@@@@@fail')
         return False
     bound = ATOL + RTOL * expected.abs()
     if (diff <= bound).all():
@@ -225,8 +275,12 @@ def stats_ok(actual: torch.Tensor, expected: torch.Tensor) -> bool:
     ratio = rmse / max(mean_abs, 1e-15)
     r2 = _r2(expected, actual)
     if mean_abs < 1e-9:
-        return rmse < 5e-4
-    return ratio <= MAX_RMSE_RATIO and np.isfinite(r2) and r2 >= MIN_R2
+        ok = rmse < 5e-4
+    else:
+        ok = ratio <= MAX_RMSE_RATIO and np.isfinite(r2) and r2 >= MIN_R2
+    if not ok:
+        _print_zero_slice_debug(actual, expected)
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -309,31 +363,111 @@ def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     return stats_ok(A_out.float().cpu(), ref)
 
 
-def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+def _test_chunk_h_impl(tc: TestCase, dev: torch.device, H: int, HG: int,
+                       chunk_h_runner, input_kind: str = "wy_like",
+                       run_kind: str = "both") -> bool:
     T = tc.T
     cu = torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev) if tc.cu_seqlens_list else None
     N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
     torch.manual_seed(42)
     k = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
-    w = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
-    u = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
     g_in = F.logsigmoid(torch.randn(1, T, H, device=dev, dtype=torch.float32))
     g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(dev)
+    if input_kind == "random":
+        w = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
+        u = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
+    elif input_kind == "wy_like":
+        v = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
+        beta = torch.rand(1, T, H, device=dev, dtype=torch.float16)
+        k_h = k.repeat_interleave(H // HG, dim=2)
+        w = (k_h * beta[..., None] * torch.exp(g_sum)[..., None]).to(torch.float16)
+        u = (v * beta[..., None]).to(torch.float16)
+    else:
+        raise ValueError(f"unknown chunk_h input_kind {input_kind!r}")
     g_t = transpose_gates(g_sum)
     stream = torch.npu.current_stream()._as_parameter_
     tc_n = total_chunks(N_seq, T, C, cu)
-    s_out = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
-    v_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
-    fs_out = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
-    run_chunk_h(k, w, u, g_sum, s_out, v_out, fs_out,
-                stream=stream, g_t=g_t, chunk_size=C,
-                cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
-    torch.npu.synchronize()
-    h_ref, v_ref, fs_ref = ref_chunk_h(k.cpu(), w.cpu(), u.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
-    ok_h = stats_ok(s_out.float().cpu().view(tc_n, H, D, D), h_ref.float())
-    ok_v = stats_ok(v_out.float().cpu(), v_ref.float())
-    ok_fs = stats_ok(fs_out.float().cpu().view(N_seq, H, D, D), fs_ref.float())
-    return ok_h and ok_v and ok_fs
+
+    def _run(label: str, initial_state: torch.Tensor | None, check_final: bool) -> bool:
+        s_out = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
+        v_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
+        fs_out = torch.zeros(N_seq, H, D, D, device=dev, dtype=torch.float16) if check_final else None
+        chunk_h_runner(k, w, u, g_sum, s_out, v_out, fs_out,
+                       stream=stream, g_t=g_t, chunk_size=C,
+                       cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG,
+                       initial_state=initial_state)
+        torch.npu.synchronize()
+        init_cpu = initial_state.cpu() if initial_state is not None else None
+        h_ref, v_ref, fs_ref = ref_chunk_h(k.cpu(), w.cpu(), u.cpu(), g_sum.cpu(), C,
+                                           tc.cu_seqlens_list, init_cpu)
+        ok_h = stats_ok(s_out.float().cpu().view(tc_n, H, D, D), h_ref.float())
+        ok_v = stats_ok(v_out.float().cpu(), v_ref.float())
+        failed = []
+        if not ok_h:
+            print('failed h')
+            failed.append("S")
+        if not ok_v:
+            print('failed v')
+            failed.append("v")
+        if not check_final:
+            if failed:
+                print(f"      chunk_h detail FAIL {label}:{','.join(failed)}", flush=True)
+            return ok_h and ok_v
+        ok_fs = stats_ok(fs_out.float().cpu(), fs_ref.float())
+        if not ok_fs:
+            failed.append("final")
+        if failed:
+            print(f"      chunk_h detail FAIL {label}:{','.join(failed)}", flush=True)
+        return ok_h and ok_v and ok_fs
+
+    h0 = (0.01 * torch.randn(N_seq, H, D, D, device=dev, dtype=torch.float16)).contiguous()
+    if run_kind == "no_initial":
+        return _run(f"{input_kind}/no_initial/no_final", None, check_final=False)
+    if run_kind == "initial":
+        return _run(f"{input_kind}/initial/final", h0, check_final=True)
+    if run_kind == "both":
+        ok_no_initial = _run(f"{input_kind}/no_initial/no_final", None, check_final=False)
+        ok_initial = _run(f"{input_kind}/initial/final", h0, check_final=True)
+        return ok_no_initial and ok_initial
+    raise ValueError(f"unknown chunk_h run_kind {run_kind!r}")
+
+
+def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    return _test_chunk_h_impl(tc, dev, H, HG, _chunk_h_runner_for_launcher(CHUNK_H_LAUNCHER))
+
+
+def test_chunk_h_random(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    return _test_chunk_h_impl(tc, dev, H, HG, _chunk_h_runner_for_launcher(CHUNK_H_LAUNCHER),
+                              input_kind="random")
+
+
+def test_chunk_h_wy_like(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    return _test_chunk_h_impl(tc, dev, H, HG, _chunk_h_runner_for_launcher(CHUNK_H_LAUNCHER),
+                              input_kind="wy_like")
+
+
+def test_chunk_h_1(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    return _test_chunk_h_impl(tc, dev, H, HG, _chunk_h_runner_for_launcher(CHUNK_H_LAUNCHER),
+                              input_kind="random", run_kind="no_initial")
+
+
+def test_chunk_h_2(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    return _test_chunk_h_impl(tc, dev, H, HG, _chunk_h_runner_for_launcher(CHUNK_H_LAUNCHER),
+                              input_kind="random", run_kind="initial")
+
+
+def test_chunk_h_3(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    return _test_chunk_h_impl(tc, dev, H, HG, _chunk_h_runner_for_launcher(CHUNK_H_LAUNCHER),
+                              input_kind="wy_like", run_kind="no_initial")
+
+
+def test_chunk_h_4(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    return _test_chunk_h_impl(tc, dev, H, HG, _chunk_h_runner_for_launcher(CHUNK_H_LAUNCHER),
+                              input_kind="wy_like", run_kind="initial")
+
+
+def test_chunk_h_torch_cpp(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    return _test_chunk_h_impl(tc, dev, H, HG, run_chunk_h_torch_cpp)
 
 
 def test_wy(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
@@ -376,9 +510,12 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     s_out = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
     v_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     fs_out = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
-    run_chunk_h(k, w, u, g_sum, s_out, v_out, fs_out,
-                stream=stream, g_t=g_t, chunk_size=C,
-                cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
+    h0 = (0.01 * torch.randn(N_seq, H, D, D, device=dev, dtype=torch.float16)).contiguous()
+    chunk_h_runner = _chunk_h_runner_for_launcher(CHUNK_H_LAUNCHER)
+    chunk_h_runner(k, w, u, g_sum, s_out, v_out, fs_out,
+                   stream=stream, g_t=g_t, chunk_size=C,
+                   cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG,
+                   initial_state=h0)
     torch.npu.synchronize()
     msk = torch.tril(torch.ones(C, C, device=dev), diagonal=0).float()
     o_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
@@ -436,9 +573,39 @@ _STAGES = {
     "kkt":        ("scaled_dot_kkt", test_kkt),
     "solve_tril": ("solve_tril",     test_solve_tril),
     "chunk_h":    ("chunk_h",        test_chunk_h),
+    "chunk_h_random": ("chunk_h random w/u", test_chunk_h_random),
+    "chunk_h_wy_like": ("chunk_h WY-like w/u", test_chunk_h_wy_like),
+    "chunk_h_1":  ("chunk_h random no_initial", test_chunk_h_1),
+    "chunk_h_2":  ("chunk_h random initial", test_chunk_h_2),
+    "chunk_h_3":  ("chunk_h WY-like no_initial", test_chunk_h_3),
+    "chunk_h_4":  ("chunk_h WY-like initial", test_chunk_h_4),
+    "chunk_h_torch_cpp": ("chunk_h_torch_cpp", test_chunk_h_torch_cpp),
     "wy_fast":    ("wy_fast",        test_wy),
     "chunk_o":    ("chunk_o",        test_chunk_o),
 }
+
+
+DEFAULT_HEAD_CONFIGS = [
+    (16, 4),
+    (16, 16),
+    (24, 8),
+    (32, 8),
+    (48, 16),
+    (64, 16),
+]
+
+
+def _parse_head_configs(raw: str | None, h_list: str, hg: int) -> list[tuple[int, int]]:
+    if raw:
+        configs: list[tuple[int, int]] = []
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            h_s, hg_s = item.split(":", 1)
+            configs.append((int(h_s), int(hg_s)))
+        return configs
+    return [(int(x), hg) for x in h_list.split(",") if x.strip()]
 
 
 def main() -> None:
@@ -447,6 +614,13 @@ def main() -> None:
     parser.add_argument("--quick", action="store_true", help="Run a single small test case.")
     parser.add_argument("--H-list", default="16,32,48,64", help="Comma-separated value head counts.")
     parser.add_argument("--hg", type=int, default=16, help="Key head count Hg.")
+    parser.add_argument("--head-configs",
+                        default=None,
+                        help="Comma-separated H:Hg pairs. Overrides --H-list/--hg when set.")
+    parser.add_argument("--chunk-h-launcher",
+                        choices=("ctypes", "torch-cpp"),
+                        default="ctypes",
+                        help="Launcher used by chunk_h tests and chunk_o warmup.")
     parser.add_argument("--stage",
                         default="cumsum,kkt,solve_tril,chunk_h,wy_fast,chunk_o",
                         help="Comma-separated stages to test.")
@@ -459,18 +633,27 @@ def main() -> None:
 
     torch.npu.set_device(args.device)
     dev = torch.device(args.device)
-    heads_list = [int(x) for x in args.H_list.split(",") if x.strip()]
-    HG = args.hg
+    global CHUNK_H_LAUNCHER
+    CHUNK_H_LAUNCHER = args.chunk_h_launcher
+    default_heads = args.H_list == "16,32,48,64" and args.hg == 16
+    head_configs = (
+        DEFAULT_HEAD_CONFIGS
+        if args.head_configs is None and default_heads
+        else _parse_head_configs(args.head_configs, args.H_list, args.hg)
+    )
 
-    cases = [TestCase("quick T=128", None, 128)] if args.quick else build_test_cases()
+    cases = [TestCase("quick T=128", None, 128), TestCase("quick T=256", None, 256)] if args.quick else build_test_cases()
 
-    print(f"Device: {args.device}  stages={stages}  H={heads_list}  Hg={HG}  D={D}  C={C}")
+    print(
+        f"Device: {args.device}  stages={stages}  head_configs={head_configs}  "
+        f"D={D}  C={C}  chunk_h_launcher={CHUNK_H_LAUNCHER}"
+    )
     all_pass = True
 
     for stage in stages:
         name, fn = _STAGES[stage]
         print(f"\n{'=' * 60}\nStage: {name}\n{'=' * 60}")
-        for H in heads_list:
+        for H, HG in head_configs:
             assert H % HG == 0, f"H={H} must be divisible by Hg={HG}"
             print(f"\n  H={H} (Hg={HG})")
             for i, tc in enumerate(cases):

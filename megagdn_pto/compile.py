@@ -1,7 +1,7 @@
 """Bisheng JIT compilation for PTO GDN kernels on Ascend NPU.
 
-All kernels compile to shared libraries (.so) cached under ``kernels/pto/compiled_lib/``.
-Re-compilation is triggered automatically when the C++ source is modified (mtime key in lru_cache).
+Kernels compile to shared libraries (.so) under ``kernels/pto/compiled_lib/``.
+Chunk kernels intentionally rebuild on each load while debugging kernel code.
 
 Environment variables:
     PTO_LIB_PATH            Path to pto-isa header directory (contains ``include/``).
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from functools import lru_cache
 
 import torch
@@ -115,7 +116,6 @@ def _run_bisheng(cmd: list[str], timeout: int) -> None:
     subprocess.run(cmd, check=True, timeout=timeout)
 
 
-@lru_cache(maxsize=None)
 def compile_chunk_kernel(
     cpp_basename: str,
     so_stem: str,
@@ -126,13 +126,14 @@ def compile_chunk_kernel(
     key_heads: int | None = None,
     cpp_mtime_ns: int = 0,
 ) -> str:
-    """Compile a chunk-GDN kernel and return the path to the resulting ``.so``."""
+    """Compile a chunk-GDN kernel and return a fresh ``.so`` path."""
     kh = key_heads if key_heads is not None else num_heads
     os.makedirs(_COMPILED_DIR, exist_ok=True)
     cpp_path = os.path.join(_KERNELS_PTO, cpp_basename)
+    build_id = time.time_ns()
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"{so_stem}_H{num_heads}_Hg{kh}_D{hidden_size}_C{chunk_size}.so",
+        f"{so_stem}_H{num_heads}_Hg{kh}_D{hidden_size}_C{chunk_size}_m{cpp_mtime_ns}_b{build_id}.so",
     )
     flags = _common_flags(
         num_heads=num_heads, key_heads=kh, hidden_size=hidden_size, chunk_size=chunk_size
