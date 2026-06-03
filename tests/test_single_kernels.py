@@ -38,7 +38,7 @@ from megagdn_pto.kernel_libs import (
     transpose_beta,
     transpose_gates,
 )
-from tests.utils import NumericalAccuracy
+from tests.utils import NumericalAccuracy, generate_random_inputs
 
 ACCURACY = NumericalAccuracy()
 
@@ -90,8 +90,10 @@ class RefGDN:
                 v = e - s
                 for h in range(H):
                     Ac = Af[0, s:e, h, :v]  # [v, v], strictly lower triangular
-                    inv = torch.linalg.inv(torch.eye(v) + Ac)
-                    out[0, s:e, h, :v] = inv
+                    # inv = torch.linalg.inv(torch.eye(v) + Ac)
+                    M = np.linalg.inv((np.identity(v) + Ac.numpy()).astype(np.double))
+                    inv = torch.from_numpy(M)
+                    out[0, s:e, h, :v] = inv.to(self.dtype)
         return out
 
     def kkt(
@@ -169,12 +171,12 @@ class RefGDN:
             ci_base += nc
         return h_out, v_new, final
 
-    def wy(
+    def wy_fast(
         self,
         k: torch.Tensor,
         v: torch.Tensor,
         beta: torch.Tensor,
-        A: torch.Tensor,
+        A_inv: torch.Tensor,
         g_cumsum: torch.Tensor,
         cs: int,
         cu_seqlens=None,
@@ -186,11 +188,11 @@ class RefGDN:
         w = torch.zeros(B, T, H, Kd, dtype=self.dtype)
         u = torch.zeros(B, T, H, v.shape[-1], dtype=self.dtype)
         kf, vf, bf, Af, gf = (
-            k.float(),
-            v.float(),
-            beta.float(),
-            A.float(),
-            g_cumsum.float(),
+            k.to(dtype=self.dtype),
+            v.to(dtype=self.dtype),
+            beta.to(dtype=self.dtype),
+            A_inv.to(dtype=self.dtype),
+            g_cumsum.to(dtype=self.dtype),
         )
         for bos, eos in _seq_ranges(T, cu_seqlens):
             for j in range(0, eos - bos, cs):
@@ -206,7 +208,7 @@ class RefGDN:
                     )
                     u[0, s:e, h, :] = Ab @ vb
                     w[0, s:e, h, :] = Ab @ kb
-        return w.to(k.dtype), u.to(v.dtype)
+        return w, u
 
     def chunk_o(
         self,
@@ -350,11 +352,12 @@ def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     )
     beta = torch.rand(1, T, H, device=dev, dtype=torch.float16)
     g_in = F.logsigmoid(torch.randn(1, T, H, device=dev, dtype=torch.float32))
-    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(dev)
+    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(g_in.dtype).to(dev)
     g_t, beta_t = transpose_gates(g_sum), transpose_beta(beta)
     msk = torch.tril(torch.ones(C, C, device=dev), diagonal=-1).float()
     A_out = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
     stream = torch.npu.current_stream()._as_parameter_
+    torch.npu.synchronize()
     run_scaled_dot_kkt(
         k,
         beta,
@@ -371,10 +374,8 @@ def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     )
     torch.npu.synchronize()
     ref = ref_kkt(k.cpu(), beta.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
-    A_out_cpu = A_out.cpu()
-    torch.npu.synchronize()
-    print(f"max A_out: {A_out_cpu.abs().max().item()}")
-    return ACCURACY.stats_ok(A_out.cpu().to(tc.dtype), ref.to(tc.dtype))
+
+    return ACCURACY.stats_ok(A_out.cpu().to(tc.dtype), ref.to(tc.dtype), chunk_size=C)
 
 
 def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
@@ -394,7 +395,7 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     w = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
     u = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
     g_in = F.logsigmoid(torch.randn(1, T, H, device=dev, dtype=torch.float32))
-    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(dev)
+    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(g_in.dtype).to(dev)
     g_t = transpose_gates(g_sum)
     stream = torch.npu.current_stream()._as_parameter_
     tc_n = total_chunks(N_seq, T, C, cu)
@@ -421,41 +422,49 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         k.cpu(), w.cpu(), u.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list
     )
     ok_h = ACCURACY.stats_ok(
-        s_out.cpu().to(tc.dtype).view(tc_n, H, D, D), h_ref.to(tc.dtype)
+        s_out.cpu().to(tc.dtype).view(tc_n, H, D, D), h_ref.to(tc.dtype), chunk_size=C
     )
-    ok_v = ACCURACY.stats_ok(v_out.cpu().to(tc.dtype), v_ref.to(tc.dtype))
+    ok_v = ACCURACY.stats_ok(v_out.cpu().to(tc.dtype), v_ref.to(tc.dtype), chunk_size=C)
     return ok_h and ok_v
 
 
-def test_wy(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+def test_wy_fast(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
     ref_cumsum = tc.ref_gdn.cumsum
-    ref_wy = tc.ref_gdn.wy
+    ref_wy_fast = tc.ref_gdn.wy_fast
+    ref_solve_tril = tc.ref_gdn.solve_tril
+    ref_kkt = tc.ref_gdn.kkt
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
         else None
     )
     N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
+
     torch.manual_seed(42)
-    k = F.normalize(
-        torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2
-    )
-    v = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
-    beta = torch.rand(1, T, H, device=dev, dtype=torch.float16)
-    A = torch.randn(1, T, H, C, device=dev, dtype=torch.float16)
-    g_in = F.logsigmoid(torch.randn(1, T, H, device=dev, dtype=torch.float32))
-    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(dev)
-    g_t, beta_t = transpose_gates(g_sum), transpose_beta(beta)
+    _, k, v, beta, g_in = generate_random_inputs(T, H, HG, D)
+    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list)
+    A = ref_kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
+    A_inv = ref_solve_tril(A, C, tc.cu_seqlens_list)
     stream = torch.npu.current_stream()._as_parameter_
+
+    k_npu, v_npu, beta_npu, g_sum_npu, A_inv_npu = (
+        k.to(torch.float16).npu(),
+        v.to(torch.float16).npu(),
+        beta.to(torch.float16).npu(),
+        g_sum.to(torch.float32).npu(),
+        A_inv.to(torch.float16).npu(),
+    )
+    g_t, beta_t = transpose_gates(g_sum_npu), transpose_beta(beta_npu)
     w_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     u_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
+
     run_wy_fast(
-        k,
-        v,
-        beta,
-        g_sum,
-        A,
+        k_npu,
+        v_npu,
+        beta_npu,
+        g_sum_npu,
+        A_inv_npu,
         w_out,
         u_out,
         stream=stream,
@@ -467,12 +476,10 @@ def test_wy(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         key_heads=HG,
     )
     torch.npu.synchronize()
-    w_ref, u_ref = ref_wy(
-        k.cpu(), v.cpu(), beta.cpu(), A.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list
-    )
+    w_ref, u_ref = ref_wy_fast(k, v, beta, A_inv, g_sum, C, tc.cu_seqlens_list)
     return ACCURACY.stats_ok(
-        w_out.cpu().to(tc.dtype), w_ref.to(tc.dtype)
-    ) and ACCURACY.stats_ok(u_out.cpu().to(tc.dtype), u_ref.to(tc.dtype))
+        w_out.cpu().to(tc.dtype), w_ref.to(tc.dtype), chunk_size=C
+    ) and ACCURACY.stats_ok(u_out.cpu().to(tc.dtype), u_ref.to(tc.dtype), chunk_size=C)
 
 
 def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
@@ -495,7 +502,7 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     w = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
     u = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
     g_in = F.logsigmoid(torch.randn(1, T, H, device=dev, dtype=torch.float32))
-    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(dev)
+    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(g_in.dtype).to(dev)
     g_t = transpose_gates(g_sum)
     stream = torch.npu.current_stream()._as_parameter_
     tc_n = total_chunks(N_seq, T, C, cu)
@@ -540,7 +547,7 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     o_ref = ref_chunk_o(
         q.cpu(), k.cpu(), v_out.cpu(), s_re, g_sum.cpu(), C, tc.cu_seqlens_list
     )
-    return ACCURACY.stats_ok(o_out.cpu().to(tc.dtype), o_ref.to(tc.dtype))
+    return ACCURACY.stats_ok(o_out.cpu().to(tc.dtype), o_ref.to(tc.dtype), chunk_size=C)
 
 
 def test_cumsum(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
@@ -567,31 +574,26 @@ def test_cumsum(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
 def test_solve_tril(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
     ref_solve_tril = tc.ref_gdn.solve_tril
+    ref_cumsum = tc.ref_gdn.cumsum
+    ref_kkt = tc.ref_gdn.kkt
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
         else None
     )
     torch.manual_seed(42)
-    # Build A lower-triangular in the (time-within-chunk × chunk-col) space.
-    # Position-within-chunk = (t - bos) % C for each sequence starting at bos.
-    # This handles non-chunk-aligned sequence starts correctly.
-    # Use std=0.1 to keep (I+A)^{-1} well-conditioned in fp16.
-    t_within = torch.zeros(T, dtype=torch.long)
-    if tc.cu_seqlens_list is not None:
-        for i in range(len(tc.cu_seqlens_list) - 1):
-            bos, eos = tc.cu_seqlens_list[i], tc.cu_seqlens_list[i + 1]
-            t_within[bos:eos] = torch.arange(eos - bos) % C
-    else:
-        t_within = torch.arange(T) % C
-    chunk_mask = (t_within[:, None] > torch.arange(C)[None, :]).float()  # [T, C]
-    A_raw = torch.randn(1, T, H, C) * 0.1 * chunk_mask[None, :, None, :]
-    A = A_raw.to(torch.float16).to(dev)
+    k = F.normalize(torch.randn(1, T, HG, D, dtype=tc.dtype), dim=-1, p=2)
+    beta = torch.rand(1, T, H, dtype=tc.dtype)
+    g_in = F.logsigmoid(torch.randn(1, T, H, dtype=tc.dtype))
+    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(tc.dtype)
+    A_raw = ref_kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
+
+    A_dev = A_raw.to(torch.float16).to(dev)
     tri_inv = load_tri_inverse()
-    A_inv = solve_tril(A, cu, C, H, tri_inv)
+    A_inv = solve_tril(A_dev, cu, C, H, tri_inv)
     torch.npu.synchronize()
-    ref = ref_solve_tril(A.cpu(), C, tc.cu_seqlens_list)
-    return ACCURACY.stats_ok(A_inv.cpu().to(tc.dtype), ref.to(tc.dtype))
+    ref = ref_solve_tril(A_dev.cpu(), C, tc.cu_seqlens_list)
+    return ACCURACY.stats_ok(A_inv.cpu().to(tc.dtype), ref.to(tc.dtype), chunk_size=C)
 
 
 _STAGES = {
@@ -599,7 +601,7 @@ _STAGES = {
     "kkt": ("scaled_dot_kkt", test_kkt),
     "solve_tril": ("solve_tril", test_solve_tril),
     "chunk_h": ("chunk_h", test_chunk_h),
-    "wy_fast": ("wy_fast", test_wy),
+    "wy_fast": ("wy_fast", test_wy_fast),
     "chunk_o": ("chunk_o", test_chunk_o),
 }
 

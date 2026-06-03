@@ -52,15 +52,15 @@ from tests.test_single_kernels import (
     ref_cumsum,
     ref_kkt,
     ref_wy,
+    _seq_ranges,
+    stats_ok,
 )
-from tests.utils import NumericalAccuracy
 from megagdn_pto.mega_kernel import run_mega_kernel
 
 C_PTO = 128
 C_TRITON = 64
 D = 128
 
-ACCURACY = NumericalAccuracy()
 # Cross-backend agreement thresholds (tighter than vs-CPU)
 MAX_RMSE_CROSS = 0.02
 MIN_R2_CROSS = 0.999
@@ -310,8 +310,8 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
         key_heads=Hg,
     )
 
-    ok_pto = ACCURACY.stats_ok(o_pto.float().cpu(), o_cpu)
-    ok_mega = ACCURACY.stats_ok(o_mega.float().cpu(), o_cpu)
+    ok_pto = stats_ok(o_pto.float().cpu(), o_cpu)
+    ok_mega = stats_ok(o_mega.float().cpu(), o_cpu)
 
     ok_cross = True
     if triton_ok:
