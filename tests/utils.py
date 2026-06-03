@@ -23,13 +23,20 @@ class NumericalAccuracy:
         return float("nan") if ss_tot < 1e-30 else 1.0 - ss_res / ss_tot
 
     def stats_ok(self, actual: torch.Tensor, expected: torch.Tensor) -> bool:
+        print(expected.abs().max().item())
+        print(actual.abs().max().item())
         diff = (actual - expected).abs()
+        # print(actual[0])
+        # print(actual)
         mx = diff.max().item()
         if mx > self.hard_fail_max:
+            print(f"ERROR: mx fail: {mx} > {self.hard_fail_max}")
             return False
         bound = self.atol + self.rtol * expected.abs()
         if (diff <= bound).all():
             return True
+        else:
+            print(f"ERROR: diff is greater than bound: max = {mx}")
         mean_abs = float(expected.float().flatten().abs().mean())
         rmse = float(torch.sqrt((diff.float().flatten() ** 2).mean()))
         ratio = rmse / max(mean_abs, 1e-15)
