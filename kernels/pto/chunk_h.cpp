@@ -36,6 +36,7 @@
 //   S  [total_chunks, H, D, D] half — per-chunk state snapshots (output)
 //   V  [total_tokens, H, D]  half   — residual-corrected values (output)
 //   FS [batch, H, D, D]      half   — final state per sequence (output)
+//   H0 [batch, H, D, D]      half   — optional initial state per sequence
 //   workspace [per-core scratch]     — Cube↔Vec communication buffer
 //
 // NPU memory hierarchy:
@@ -79,11 +80,11 @@
 //   WS_KV [D×D]:  Cube writes KV = K^T @ V here → Vec reads it to update S
 //
 // Data flow per chunk (think of it as a ping-pong between Cube and Vec):
-//   Vec: write S₀ to WS_S → signal Cube (flag 3)
-//   Cube: read S from WS_S, load W → compute WS = W@S → write WS_WS → signal Vec (flag 0)
-//   Vec: read WS, compute V_new = U - WS, compute K_scaled → write WS_K → signal Cube (flag 1)
-//   Cube: read K from WS_K, load V → compute KV = K^T@V → write WS_KV → signal Vec (flag 2)
-//   Vec: read KV, update S = exp(g_last)*S + KV → write S to WS_S → signal Cube (flag 3)
+//   Vec: write S₀ to WS_S → signal Cube (H_S_READY_FLAG)
+//   Cube: read S from WS_S, load W → compute WS = W@S → write WS_WS → signal Vec (H_WS_READY_FLAG)
+//   Vec: read WS, compute V_new = U - WS, compute K_scaled → write WS_K → signal Cube (H_K_READY_FLAG)
+//   Cube: read K from WS_K, load V → compute KV = K^T@V → write WS_KV → signal Vec (H_KV_READY_FLAG)
+//   Vec: read KV, update S = exp(g_last)*S + KV → write S to WS_S → signal Cube (H_S_READY_FLAG)
 //   ... repeat for next chunk ...
 // ============================================================================
 
@@ -96,6 +97,56 @@ using namespace pto;
 #ifdef __CCE_AICORE__
 
 namespace {
+
+constexpr uint16_t H_WS_READY_FLAG = 0;
+constexpr uint16_t H_K_READY_FLAG = 1;
+constexpr uint16_t H_KV_READY_FLAG = 2;
+constexpr uint16_t H_S_READY_FLAG = 3;
+
+AICORE PTO_INLINE uint16_t chunk_h_ffts_msg(uint16_t flag_id)
+{
+  return static_cast<uint16_t>(1 | (2 << 4) | ((flag_id & 0xf) << 8));
+}
+
+AICORE PTO_INLINE void wait_h_s_ready(int64_t)
+{
+  wait_flag_dev(H_S_READY_FLAG);
+}
+
+AICORE PTO_INLINE void wait_h_ws_ready(int64_t)
+{
+  wait_flag_dev(H_WS_READY_FLAG);
+}
+
+AICORE PTO_INLINE void wait_h_k_ready(int64_t)
+{
+  wait_flag_dev(H_K_READY_FLAG);
+}
+
+AICORE PTO_INLINE void wait_h_kv_ready(int64_t)
+{
+  wait_flag_dev(H_KV_READY_FLAG);
+}
+
+AICORE PTO_INLINE void signal_h_s_ready(int64_t)
+{
+  ffts_cross_core_sync(PIPE_MTE3, chunk_h_ffts_msg(H_S_READY_FLAG));
+}
+
+AICORE PTO_INLINE void signal_h_k_ready(int64_t)
+{
+  ffts_cross_core_sync(PIPE_MTE3, chunk_h_ffts_msg(H_K_READY_FLAG));
+}
+
+AICORE PTO_INLINE void signal_h_ws_ready(int64_t)
+{
+  ffts_cross_core_sync(PIPE_FIX, chunk_h_ffts_msg(H_WS_READY_FLAG));
+}
+
+AICORE PTO_INLINE void signal_h_kv_ready(int64_t)
+{
+  ffts_cross_core_sync(PIPE_FIX, chunk_h_ffts_msg(H_KV_READY_FLAG));
+}
 
 using GmShape2D = pto::Shape<1, 1, 1, pto::DYNAMIC, pto::DYNAMIC>;
 using GmStride2D = pto::Stride<1, 1, 1, pto::DYNAMIC, 1>;
@@ -285,15 +336,18 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 
 #endif
 
-template <int32_t NumHeads, int32_t NumKeyHeads, int32_t HiddenSize,
-          int32_t ChunkSize>
+template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
 AICORE void chunk_h_kernel(
     __gm__ half *K_handle, __gm__ half *W_handle, __gm__ half *U_handle,
     __gm__ float *G_handle,
     __gm__ half *S_handle, __gm__ half *V_handle, __gm__ half *FS_handle,
+    __gm__ half *H0_handle,
+    int64_t has_initial_state,
+    int64_t output_final_state,
     __gm__ half *workspace_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
   // chunk_h advances the recurrent hidden state chunk by chunk:
@@ -324,13 +378,12 @@ AICORE void chunk_h_kernel(
   constexpr int32_t D = HiddenSize;
   constexpr int32_t C = ChunkSize;
   constexpr int32_t H = NumHeads;
-  constexpr int32_t Hg = NumKeyHeads;
-  static_assert(Hg > 0 && H % Hg == 0,
-                "NumHeads must be divisible by NumKeyHeads");
-  constexpr int32_t GROUP = H / Hg;
+  const int32_t Hg = static_cast<int32_t>(num_key_heads);
+  if (Hg <= 0 || (H % Hg) != 0) return;
+  const int32_t GROUP = H / Hg;
   constexpr int32_t HalfC = C / 2;
   constexpr int32_t BSND_QKV_STRIDE = H * D;
-  constexpr int32_t BSND_K_STRIDE = Hg * D;
+  const int32_t BSND_K_STRIDE = Hg * D;
   constexpr int32_t DD = D * D;
 
   constexpr int32_t WS_WS = 0;
@@ -432,7 +485,7 @@ AICORE void chunk_h_kernel(
     //   WS_KV : k_tilde^T @ v_i_new
 
     for (int32_t ci = 0; ci < num_chunks; ++ci) {
-      wait_flag_dev(3);
+      wait_h_s_ready(num_chunks);
 
       int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
       int64_t valid = slen - static_cast<int64_t>(ci) * C;
@@ -478,9 +531,14 @@ AICORE void chunk_h_kernel(
         // Save ws_i so the Vec phase can do `v_new = U_i - ws_i`.
         TSTORE(ws_global, ws_store);
       }
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
+      pipe_barrier(PIPE_ALL);
+      set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      pipe_barrier(PIPE_ALL);
+      signal_h_ws_ready(num_chunks);
 
-      wait_flag_dev(1);
+      wait_h_k_ready(num_chunks);
+      pipe_barrier(PIPE_ALL);
 
       {
         GmShape2D k_shape(D, C);
@@ -511,6 +569,7 @@ AICORE void chunk_h_kernel(
       // This chunk contributes the additive update K_i^T V_i to the state recurrence.
       gemm_v0<half, float, D, D, C, D, D, C, C, true, false>(
           k_l1, v_l1, kv_l0, (bool)1);
+      pipe_barrier(PIPE_ALL);
 
       {
         GmShape2D kv_shape(D, D);
@@ -521,8 +580,18 @@ AICORE void chunk_h_kernel(
         TASSIGN(kv_store, C * D * static_cast<int32_t>(sizeof(float)));
         // Save kv = k_tilde^T @ v_i_new so Vec can finish the state update.
         TSTORE(kv_global, kv_store);
+        if (output_final_state == 2 && ci == 0) {
+          int64_t fs_offset = (seq_idx * H + head) * DD;
+          GmTensor2D<half> fs_global(FS_handle + fs_offset, kv_shape,
+                                     kv_stride);
+          TSTORE(fs_global, kv_store);
+        }
       }
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
+      pipe_barrier(PIPE_ALL);
+      set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+      pipe_barrier(PIPE_ALL);
+      signal_h_kv_ready(num_chunks);
     }
   }
 #endif
@@ -563,10 +632,22 @@ AICORE void chunk_h_kernel(
     TEXPANDS(zero_ub, 0.0f);
     set_flag(PIPE_V, PIPE_S, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-    // Start each sequence/head recurrence from S_0 = 0.
-    TEXPANDS(s_ub, 0.0f);
-
-    TCVT(s_ub_half, s_ub, pto::RoundMode::CAST_NONE);
+    if (has_initial_state != 0) {
+      int64_t h0_offset = (seq_idx * H + head) * DD + vid * HalfC * D;
+      GmShape2D h0_shape(HalfC, D);
+      GmStride2D h0_stride(D);
+      GmTensor2D<half> h0_global(H0_handle + h0_offset, h0_shape, h0_stride);
+      DynVecTile<half, HalfC, D> h0_load(HalfC, D);
+      TASSIGN(h0_load, S_UB_HALF);
+      TLOAD(h0_load, h0_global);
+      set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      TCVT(s_ub, s_ub_half, pto::RoundMode::CAST_NONE);
+    } else {
+      // Start each sequence/head recurrence from S_0 = 0.
+      TEXPANDS(s_ub, 0.0f);
+      TCVT(s_ub_half, s_ub, pto::RoundMode::CAST_NONE);
+    }
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     {
@@ -580,7 +661,23 @@ AICORE void chunk_h_kernel(
       TASSIGN(s_store, S_UB_HALF);
       TSTORE(s_global, s_store);
     }
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+    pipe_barrier(PIPE_ALL);
+    {
+      int64_t s_out_offset = (chunk_offset * H + head) * DD;
+      GmShape2D s_out_shape(HalfC, D);
+      GmStride2D s_out_stride(D);
+      GmTensor2D<half> s_out_global(
+          S_handle + s_out_offset + vid * HalfC * D, s_out_shape,
+          s_out_stride);
+      DynVecTile<half, HalfC, D> s_out_store(HalfC, D);
+      TASSIGN(s_out_store, S_UB_HALF);
+      TSTORE(s_out_global, s_out_store);
+    }
+    pipe_barrier(PIPE_ALL);
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    pipe_barrier(PIPE_ALL);
+    signal_h_s_ready(num_chunks);
 
     int64_t chunk_start_0 = bos;
     int64_t valid0 = slen;
@@ -698,7 +795,8 @@ AICORE void chunk_h_kernel(
       TMUL(k_ub, k_ub, coeff_2d_ub);
       pipe_barrier(PIPE_V);
 
-      wait_flag_dev(0);
+      wait_h_ws_ready(num_chunks);
+      pipe_barrier(PIPE_ALL);
       {
         GmShape2D ws_shape(HalfC, D);
         GmStride2D ws_stride(D);
@@ -712,6 +810,7 @@ AICORE void chunk_h_kernel(
 
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      pipe_barrier(PIPE_ALL);
       TCVT(ws_ub, u_ub_half, pto::RoundMode::CAST_NONE);
       // v_i_new = U_i - W_i @ S_i.
       // In PyTorch notation:
@@ -746,7 +845,11 @@ AICORE void chunk_h_kernel(
         TSTORE(k_global, k_store);
       }
 
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+      pipe_barrier(PIPE_ALL);
+      set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+      pipe_barrier(PIPE_ALL);
+      signal_h_k_ready(num_chunks);
 
       set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
@@ -801,7 +904,8 @@ AICORE void chunk_h_kernel(
         }
       }
 
-      wait_flag_dev(2);
+      wait_h_kv_ready(num_chunks);
+      pipe_barrier(PIPE_ALL);
       {
         GmShape2D kv_shape(HalfC, D);
         GmStride2D kv_stride(D);
@@ -815,13 +919,16 @@ AICORE void chunk_h_kernel(
 
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+      pipe_barrier(PIPE_ALL);
       TCVT(kv_ub, s_ub_half, pto::RoundMode::CAST_NONE);
       pipe_barrier(PIPE_ALL);
       // Finish S_{i+1} = exp(g_last) * S_i + k_i_tilde^T @ v_i_new.
       // Torch-like:
       //   s_ub = s_ub + kv_ub
       TADD(s_ub, s_ub, kv_ub);
+      pipe_barrier(PIPE_ALL);
       TCVT(s_ub_half, s_ub, pto::RoundMode::CAST_NONE);
+      pipe_barrier(PIPE_ALL);
 
       if (ci + 1 < static_cast<int32_t>(num_chunks)) {
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -836,6 +943,7 @@ AICORE void chunk_h_kernel(
           TASSIGN(s_store, S_UB_HALF);
           TSTORE(s_global, s_store);
         }
+        pipe_barrier(PIPE_ALL);
 
         // Expose the post-chunk state so the next chunk (and debug/verification
         // outputs) can see S_{i+1}. Conceptually:
@@ -851,7 +959,21 @@ AICORE void chunk_h_kernel(
           TASSIGN(s_out_store, S_UB_HALF);
           TSTORE(s_out_global, s_out_store);
         }
-        ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+        if (output_final_state == 3 && ci == 0) {
+          int64_t fs_offset = (seq_idx * H + head) * DD;
+          GmShape2D fs_shape(HalfC, D);
+          GmStride2D fs_stride(D);
+          GmTensor2D<half> fs_global(FS_handle + fs_offset + vid * HalfC * D,
+                                     fs_shape, fs_stride);
+          DynVecTile<half, HalfC, D> fs_store(HalfC, D);
+          TASSIGN(fs_store, S_UB_HALF);
+          TSTORE(fs_global, fs_store);
+        }
+        pipe_barrier(PIPE_ALL);
+        set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+        pipe_barrier(PIPE_ALL);
+        signal_h_s_ready(num_chunks);
       }
 
       if (ci + 1 < static_cast<int32_t>(num_chunks)) {
@@ -860,20 +982,22 @@ AICORE void chunk_h_kernel(
       }
     }
 
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    int64_t fs_offset = (seq_idx * H + head) * DD;
-    {
-      GmShape2D fs_shape(HalfC, D);
-      GmStride2D fs_stride(D);
-      GmTensor2D<half> fs_global(FS_handle + fs_offset + vid * HalfC * D,
-                                 fs_shape, fs_stride);
-      DynVecTile<half, HalfC, D> fs_store(HalfC, D);
-      TASSIGN(fs_store, S_UB_HALF);
-      TSTORE(fs_global, fs_store);
+    if (output_final_state == 1) {
+      set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      int64_t fs_offset = (seq_idx * H + head) * DD;
+      {
+        GmShape2D fs_shape(HalfC, D);
+        GmStride2D fs_stride(D);
+        GmTensor2D<half> fs_global(FS_handle + fs_offset + vid * HalfC * D,
+                                   fs_shape, fs_stride);
+        DynVecTile<half, HalfC, D> fs_store(HalfC, D);
+        TASSIGN(fs_store, S_UB_HALF);
+        TSTORE(fs_global, fs_store);
+      }
+      set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
     }
-    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
   }
 #endif
 }
@@ -886,12 +1010,16 @@ extern "C" __global__ AICORE void launch_chunk_h(
     __gm__ uint8_t *K, __gm__ uint8_t *W, __gm__ uint8_t *U,
     __gm__ uint8_t *G,
     __gm__ uint8_t *S, __gm__ uint8_t *V, __gm__ uint8_t *FS,
+    __gm__ uint8_t *H0,
+    int64_t has_initial_state,
+    int64_t output_final_state,
     __gm__ uint8_t *workspace,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
-  chunk_h_kernel<GDN_H, GDN_HG, GDN_D, GDN_C>(
+  chunk_h_kernel<GDN_H, GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(K),
       reinterpret_cast<__gm__ half *>(W),
       reinterpret_cast<__gm__ half *>(U),
@@ -899,23 +1027,30 @@ extern "C" __global__ AICORE void launch_chunk_h(
       reinterpret_cast<__gm__ half *>(S),
       reinterpret_cast<__gm__ half *>(V),
       reinterpret_cast<__gm__ half *>(FS),
+      reinterpret_cast<__gm__ half *>(H0),
+      has_initial_state,
+      output_final_state,
       reinterpret_cast<__gm__ half *>(workspace),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, ffts_addr);
+      batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
 }
 
 extern "C" void call_kernel(
     uint32_t block_dim, void *stream,
     uint8_t *K, uint8_t *W, uint8_t *U, uint8_t *G,
     uint8_t *S, uint8_t *V, uint8_t *FS,
+    uint8_t *H0,
+    int64_t has_initial_state,
+    int64_t output_final_state,
     uint8_t *workspace,
     uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_key_heads)
 {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
   rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
   launch_chunk_h<<<block_dim, nullptr, stream>>>(
-      K, W, U, G, S, V, FS, workspace, cu_seqlens,
-      batch_size, seq_len, total_tokens, fftsAddr);
+      K, W, U, G, S, V, FS, H0, has_initial_state, output_final_state, workspace, cu_seqlens,
+      batch_size, seq_len, total_tokens, num_key_heads, fftsAddr);
 }
