@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-from functools import lru_cache
 
 import torch
 
@@ -25,7 +24,6 @@ from megagdn_pto.kernel_libs import (
 )
 
 
-@lru_cache(maxsize=None)
 def _load_mega_kernel(
     *,
     num_heads: int,
@@ -44,7 +42,10 @@ def _load_mega_kernel(
     lib = ctypes.CDLL(os.path.abspath(lib_path))
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
-        + [ctypes.c_void_p] * 28
+        + [ctypes.c_void_p] * 22
+        + [ctypes.c_int64]
+        + [ctypes.c_void_p] * 7
+        + [ctypes.c_uint32, ctypes.c_uint32]
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
@@ -64,6 +65,7 @@ def run_mega_kernel(
     scale: float = 1.0,
     block_dim: int | None = None,
     key_heads: int | None = None,
+    initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run all seven GDN stages in a single fused NPU kernel launch.
@@ -79,6 +81,7 @@ def run_mega_kernel(
         scale:            Output scale factor (typically ``head_dim ** -0.5``).
         block_dim:        AI-Core block count (auto-detected if None).
         key_heads:        Number of Q/K heads Hg (inferred from ``q`` if None).
+        initial_state:    Optional ``[N_seq, H, D, D]`` initial recurrent state.
         return_final_state: If True, also return ``[N_seq, H, D, D]`` final states.
 
     Returns:
@@ -114,6 +117,12 @@ def run_mega_kernel(
     s        = torch.zeros(tc * H, D, D, device=dev, dtype=torch.float16)
     v_new    = torch.empty_like(v)
     fs       = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
+    if initial_state is None:
+        h0 = None
+        has_initial_state = 0
+    else:
+        h0 = initial_state.to(device=dev, dtype=torch.float16).contiguous()
+        has_initial_state = 1
 
     kkt_ws    = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float16)
     wy_ws_a1  = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
@@ -133,12 +142,15 @@ def run_mega_kernel(
         _vp(g_sum), _vp(g_t), _vp(beta_t),
         _vp(A), _vp(A_inv_f32), _vp(A_inv),
         _vp(w), _vp(u), _vp(s), _vp(v_new), _vp(fs),
+        _vp(h0), has_initial_state,
         _vp(kkt_ws), _vp(wy_ws_a1), _vp(wy_ws_a2), _vp(h_ws),
         _vp(o_ws_qk), _vp(o_ws_qs), _vp(o_ws_gated),
+        H, kh,
         N_seq, T, T, num_matrices,
     )
 
     o_scaled = o_out * scale
     if return_final_state:
-        return o_scaled, fs.view(N_seq, H, D, D)
+        fs_view = fs.view(N_seq, H, D, D)
+        return o_scaled, fs_view
     return o_scaled

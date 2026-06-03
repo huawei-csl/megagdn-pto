@@ -1,7 +1,7 @@
 """Bisheng JIT compilation for PTO GDN kernels on Ascend NPU.
 
 Kernels compile to shared libraries (.so) under ``kernels/pto/compiled_lib/``.
-Chunk kernels intentionally rebuild on each load while debugging kernel code.
+Chunk and fused mega kernels use fresh paths so ``dlopen`` cannot return a stale loaded image.
 
 Environment variables:
     PTO_LIB_PATH            Path to pto-isa header directory (contains ``include/``).
@@ -142,7 +142,6 @@ def compile_chunk_kernel(
     return lib_path
 
 
-@lru_cache(maxsize=None)
 def compile_mega_kernel(
     *,
     num_heads: int = 16,
@@ -151,13 +150,14 @@ def compile_mega_kernel(
     chunk_size: int = 128,
     cpp_mtime_ns: int = 0,
 ) -> str:
-    """Compile the fused mega-kernel and return the path to the resulting ``.so``."""
+    """Compile the fused mega-kernel and return a fresh ``.so`` path."""
     kh = key_heads if key_heads is not None else num_heads
     os.makedirs(_COMPILED_DIR, exist_ok=True)
     cpp_path = os.path.join(_KERNELS_PTO, "mega_kernel.cpp")
+    build_id = time.time_ns()
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"mega_kernel_H{num_heads}_Hg{kh}_D{hidden_size}_C{chunk_size}.so",
+        f"mega_kernel_H{num_heads}_Hg{kh}_D{hidden_size}_C{chunk_size}_m{cpp_mtime_ns}_b{build_id}.so",
     )
     flags = _common_flags(
         num_heads=num_heads, key_heads=kh, hidden_size=hidden_size, chunk_size=chunk_size

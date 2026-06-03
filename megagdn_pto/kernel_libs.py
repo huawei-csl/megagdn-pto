@@ -97,7 +97,6 @@ def _mtime(name: str) -> int:
 # Kernel loading
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=None)
 def _load(
     cpp_name: str,
     so_stem: str,
@@ -106,6 +105,7 @@ def _load(
     hidden_size: int = 128,
     chunk_size: int = 128,
     key_heads: int | None = None,
+    cpp_mtime_ns: int,
 ) -> ctypes.CDLL:
     lib_path = compile_chunk_kernel(
         cpp_name,
@@ -114,7 +114,7 @@ def _load(
         hidden_size=hidden_size,
         chunk_size=chunk_size,
         key_heads=key_heads,
-        cpp_mtime_ns=_mtime(cpp_name),
+        cpp_mtime_ns=cpp_mtime_ns,
     )
     return ctypes.CDLL(os.path.abspath(lib_path))
 
@@ -139,6 +139,7 @@ def load_chunk_cumsum(
     lib = _load(
         "chunk_cumsum.cpp", "chunk_cumsum",
         num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
+        cpp_mtime_ns=_mtime("chunk_cumsum.cpp"),
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
@@ -183,16 +184,16 @@ def load_scaled_dot_kkt(
     *,
     key_heads: int | None = None,
 ) -> ctypes.CDLL:
-    kh = key_heads if key_heads is not None else num_heads
     lib = _load(
         "scaled_dot_kkt.cpp", "scaled_dot_kkt",
         num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
-        key_heads=key_heads,
+        key_heads=key_heads, cpp_mtime_ns=_mtime("scaled_dot_kkt.cpp"),
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 7
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
+        + [ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
     return lib
@@ -230,7 +231,7 @@ def run_scaled_dot_kkt(
     lib.call_kernel(
         bd, stream,
         _vp(k), _vp(beta_t), _vp(g_t), _vp(mask), _vp(ws), _vp(A_out), _vp(cu32),
-        batch, k.shape[1], T,
+        batch, k.shape[1], T, kh,
     )
 
 
@@ -248,12 +249,13 @@ def load_wy_fast(
     lib = _load(
         "wy_fast.cpp", "wy_fast",
         num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
-        key_heads=key_heads,
+        key_heads=key_heads, cpp_mtime_ns=_mtime("wy_fast.cpp"),
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 10
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
+        + [ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
     return lib
@@ -295,7 +297,7 @@ def run_wy_fast(
         bd, stream,
         _vp(k), _vp(v), _vp(beta_t), _vp(g_t), _vp(A),
         _vp(ws_a1), _vp(ws_a2), _vp(w_out), _vp(u_out), _vp(cu32),
-        batch, k.shape[1], T,
+        batch, k.shape[1], T, kh,
     )
 
 
@@ -313,12 +315,15 @@ def load_chunk_h(
     lib = _load(
         "chunk_h.cpp", "chunk_h",
         num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
-        key_heads=key_heads,
+        key_heads=key_heads, cpp_mtime_ns=_mtime("chunk_h.cpp"),
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
-        + [ctypes.c_void_p] * 9
+        + [ctypes.c_void_p] * 7
+        + [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64]
+        + [ctypes.c_void_p] * 2
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
+        + [ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
     return lib
@@ -331,7 +336,7 @@ def run_chunk_h(
     g_sum: torch.Tensor,
     s_out: torch.Tensor,
     v_new_out: torch.Tensor,
-    final_state_out: torch.Tensor,
+    final_state_out: torch.Tensor | None,
     *,
     stream,
     g_t: torch.Tensor,
@@ -340,11 +345,13 @@ def run_chunk_h(
     batch_size_override: int | None = None,
     block_dim: int | None = None,
     key_heads: int | None = None,
+    initial_state: torch.Tensor | None = None,
 ) -> None:
     """Compute chunk states S and per-token v_new (de-interfered values).
 
     ``k``: ``[B, T, Hg, D]``; ``w``, ``u``: ``[B, T, H, D]``.
-    ``s_out``: ``[total_chunks*H, D, D]``; ``final_state_out``: ``[N_seq*H, D, D]``.
+    ``s_out``: ``[total_chunks*H, D, D]``; ``final_state_out`` may be
+    ``[N_seq*H, D, D]`` or ``[N_seq, H, D, D]``.
     """
     hg = k.shape[2]
     kh = key_heads if key_heads is not None else hg
@@ -355,12 +362,47 @@ def run_chunk_h(
     cu32 = _ensure_int32(cu_seqlens)
     T = g_sum.shape[1]
     ws = torch.zeros(bd * 4, D, D, device=k.device, dtype=torch.float16)
+
+    if kh <= 0 or H % kh != 0:
+        raise ValueError(f"H={H} must be divisible by key_heads={kh}")
+    if kh != hg:
+        raise ValueError(f"key_heads={kh} must match k.shape[2]={hg}")
+
+    if final_state_out is None:
+        final_state_buf = None
+        output_final_state = 0
+    elif final_state_out.shape == (batch, H, D, D):
+        final_state_buf = final_state_out.view(batch * H, D, D)
+        output_final_state = 1
+    elif final_state_out.shape == (batch * H, D, D):
+        final_state_buf = final_state_out
+        output_final_state = 1
+    else:
+        raise ValueError(
+            "final_state_out must have shape "
+            f"({batch * H}, {D}, {D}) or ({batch}, {H}, {D}, {D})"
+        )
+    if final_state_buf is not None and not final_state_buf.is_contiguous():
+        raise ValueError("final_state_out must be contiguous")
+
+    if initial_state is None:
+        h0 = None
+        has_initial_state = 0
+    else:
+        if initial_state.shape != (batch, H, D, D):
+            raise ValueError(
+                "initial_state must have shape "
+                f"({batch}, {H}, {D}, {D})"
+            )
+        h0 = initial_state.to(device=k.device, dtype=torch.float16).contiguous()
+        has_initial_state = 1
     lib = load_chunk_h(H, D, chunk_size, key_heads=kh)
     lib.call_kernel(
         bd, stream,
         _vp(k), _vp(w), _vp(u), _vp(g_t),
-        _vp(s_out), _vp(v_new_out), _vp(final_state_out), _vp(ws), _vp(cu32),
-        batch, k.shape[1], T,
+        _vp(s_out), _vp(v_new_out), _vp(final_state_buf),
+        _vp(h0), has_initial_state, output_final_state, _vp(ws), _vp(cu32),
+        batch, k.shape[1], T, kh,
     )
 
 
@@ -378,12 +420,13 @@ def load_chunk_o(
     lib = _load(
         "chunk_o.cpp", "chunk_o",
         num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
-        key_heads=key_heads,
+        key_heads=key_heads, cpp_mtime_ns=_mtime("chunk_o.cpp"),
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 11
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
+        + [ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
     return lib
@@ -426,5 +469,5 @@ def run_chunk_o(
         bd, stream,
         _vp(q), _vp(k), _vp(v_new), _vp(s), _vp(g_t), _vp(mask),
         _vp(ws_qk), _vp(ws_qs), _vp(ws_gated), _vp(o_out), _vp(cu32),
-        batch, q.shape[1], T,
+        batch, q.shape[1], T, kh,
     )
