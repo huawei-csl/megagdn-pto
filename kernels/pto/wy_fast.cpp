@@ -263,8 +263,7 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 
 #endif
 
-template <int32_t NumHeads, int32_t NumKeyHeads, int32_t HiddenSize,
-          int32_t ChunkSize>
+template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
 AICORE void wy_fast_kernel(
     __gm__ half *K_handle, __gm__ half *V_handle,
     __gm__ half *Beta_handle, __gm__ float *G_handle,
@@ -273,6 +272,7 @@ AICORE void wy_fast_kernel(
     __gm__ half *W_handle, __gm__ half *U_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
   // WY recompute materializes two diagonal reweightings of the same A tile:
@@ -301,12 +301,11 @@ AICORE void wy_fast_kernel(
       (HiddenSize % 128 == 0) ? 128 : (HiddenSize % 128);
 
   constexpr int32_t H = NumHeads;
-  constexpr int32_t Hg = NumKeyHeads;
-  static_assert(Hg > 0 && H % Hg == 0,
-                "NumHeads must be divisible by NumKeyHeads");
-  constexpr int32_t GROUP = H / Hg;
+  const int32_t Hg = static_cast<int32_t>(num_key_heads);
+  if (Hg <= 0 || (H % Hg) != 0) return;
+  const int32_t GROUP = H / Hg;
   constexpr int32_t BSND_V_STRIDE = H * HiddenSize;
-  constexpr int32_t BSND_QK_STRIDE = Hg * HiddenSize;
+  const int32_t BSND_QK_STRIDE = Hg * HiddenSize;
 
   constexpr int32_t GHeadTileCols = ((NumHeads + 7) / 8) * 8;
   constexpr int32_t BetaHeadTileCols = ((NumHeads + 15) / 16) * 16;
@@ -977,9 +976,10 @@ extern "C" __global__ AICORE void launch_wy_fast(
     __gm__ uint8_t *W_handle, __gm__ uint8_t *U_handle,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
-  wy_fast_kernel<GDN_H, GDN_HG, GDN_D, GDN_C>(
+  wy_fast_kernel<GDN_H, GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(K_handle),
       reinterpret_cast<__gm__ half *>(V_handle),
       reinterpret_cast<__gm__ half *>(Beta_handle),
@@ -990,7 +990,7 @@ extern "C" __global__ AICORE void launch_wy_fast(
       reinterpret_cast<__gm__ half *>(W_handle),
       reinterpret_cast<__gm__ half *>(U_handle),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, ffts_addr);
+      batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
 }
 
 extern "C" void call_kernel(
@@ -999,7 +999,8 @@ extern "C" void call_kernel(
     uint8_t *workspace_a1, uint8_t *workspace_a2,
     uint8_t *w, uint8_t *u,
     uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_key_heads)
 {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
@@ -1009,5 +1010,5 @@ extern "C" void call_kernel(
       workspace_a1, workspace_a2,
       w, u,
       cu_seqlens,
-      batch_size, seq_len, total_tokens, fftsAddr);
+      batch_size, seq_len, total_tokens, num_key_heads, fftsAddr);
 }

@@ -127,16 +127,21 @@ using L1Mat = pto::Tile<pto::TileType::Mat, T, R, C, pto::BLayout::ColMajor,
 template <typename T, int R, int C, int RV = R, int CV = C>
 using L1MatZN = pto::Tile<pto::TileType::Mat, T, R, C, pto::BLayout::RowMajor,
                           RV, CV, pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
+
+using GmShape2D = pto::Shape<1, 1, 1, pto::DYNAMIC, pto::DYNAMIC>;
+using GmStride2D = pto::Stride<1, 1, 1, pto::DYNAMIC, 1>;
+
+template <typename T>
+using GmTensor2D = pto::GlobalTensor<T, GmShape2D, GmStride2D>;
 #endif
 
 // ── Main kernel function (runs on each AI core) ──────────────────────
-// Template parameters: NumHeads (H value), NumKeyHeads (Hg), HiddenSize, ChunkSize.
+// Template parameters: NumHeads (H value), HiddenSize, ChunkSize.
 // GROUP = H/Hg; Cube loads K at head_g = head_idx / GROUP.
 //
 // __gm__: Marks pointers as Global Memory (HBM) — the NPU equivalent of
 // CUDA's device memory. All input/output tensors live in GM.
-template <int32_t NumHeads, int32_t NumKeyHeads, int32_t HiddenSize,
-          int32_t ChunkSize>
+template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
 AICORE void kkt_kernel(
     __gm__ half *K_handle, __gm__ half *Beta_handle,
     __gm__ float *G_handle, __gm__ float *Msk_handle,
@@ -144,14 +149,15 @@ AICORE void kkt_kernel(
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
     int64_t total_tokens,
+    uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
   constexpr int32_t HalfChunk = ChunkSize / 2;
   constexpr int32_t ChunkSquare = ChunkSize * ChunkSize;
-  static_assert(NumHeads % NumKeyHeads == 0,
-                "NumHeads must be divisible by NumKeyHeads (GQA grouping)");
-  constexpr int32_t GROUP = NumHeads / NumKeyHeads;
-  constexpr int32_t BSND_QK_STRIDE = NumKeyHeads * HiddenSize;
+  const int32_t key_heads = static_cast<int32_t>(num_key_heads);
+  if (key_heads <= 0 || (NumHeads % key_heads) != 0) return;
+  const int32_t group = NumHeads / key_heads;
+  const int32_t bsnd_qk_stride = key_heads * HiddenSize;
   // KTail: number of valid columns in the last 128-wide fractal block of K.
   // If HiddenSize is a multiple of 128, the last block is fully used (128).
   // Otherwise it's the remainder. Used internally by TLOAD for partial blocks.
@@ -302,9 +308,9 @@ AICORE void kkt_kernel(
 
       // BSND key layout [Seq, Hg, D]: token stride Hg * D (see BSND_QK_STRIDE).
       // Value head head_idx maps to head_g = head_idx / GROUP for shared K rows.
-      int32_t head_g = head_idx / GROUP;
+      int32_t head_g = head_idx / group;
       int64_t k_offset =
-          ((bos + chunk_start) * static_cast<int64_t>(NumKeyHeads) +
+          ((bos + chunk_start) * static_cast<int64_t>(key_heads) +
            static_cast<int64_t>(head_g)) *
           static_cast<int64_t>(HiddenSize);
 
@@ -317,11 +323,9 @@ AICORE void kkt_kernel(
       {
         L1Mat<half, ChunkSize, HiddenSize, DYNAMIC, DYNAMIC> _l1(valid_rows, HiddenSize);
         TASSIGN(_l1, 0);
-        Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
-        _gs.shape[3] = valid_rows; _gs.shape[4] = HiddenSize;
-        GlobalTensor<half, decltype(_gs),
-                     Stride<1, 1, 1, BSND_QK_STRIDE, 1>>
-            _gm(K_handle + k_offset, _gs);
+        GmShape2D _gs(valid_rows, HiddenSize);
+        GmStride2D _stride(bsnd_qk_stride);
+        GmTensor2D<half> _gm(K_handle + k_offset, _gs, _stride);
         TLOAD(_l1, _gm);
         if (valid_rows != ChunkSize) TFILLPAD(_l1, _l1);
       }
@@ -657,9 +661,10 @@ extern "C" __global__ AICORE void launch_scaled_dot_kkt(
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
     int64_t total_tokens,
+    uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
-  kkt_kernel<GDN_H, GDN_HG, GDN_D, GDN_C>(
+  kkt_kernel<GDN_H, GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(K_handle),
       reinterpret_cast<__gm__ half *>(Beta_handle),
       reinterpret_cast<__gm__ float *>(G_handle),
@@ -667,7 +672,7 @@ extern "C" __global__ AICORE void launch_scaled_dot_kkt(
       reinterpret_cast<__gm__ half *>(workspace_handle),
       reinterpret_cast<__gm__ half *>(A_handle),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, ffts_addr);
+      batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
 }
 
 // ── Host-side launcher ────────────────────────────────────────────────
@@ -687,7 +692,8 @@ extern "C" void call_kernel(
     uint8_t *workspace_handle, uint8_t *A_handle,
     uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
-    int64_t total_tokens)
+    int64_t total_tokens,
+    uint32_t num_key_heads)
 {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
@@ -695,5 +701,5 @@ extern "C" void call_kernel(
   launch_scaled_dot_kkt<<<block_dim, nullptr, stream>>>(
       K_handle, Beta_handle, G_handle, Msk_handle,
       workspace_handle, A_handle, cu_seqlens,
-      batch_size, seq_len, total_tokens, fftsAddr);
+      batch_size, seq_len, total_tokens, num_key_heads, fftsAddr);
 }

@@ -139,10 +139,15 @@ template <typename T, int R, int C, int RV = R, int CV = C>
 using L1MatZN = pto::Tile<pto::TileType::Mat, T, R, C, pto::BLayout::RowMajor,
                           RV, CV, pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
+using GmShape2D = pto::Shape<1, 1, 1, pto::DYNAMIC, pto::DYNAMIC>;
+using GmStride2D = pto::Stride<1, 1, 1, pto::DYNAMIC, 1>;
+
+template <typename T>
+using GmTensor2D = pto::GlobalTensor<T, GmShape2D, GmStride2D>;
+
 #endif  // __CCE_AICORE__
 
-template <int32_t NumHeads, int32_t NumKeyHeads, int32_t HiddenSize,
-          int32_t ChunkSize>
+template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
 AICORE void chunk_o_kernel(
     __gm__ half *Q_handle, __gm__ half *K_handle, __gm__ half *V_handle,
     __gm__ half *S_handle, __gm__ float *G_handle,
@@ -154,6 +159,7 @@ AICORE void chunk_o_kernel(
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
     int64_t total_tokens,
+    uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
   // Half the chunk — each Vec sub-block handles C/2 rows independently.
@@ -166,12 +172,11 @@ AICORE void chunk_o_kernel(
       (ChunkSize % 128 == 0) ? 128 : (ChunkSize % 128);
 
   constexpr int32_t H = NumHeads;
-  constexpr int32_t Hg = NumKeyHeads;
-  static_assert(Hg > 0 && H % Hg == 0,
-                "NumHeads must be divisible by NumKeyHeads");
-  constexpr int32_t GROUP = H / Hg;
+  const int32_t Hg = static_cast<int32_t>(num_key_heads);
+  if (Hg <= 0 || (H % Hg) != 0) return;
+  const int32_t GROUP = H / Hg;
   constexpr int32_t BSND_V_STRIDE = H * HiddenSize;
-  constexpr int32_t BSND_QK_STRIDE = Hg * HiddenSize;
+  const int32_t BSND_QK_STRIDE = Hg * HiddenSize;
 
   // Workspace sizes (in elements) shared between Cube and Vec via GM
   constexpr int32_t WsQKSize = ChunkSize * ChunkSize;
@@ -341,9 +346,9 @@ AICORE void chunk_o_kernel(
       {
         L1Mat<half, ChunkSize, HiddenSize, DYNAMIC, DYNAMIC> _l1(valid_rows, HiddenSize);
         TASSIGN(_l1, 0);
-        Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
-        _gs.shape[3] = valid_rows; _gs.shape[4] = HiddenSize;
-        GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, BSND_QK_STRIDE, 1>> _gm(Q_handle + qk_off, _gs);
+        GmShape2D _gs(valid_rows, HiddenSize);
+        GmStride2D _stride(BSND_QK_STRIDE);
+        GmTensor2D<half> _gm(Q_handle + qk_off, _gs, _stride);
         TLOAD(_l1, _gm);
         if (valid_rows != ChunkSize) TFILLPAD(_l1, _l1);
       }
@@ -351,9 +356,9 @@ AICORE void chunk_o_kernel(
       {
         L1Mat<half, ChunkSize, HiddenSize, DYNAMIC, DYNAMIC> _l1(valid_rows, HiddenSize);
         TASSIGN(_l1, 32768);
-        Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
-        _gs.shape[3] = valid_rows; _gs.shape[4] = HiddenSize;
-        GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, BSND_QK_STRIDE, 1>> _gm(K_handle + qk_off, _gs);
+        GmShape2D _gs(valid_rows, HiddenSize);
+        GmStride2D _stride(BSND_QK_STRIDE);
+        GmTensor2D<half> _gm(K_handle + qk_off, _gs, _stride);
         TLOAD(_l1, _gm);
         if (valid_rows != ChunkSize) TFILLPAD(_l1, _l1);
       }
@@ -571,9 +576,9 @@ AICORE void chunk_o_kernel(
             {
               L1Mat<half, ChunkSize, HiddenSize, DYNAMIC, DYNAMIC> _l1(valid_rows, HiddenSize);
               TASSIGN(_l1, 0);
-              Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
-              _gs.shape[3] = valid_rows; _gs.shape[4] = HiddenSize;
-              GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, BSND_QK_STRIDE, 1>> _gm(Q_handle + qk_off, _gs);
+              GmShape2D _gs(valid_rows, HiddenSize);
+              GmStride2D _stride(BSND_QK_STRIDE);
+              GmTensor2D<half> _gm(Q_handle + qk_off, _gs, _stride);
               TLOAD(_l1, _gm);
               if (valid_rows != ChunkSize) TFILLPAD(_l1, _l1);
             }
@@ -581,9 +586,9 @@ AICORE void chunk_o_kernel(
             {
               L1Mat<half, ChunkSize, HiddenSize, DYNAMIC, DYNAMIC> _l1(valid_rows, HiddenSize);
               TASSIGN(_l1, 32768);
-              Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
-              _gs.shape[3] = valid_rows; _gs.shape[4] = HiddenSize;
-              GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, BSND_QK_STRIDE, 1>> _gm(K_handle + qk_off, _gs);
+              GmShape2D _gs(valid_rows, HiddenSize);
+              GmStride2D _stride(BSND_QK_STRIDE);
+              GmTensor2D<half> _gm(K_handle + qk_off, _gs, _stride);
               TLOAD(_l1, _gm);
               if (valid_rows != ChunkSize) TFILLPAD(_l1, _l1);
             }
@@ -1205,9 +1210,10 @@ extern "C" __global__ AICORE void launch_chunk_o(
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
     int64_t total_tokens,
+    uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
-  chunk_o_kernel<GDN_H, GDN_HG, GDN_D, GDN_C>(
+  chunk_o_kernel<GDN_H, GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(Q_handle),
       reinterpret_cast<__gm__ half *>(K_handle),
       reinterpret_cast<__gm__ half *>(V_handle),
@@ -1219,7 +1225,7 @@ extern "C" __global__ AICORE void launch_chunk_o(
       reinterpret_cast<__gm__ half *>(workspace_qk_gated),
       reinterpret_cast<__gm__ half *>(O_handle),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, ffts_addr);
+      batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
 }
 
 // ── Host launcher (called from Python ctypes) ─────────────────────────
@@ -1235,7 +1241,8 @@ extern "C" void call_kernel(
     uint8_t *o,
     uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
-    int64_t total_tokens)
+    int64_t total_tokens,
+    uint32_t num_key_heads)
 {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
@@ -1245,5 +1252,5 @@ extern "C" void call_kernel(
       workspace_qk, workspace_qs_qkv, workspace_qk_gated,
       o,
       cu_seqlens,
-      batch_size, seq_len, total_tokens, fftsAddr);
+      batch_size, seq_len, total_tokens, num_key_heads, fftsAddr);
 }

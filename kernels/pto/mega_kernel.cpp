@@ -88,20 +88,23 @@ AICORE void mega_transpose_TH_to_HT(
     constexpr int32_t BLOCK = 128;
     constexpr int32_t H = static_cast<int32_t>(H_val);
     constexpr int32_t ES = static_cast<int32_t>(sizeof(T));
+    constexpr int32_t MinTransposeCols = 16;
+    constexpr int32_t AlignElems = ((32 / ES) > MinTransposeCols) ? (32 / ES) : MinTransposeCols;
+    constexpr int32_t HP = ((H + AlignElems - 1) / AlignElems) * AlignElems;
     constexpr int32_t SRC_UB = 0;
-    constexpr int32_t DST_UB = SRC_UB + BLOCK * H * ES;
-    constexpr int32_t TMP_UB = DST_UB + H * BLOCK * ES;
+    constexpr int32_t DST_UB = SRC_UB + BLOCK * HP * ES;
+    constexpr int32_t TMP_UB = DST_UB + HP * BLOCK * ES;
 
-    using UBSrcFull = Tile<TileType::Vec, T, BLOCK, H, BLayout::RowMajor,
-                           BLOCK, H, SLayout::NoneBox, 512, PadValue::Zero>;
-    using UBSrcDyn  = Tile<TileType::Vec, T, BLOCK, H, BLayout::RowMajor,
+    using UBSrcFull = Tile<TileType::Vec, T, BLOCK, HP, BLayout::RowMajor,
+                           BLOCK, HP, SLayout::NoneBox, 512, PadValue::Zero>;
+    using UBSrcDyn  = Tile<TileType::Vec, T, BLOCK, HP, BLayout::RowMajor,
                            DYNAMIC, DYNAMIC, SLayout::NoneBox, 512, PadValue::Zero>;
-    using UBDst     = Tile<TileType::Vec, T, H, BLOCK, BLayout::RowMajor,
-                           H, BLOCK, SLayout::NoneBox, 512>;
-    using UBDstDyn  = Tile<TileType::Vec, T, H, BLOCK, BLayout::RowMajor,
+    using UBDst     = Tile<TileType::Vec, T, HP, BLOCK, BLayout::RowMajor,
+                           HP, BLOCK, SLayout::NoneBox, 512>;
+    using UBDstDyn  = Tile<TileType::Vec, T, HP, BLOCK, BLayout::RowMajor,
                            DYNAMIC, DYNAMIC, SLayout::NoneBox, 512>;
-    using UBTmp     = Tile<TileType::Vec, T, BLOCK, H, BLayout::RowMajor,
-                           BLOCK, H, SLayout::NoneBox, 512>;
+    using UBTmp     = Tile<TileType::Vec, T, BLOCK, HP, BLayout::RowMajor,
+                           BLOCK, HP, SLayout::NoneBox, 512>;
 
     using UBRow     = Tile<TileType::Vec, T, 1, BLOCK, BLayout::RowMajor,
                            1, BLOCK, SLayout::NoneBox, 512>;
@@ -132,7 +135,7 @@ AICORE void mega_transpose_TH_to_HT(
             UBSrcDyn ld(valid, H);
             TASSIGN(ld, SRC_UB);
             TLOAD(ld, gm);
-            if (valid != BLOCK) TFILLPAD_INPLACE(ub_src, ld);
+            if (valid != BLOCK || H != HP) TFILLPAD_INPLACE(ub_src, ld);
         }
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -279,7 +282,8 @@ AICORE void mega_solve_tril(
             num_bsnd_heads, cu_seqlens, is_lower);
 }
 
-extern "C" __global__ AICORE void launch_mega_kernel(
+template <int32_t H>
+AICORE inline void mega_kernel_impl(
     __gm__ uint8_t *q_ptr,
     __gm__ uint8_t *k_ptr,
     __gm__ uint8_t *v_ptr,
@@ -301,6 +305,8 @@ extern "C" __global__ AICORE void launch_mega_kernel(
     __gm__ uint8_t *s_ptr,
     __gm__ uint8_t *v_new_ptr,
     __gm__ uint8_t *fs_ptr,
+    __gm__ uint8_t *h0_ptr,
+    int64_t has_initial_state,
     __gm__ uint8_t *kkt_ws_ptr,
     __gm__ uint8_t *wy_ws_a1_ptr,
     __gm__ uint8_t *wy_ws_a2_ptr,
@@ -308,6 +314,7 @@ extern "C" __global__ AICORE void launch_mega_kernel(
     __gm__ uint8_t *o_ws_qk_ptr,
     __gm__ uint8_t *o_ws_qs_ptr,
     __gm__ uint8_t *o_ws_gated_ptr,
+    uint32_t num_key_heads,
     int64_t batch_size,
     int64_t seq_len,
     int64_t total_tokens,
@@ -316,10 +323,12 @@ extern "C" __global__ AICORE void launch_mega_kernel(
 {
     set_ffts_base_addr(ffts_addr);
 
-    constexpr int32_t H = GDN_H;
-    constexpr int32_t HG = GDN_HG;
     constexpr int32_t D = GDN_D;
     constexpr int32_t C = GDN_C;
+
+    if (num_key_heads == 0 || (static_cast<uint32_t>(H) % num_key_heads) != 0) {
+        return;
+    }
 
     mk_cumsum::cumsum_kernel<H, C>(
         reinterpret_cast<__gm__ float *>(g_in_ptr),
@@ -354,7 +363,7 @@ extern "C" __global__ AICORE void launch_mega_kernel(
 
     SyncAllImpl<false>();
 
-    mk_kkt::kkt_kernel<H, HG, D, C>(
+    mk_kkt::kkt_kernel<H, D, C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
         reinterpret_cast<__gm__ half *>(beta_t_ptr),
         reinterpret_cast<__gm__ float *>(g_t_ptr),
@@ -362,7 +371,7 @@ extern "C" __global__ AICORE void launch_mega_kernel(
         reinterpret_cast<__gm__ half *>(kkt_ws_ptr),
         reinterpret_cast<__gm__ half *>(A_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, ffts_addr);
+        batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
 
 #if defined(__DAV_C220_CUBE__)
     pipe_barrier(PIPE_ALL);
@@ -402,7 +411,7 @@ extern "C" __global__ AICORE void launch_mega_kernel(
     return;
 #endif
 
-    mk_wy::wy_fast_kernel<H, HG, D, C>(
+    mk_wy::wy_fast_kernel<H, D, C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
         reinterpret_cast<__gm__ half *>(v_ptr),
         reinterpret_cast<__gm__ half *>(beta_t_ptr),
@@ -413,7 +422,7 @@ extern "C" __global__ AICORE void launch_mega_kernel(
         reinterpret_cast<__gm__ half *>(w_ptr),
         reinterpret_cast<__gm__ half *>(u_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, ffts_addr);
+        batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
 
 #if defined(__DAV_C220_VEC__)
     if (get_block_idx() < num_matrices) {
@@ -430,7 +439,7 @@ extern "C" __global__ AICORE void launch_mega_kernel(
 
     SyncAllImpl<false>();
 
-    mk_h::chunk_h_kernel<H, HG, D, C>(
+    mk_h::chunk_h_kernel<H, D, C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
         reinterpret_cast<__gm__ half *>(w_ptr),
         reinterpret_cast<__gm__ half *>(u_ptr),
@@ -438,9 +447,12 @@ extern "C" __global__ AICORE void launch_mega_kernel(
         reinterpret_cast<__gm__ half *>(s_ptr),
         reinterpret_cast<__gm__ half *>(v_new_ptr),
         reinterpret_cast<__gm__ half *>(fs_ptr),
+        reinterpret_cast<__gm__ half *>(h0_ptr),
+        has_initial_state,
+        1,
         reinterpret_cast<__gm__ half *>(h_ws_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, ffts_addr);
+        batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
 
 #ifdef MEGA_STOP_AFTER_H
     pipe_barrier(PIPE_ALL);
@@ -449,7 +461,7 @@ extern "C" __global__ AICORE void launch_mega_kernel(
 
     SyncAllImpl<false>();
 
-    mk_o::chunk_o_kernel<H, HG, D, C>(
+    mk_o::chunk_o_kernel<H, D, C>(
         reinterpret_cast<__gm__ half *>(q_ptr),
         reinterpret_cast<__gm__ half *>(k_ptr),
         reinterpret_cast<__gm__ half *>(v_new_ptr),
@@ -461,7 +473,7 @@ extern "C" __global__ AICORE void launch_mega_kernel(
         reinterpret_cast<__gm__ half *>(o_ws_gated_ptr),
         reinterpret_cast<__gm__ half *>(o_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, ffts_addr);
+        batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
 
 #if defined(__DAV_C220_CUBE__)
     if (get_block_idx() < num_matrices) {
@@ -469,6 +481,67 @@ extern "C" __global__ AICORE void launch_mega_kernel(
         wait_flag_dev(3);
     }
 #endif
+}
+
+extern "C" __global__ AICORE void launch_mega_kernel(
+    __gm__ uint8_t *q_ptr,
+    __gm__ uint8_t *k_ptr,
+    __gm__ uint8_t *v_ptr,
+    __gm__ uint8_t *g_in_ptr,
+    __gm__ uint8_t *beta_ptr,
+    __gm__ uint8_t *msk_lower_ptr,
+    __gm__ uint8_t *msk_full_ptr,
+    __gm__ uint8_t *minus_id_ptr,
+    __gm__ uint8_t *cu_seqlens_ptr,
+    __gm__ uint8_t *o_ptr,
+    __gm__ uint8_t *g_sum_ptr,
+    __gm__ uint8_t *g_t_ptr,
+    __gm__ uint8_t *beta_t_ptr,
+    __gm__ uint8_t *A_ptr,
+    __gm__ uint8_t *A_inv_f32_ptr,
+    __gm__ uint8_t *A_inv_ptr,
+    __gm__ uint8_t *w_ptr,
+    __gm__ uint8_t *u_ptr,
+    __gm__ uint8_t *s_ptr,
+    __gm__ uint8_t *v_new_ptr,
+    __gm__ uint8_t *fs_ptr,
+    __gm__ uint8_t *h0_ptr,
+    int64_t has_initial_state,
+    __gm__ uint8_t *kkt_ws_ptr,
+    __gm__ uint8_t *wy_ws_a1_ptr,
+    __gm__ uint8_t *wy_ws_a2_ptr,
+    __gm__ uint8_t *h_ws_ptr,
+    __gm__ uint8_t *o_ws_qk_ptr,
+    __gm__ uint8_t *o_ws_qs_ptr,
+    __gm__ uint8_t *o_ws_gated_ptr,
+    uint32_t num_heads,
+    uint32_t num_key_heads,
+    int64_t batch_size,
+    int64_t seq_len,
+    int64_t total_tokens,
+    uint32_t num_matrices,
+    uint64_t ffts_addr)
+{
+#define DISPATCH_MEGA_H(H)                                                                                         \
+    case H:                                                                                                        \
+        mega_kernel_impl<H>(q_ptr, k_ptr, v_ptr, g_in_ptr, beta_ptr, msk_lower_ptr, msk_full_ptr, minus_id_ptr,    \
+                            cu_seqlens_ptr, o_ptr, g_sum_ptr, g_t_ptr, beta_t_ptr, A_ptr, A_inv_f32_ptr, A_inv_ptr, \
+                            w_ptr, u_ptr, s_ptr, v_new_ptr, fs_ptr, h0_ptr, has_initial_state, kkt_ws_ptr,          \
+                            wy_ws_a1_ptr, wy_ws_a2_ptr, h_ws_ptr, o_ws_qk_ptr, o_ws_qs_ptr, o_ws_gated_ptr,         \
+                            num_key_heads, batch_size, seq_len, total_tokens, num_matrices, ffts_addr);            \
+        return
+
+    switch (num_heads) {
+        DISPATCH_MEGA_H(16);
+        DISPATCH_MEGA_H(24);
+        DISPATCH_MEGA_H(32);
+        DISPATCH_MEGA_H(48);
+        DISPATCH_MEGA_H(64);
+        default:
+            return;
+    }
+
+#undef DISPATCH_MEGA_H
 }
 
 extern "C" void call_kernel(
@@ -481,9 +554,13 @@ extern "C" void call_kernel(
     uint8_t *g_sum, uint8_t *g_t, uint8_t *beta_t,
     uint8_t *A, uint8_t *A_inv_f32, uint8_t *A_inv,
     uint8_t *w, uint8_t *u, uint8_t *s, uint8_t *v_new, uint8_t *fs,
+    uint8_t *h0,
+    int64_t has_initial_state,
     uint8_t *kkt_ws, uint8_t *wy_ws_a1, uint8_t *wy_ws_a2,
     uint8_t *h_ws,
     uint8_t *o_ws_qk, uint8_t *o_ws_qs, uint8_t *o_ws_gated,
+    uint32_t num_heads,
+    uint32_t num_key_heads,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
     uint32_t num_matrices)
 {
@@ -494,9 +571,10 @@ extern "C" void call_kernel(
         q, k, v, g_in, beta, msk_lower, msk_full, minus_id, cu_seqlens,
         o,
         g_sum, g_t, beta_t, A, A_inv_f32, A_inv,
-        w, u, s, v_new, fs,
+        w, u, s, v_new, fs, h0, has_initial_state,
         kkt_ws, wy_ws_a1, wy_ws_a2, h_ws,
         o_ws_qk, o_ws_qs, o_ws_gated,
+        num_heads, num_key_heads,
         batch_size, seq_len, total_tokens, num_matrices,
         fftsAddr);
 }
