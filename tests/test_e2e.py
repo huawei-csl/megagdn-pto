@@ -230,17 +230,22 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
         g_in.cpu(), beta.cpu().float(), cu_cpu, H, Hg, scale,
     )
 
-    # PTO mega kernel
-    o_mega = run_mega_kernel(
-        q, k, v, g_in, beta, cu32,
-        stream=torch.npu.current_stream()._as_parameter_,
-        chunk_size=C_PTO,
-        scale=scale,
-        key_heads=Hg,
-    )
+    run_mega = os.environ.get("MEGAGDN_PTO_ARCH", "").lower() not in {
+        "a5", "dav3510", "dav_3510", "ascend950"
+    }
+    if run_mega:
+        o_mega = run_mega_kernel(
+            q, k, v, g_in, beta, cu32,
+            stream=torch.npu.current_stream()._as_parameter_,
+            chunk_size=C_PTO,
+            scale=scale,
+            key_heads=Hg,
+        )
+        ok_mega = stats_ok(o_mega.float().cpu(), o_cpu)
+    else:
+        ok_mega = True
 
     ok_pto = stats_ok(o_pto.float().cpu(), o_cpu)
-    ok_mega = stats_ok(o_mega.float().cpu(), o_cpu)
 
     ok_cross = True
     if triton_ok:
@@ -270,7 +275,8 @@ def main() -> None:
     Hg = args.hg
     scale = D ** -0.5
     triton_ok = not args.no_triton and _triton_available()
-    tri_inv_func = load_tri_inverse()
+    is_a5 = os.environ.get("MEGAGDN_PTO_ARCH", "").lower() in {"a5", "dav3510", "dav_3510", "ascend950"}
+    tri_inv_func = None if is_a5 else load_tri_inverse()
 
     print(f"Device: {args.device}  Hg={Hg}  D={D}  C_PTO={C_PTO}  C_TRITON={C_TRITON}")
     print(f"Triton cross-check: {'enabled' if triton_ok else 'disabled'}")

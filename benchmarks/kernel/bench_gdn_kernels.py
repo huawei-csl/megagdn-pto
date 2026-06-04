@@ -77,6 +77,7 @@ import ctypes
 
 C_PTO = 128
 D = 128
+PTO_ONLY = True
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,8 @@ D = 128
 
 def _bench_npu(fn, warmup: int = 5, iters: int = 15) -> float:
     """Time an NPU function using Event pairs (ms)."""
+    warmup = int(os.getenv("GDN_BENCH_WARMUP", str(warmup)))
+    iters = int(os.getenv("GDN_BENCH_ITERS", str(iters)))
     starts = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.npu.Event(enable_timing=True) for _ in range(iters)]
     cache = torch.empty(256 * 1024 * 1024, dtype=torch.int8).npu()
@@ -133,6 +136,8 @@ def _ratio(ms_triton: float | None, ms_pto: float) -> str:
 # ---------------------------------------------------------------------------
 
 def _try_triton_cumsum(cu_seqlens, BT, dev, T, H) -> float | None:
+    if PTO_ONLY:
+        return None
     try:
         from fla_vendor.cumsum import chunk_local_cumsum
         from fla_vendor.utils import prepare_chunk_indices
@@ -148,6 +153,8 @@ def _try_triton_cumsum(cu_seqlens, BT, dev, T, H) -> float | None:
 
 
 def _try_triton_kkt(cu_seqlens, BT, dev, T, H, HG) -> float | None:
+    if PTO_ONLY:
+        return None
     try:
         from fla_vendor.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
         from fla_vendor.utils import prepare_chunk_indices
@@ -168,6 +175,8 @@ def _try_triton_kkt(cu_seqlens, BT, dev, T, H, HG) -> float | None:
 
 
 def _try_triton_solve_tril(cu_seqlens, BT, dev, T, H) -> float | None:
+    if PTO_ONLY:
+        return None
     if BT > 64:
         print(f"    [Triton solve_tril BT={BT}: not supported by Triton (max BT=64)]")
         return None
@@ -191,6 +200,8 @@ def _try_triton_solve_tril(cu_seqlens, BT, dev, T, H) -> float | None:
 
 
 def _try_triton_chunk_h(cu_seqlens, BT, dev, T, H, HG) -> float | None:
+    if PTO_ONLY:
+        return None
     # H=64 with BT=64 triggers an aicore exception on this NPU, corrupting device state.
     if H >= 64 and BT <= 64:
         print(f"    [Triton chunk_h BT={BT} H={H}: known aicore failure, skip]")
@@ -218,6 +229,8 @@ def _try_triton_chunk_h(cu_seqlens, BT, dev, T, H, HG) -> float | None:
 
 
 def _try_triton_wy_fast(cu_seqlens, BT, dev, T, H, HG) -> float | None:
+    if PTO_ONLY:
+        return None
     try:
         from fla_vendor.wy_fast import recompute_w_u_fwd
         from fla_vendor.utils import prepare_chunk_indices
@@ -239,6 +252,8 @@ def _try_triton_wy_fast(cu_seqlens, BT, dev, T, H, HG) -> float | None:
 
 
 def _try_triton_chunk_o(cu_seqlens, BT, dev, T, H, HG) -> float | None:
+    if PTO_ONLY:
+        return None
     # H=64 with BT=64 is a known aicore failure; skip to protect NPU state.
     if H >= 64 and BT <= 64:
         print(f"    [Triton chunk_o BT={BT} H={H}: known aicore failure, skip]")
@@ -335,10 +350,24 @@ def bench_solve_tril(H, T, cu_seqlens, dev, tri_inv):
     Reduce ``L_seg`` (e.g. 8192 for H≤16 full parity; 4096 for H≤32) to benchmark
     the Triton reference without grid overflow.
     """
-    _ = tri_inv  # preload contract shared with staged/mega callers
-
     A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16).tril(-1)
     cu32 = cu_seqlens.to(torch.int32)
+    if os.environ.get("MEGAGDN_PTO_ARCH", "").lower() in {"a5", "dav3510", "dav_3510", "ascend950"}:
+        out = torch.empty_like(A)
+
+        def run_solve_fallback():
+            solve_tril(A, cu32, C_PTO, H, tri_inv, out_fp16=out)
+
+        run_solve_fallback()
+        torch.npu.synchronize()
+        ms_pto = _bench_npu(run_solve_fallback, warmup=1, iters=3)
+        ms_t64 = _try_triton_solve_tril(cu_seqlens, 64, dev, T, H)
+        ms_t128 = None
+        _print_stage("solve_tril_torch_fallback", ms_pto, ms_t64, ms_t128)
+        return ms_pto, ms_t64, ms_t128
+
+    _ = tri_inv  # preload contract shared with staged/mega callers
+
     workspace_fp32 = torch.zeros_like(A, dtype=torch.float32)
     batch = int(cu32.numel()) - 1
     tc = total_chunks(batch, T, C_PTO, cu32)
@@ -367,7 +396,8 @@ def bench_solve_tril(H, T, cu_seqlens, dev, tri_inv):
     ms_pto = _bench_npu(run_tri_inverse_kernel)
     ms_t64 = _try_triton_solve_tril(cu_seqlens, 64, dev, T, H)
     ms_t128 = None  # BT=128 not supported by Triton (max BT=64)
-    print(f"    [Triton solve_tril BT=128: not supported (max BT=64)]")
+    if not PTO_ONLY:
+        print(f"    [Triton solve_tril BT=128: not supported (max BT=64)]")
     _print_stage("solve_tril", ms_pto, ms_t64, ms_t128)
     return ms_pto, ms_t64, ms_t128
 
@@ -541,6 +571,7 @@ def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global PTO_ONLY
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default=os.getenv("GDN_NPU_DEVICE", "npu:0"))
     parser.add_argument("--n-seq", type=int, default=None,
@@ -554,9 +585,12 @@ def main() -> None:
                         default="cumsum,kkt,solve_tril,wy_fast,chunk_h,chunk_o",
                         help="Comma-separated stages to benchmark.")
     parser.add_argument("--mega", action="store_true", help="Also benchmark mega-kernel.")
+    parser.add_argument("--with-triton-baseline", action="store_true",
+                        help="Also try Triton baselines. Off by default for the current A5 environment.")
     parser.add_argument("--output-json", default=None,
                         help="Save results as JSON to this path.")
     args = parser.parse_args()
+    PTO_ONLY = not args.with_triton_baseline
 
     torch.manual_seed(0)
     torch.npu.set_device(args.device)
@@ -575,7 +609,8 @@ def main() -> None:
     heads_list = [int(x) for x in args.H_list.split(",") if x.strip()]
     HG = args.hg
 
-    tri_inv_needed = args.mega or "solve_tril" in {s.strip() for s in args.stage.split(",")}
+    is_a5 = os.environ.get("MEGAGDN_PTO_ARCH", "").lower() in {"a5", "dav3510", "dav_3510", "ascend950"}
+    tri_inv_needed = args.mega or ("solve_tril" in {s.strip() for s in args.stage.split(",")} and not is_a5)
     tri_inv = load_tri_inverse() if tri_inv_needed else None
 
     print(f"Workload: N_seq={N_seq}  L_seg={L_seg}  T={T}  D={D}  C_PTO={C_PTO}  BLOCK_DIM={bd}")
@@ -593,6 +628,8 @@ def main() -> None:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "device": args.device,
             "N_seq": N_seq, "L_seg": L_seg, "D": D, "C_pto": C_PTO,
+            "pto_arch": os.environ.get("MEGAGDN_PTO_ARCH", "a5"),
+            "pto_only": PTO_ONLY,
             "results": all_results,
         }
         out_path.write_text(json.dumps(meta, indent=2))
