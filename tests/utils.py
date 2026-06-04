@@ -12,16 +12,7 @@ class NumericalAccuracy:
     atol: float = 1.5 * 1e-4
     # Frobenius norm-wise relative tolerance (average correct decimal digits).
     ftol: float = 1e-3
-    max_rmse_ratio: float = 0.05
-    min_r2: float = 0.99
     hard_fail_max: float = 1.0
-
-    def _r2(self, y_ref: torch.Tensor, y_pred: torch.Tensor) -> float:
-        ref = y_ref.detach().cpu().numpy().ravel().astype(np.float64)
-        pred = y_pred.detach().cpu().numpy().ravel().astype(np.float64)
-        ss_res = np.sum((ref - pred) ** 2)
-        ss_tot = np.sum((ref - np.mean(ref)) ** 2)
-        return float("nan") if ss_tot < 1e-30 else 1.0 - ss_res / ss_tot
 
     def stats_ok(
         self, actual: torch.Tensor, expected: torch.Tensor, chunk_size: int = 1
@@ -29,25 +20,25 @@ class NumericalAccuracy:
         adjusted_rtol = min(0.5, self.rtol * chunk_size)
 
         diff = (actual - expected).abs()
-        mx = diff.max().item()
-        if mx > self.hard_fail_max:
-            print(f"ERROR: mx fail: {mx} > {self.hard_fail_max}")
-            return False
-        bound = self.atol + adjusted_rtol * expected.abs()
-        f_err = torch.sqrt(torch.sum(diff**2) / torch.sum(expected**2))
-        if (diff <= bound).all():
-            return True
-        else:
+        max_abs_error = diff.max().item()
+        frob_rel_error = torch.sqrt(torch.sum(diff**2) / torch.sum(expected**2))
+        if max_abs_error > self.hard_fail_max:
             print(
-                f"ERROR: diff is greater than bound: {(diff/bound).max().item()}. ATOL={self.atol} -- RTOL={adjusted_rtol} -- F_ERR={f_err}"
+                f"ERROR: max_abs_error hard fail: {max_abs_error} > {self.hard_fail_max}"
             )
-        mean_abs = float(expected.float().flatten().abs().mean())
-        rmse = float(torch.sqrt((diff.float().flatten() ** 2).mean()))
-        ratio = rmse / max(mean_abs, 1e-15)
-        r2 = self._r2(expected, actual)
-        if mean_abs < 1e-9:
-            return rmse < 5e-4
-        return ratio <= self.max_rmse_ratio and np.isfinite(r2) and r2 >= self.min_r2
+            return False
+        rel_err_bound = self.atol + adjusted_rtol * expected.abs()
+        if (diff > rel_err_bound).all():
+            print(
+                f"ERROR: max relative error larger than the bound: {(diff).max().item()}. ATOL={self.atol} RTOL={adjusted_rtol}"
+            )
+            return False
+        if frob_rel_error > self.ftol:
+            print(
+                f"ERROR: large frobenius relative error: {frob_rel_error}. FTOL={self.ftol}"
+            )
+            return False
+        return True
 
 
 def generate_random_inputs(T, H, HG, D):

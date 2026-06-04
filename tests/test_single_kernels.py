@@ -22,13 +22,10 @@ import sys
 import time
 from dataclasses import dataclass
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 
 from megagdn_pto.fast_inverse import load_tri_inverse, solve_tril
 from megagdn_pto.kernel_libs import (
-    BLOCK_DIM,
     run_chunk_cumsum,
     run_chunk_h,
     run_chunk_o,
@@ -39,226 +36,14 @@ from megagdn_pto.kernel_libs import (
     transpose_gates,
 )
 from tests.utils import NumericalAccuracy, generate_random_inputs
+from tests.ref_gdn import RefGDN
 
 ACCURACY = NumericalAccuracy()
 
 C = 128  # PTO chunk size
 D = 128  # head dimension
 
-# ---------------------------------------------------------------------------
-# CPU Reference implementations
-# ---------------------------------------------------------------------------
-
-
-def _safe_exp(x: torch.Tensor) -> torch.Tensor:
-    return torch.where(x <= 0, torch.exp(x), torch.zeros_like(x))
-
-
-def _seq_ranges(T: int, cu_seqlens=None) -> list[tuple[int, int]]:
-    if cu_seqlens is None:
-        return [(0, T)]
-    cu = cu_seqlens.tolist() if hasattr(cu_seqlens, "tolist") else cu_seqlens
-    return [(cu[i], cu[i + 1]) for i in range(len(cu) - 1)]
-
-
-class RefGDN:
-    def __init__(self, dtype: torch.dtype):
-        self.dtype = dtype
-
-    def cumsum(self, g: torch.Tensor, cs: int, cu_seqlens=None) -> torch.Tensor:
-        """Chunk-local cumulative sum of gates (fp32)."""
-        B, T, H = g.shape
-        gf = g.to(self.dtype)
-        out = torch.zeros_like(gf, dtype=self.dtype)
-        for bos, eos in _seq_ranges(T, cu_seqlens):
-            for j in range(0, eos - bos, cs):
-                s, e = bos + j, min(bos + j + cs, eos)
-                out[:, s:e, :] = gf[:, s:e, :].cumsum(dim=1)
-        return out
-
-    def solve_tril(self, A: torch.Tensor, cs: int, cu_seqlens=None) -> torch.Tensor:
-        """CPU reference for solve_tril: computes (I + A)^{-1} per chunk submatrix.
-
-        A is strictly lower triangular [B, T, H, cs] (PTO convention).
-        """
-        B, T, H, _ = A.shape
-        out = torch.zeros(B, T, H, cs, dtype=self.dtype)
-        Af = A.to(self.dtype)
-        for bos, eos in _seq_ranges(T, cu_seqlens):
-            for j in range(0, eos - bos, cs):
-                s, e = bos + j, min(bos + j + cs, eos)
-                v = e - s
-                for h in range(H):
-                    Ac = Af[0, s:e, h, :v]  # [v, v], strictly lower triangular
-                    # inv = torch.linalg.inv(torch.eye(v) + Ac)
-                    M = np.linalg.inv((np.identity(v) + Ac.numpy()).astype(np.double))
-                    inv = torch.from_numpy(M)
-                    out[0, s:e, h, :v] = inv.to(self.dtype)
-        return out
-
-    def kkt(
-        self,
-        k: torch.Tensor,
-        beta: torch.Tensor,
-        g_cumsum: torch.Tensor,
-        cs: int,
-        cu_seqlens=None,
-    ) -> torch.Tensor:
-        """CPU reference for scaled_dot_kkt (GQA: k has Hg heads, beta/g have H heads)."""
-        B, T, Hg, Dd = k.shape
-        H = beta.shape[2]
-        grp = H // Hg
-        out = torch.zeros(B, T, H, cs, dtype=self.dtype)
-        kf, bf, gf = k.to(self.dtype), beta.to(self.dtype), g_cumsum.to(self.dtype)
-        for bos, eos in _seq_ranges(T, cu_seqlens):
-            for j in range(0, eos - bos, cs):
-                s, e = bos + j, min(bos + j + cs, eos)
-                v = e - s
-                for h in range(H):
-                    hg = h // grp
-                    kc, gc = kf[0, s:e, hg, :], gf[0, s:e, h]
-                    blk = (
-                        (kc @ kc.T)
-                        * _safe_exp(gc[:, None] - gc[None, :])
-                        * bf[0, s:e, h, None]
-                    )
-                    mask = torch.arange(v)[:, None] > torch.arange(v)[None, :]
-                    out[0, s:e, h, :v] = blk * mask.to(self.dtype)
-        return out
-
-    def chunk_h(
-        self,
-        k: torch.Tensor,
-        w: torch.Tensor,
-        u: torch.Tensor,
-        g_cumsum: torch.Tensor,
-        cs: int,
-        cu_seqlens=None,
-    ):
-        """CPU reference for chunk_h: states S, v_new, final states."""
-        B, T, Hg, Dd = k.shape
-        H = w.shape[2]
-        grp = H // Hg
-        kf, wf, uf, gf = (
-            k.to(self.dtype),
-            w.to(self.dtype),
-            u.to(self.dtype),
-            g_cumsum.to(self.dtype),
-        )
-        ranges = _seq_ranges(T, cu_seqlens)
-        tc = total_chunks(
-            len(ranges), T, cs, torch.tensor(cu_seqlens) if cu_seqlens else None
-        )
-        h_out = torch.zeros(tc, H, Dd, Dd, dtype=self.dtype)
-        v_new = torch.zeros_like(uf)
-        final = torch.zeros(len(ranges), H, Dd, Dd, dtype=self.dtype)
-        ci_base = 0
-        for si, (bos, eos) in enumerate(ranges):
-            nc = (eos - bos + cs - 1) // cs
-            for h in range(H):
-                hg = h // grp
-                S = torch.zeros(Dd, Dd, dtype=self.dtype)
-                for ci in range(nc):
-                    s, e = bos + ci * cs, min(bos + (ci + 1) * cs, eos)
-                    gc = gf[0, s:e, h]
-                    gl = gc[e - s - 1]
-                    h_out[ci_base + ci, h] = S.clone()
-                    vc = uf[0, s:e, h, :] - wf[0, s:e, h, :] @ S
-                    v_new[0, s:e, h, :] = vc
-                    kv = kf[0, s:e, hg, :].T @ (vc * torch.exp(gl - gc)[:, None])
-                    S = torch.exp(gl) * S + kv
-                final[si, h] = S
-            ci_base += nc
-        return h_out, v_new, final
-
-    def wy_fast(
-        self,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        beta: torch.Tensor,
-        A_inv: torch.Tensor,
-        g_cumsum: torch.Tensor,
-        cs: int,
-        cu_seqlens=None,
-    ):
-        """CPU reference for wy_fast."""
-        B, T, Hg, Kd = k.shape
-        H = v.shape[2]
-        grp = H // Hg
-        w = torch.zeros(B, T, H, Kd, dtype=self.dtype)
-        u = torch.zeros(B, T, H, v.shape[-1], dtype=self.dtype)
-        kf, vf, bf, Af, gf = (
-            k.to(dtype=self.dtype),
-            v.to(dtype=self.dtype),
-            beta.to(dtype=self.dtype),
-            A_inv.to(dtype=self.dtype),
-            g_cumsum.to(dtype=self.dtype),
-        )
-        for bos, eos in _seq_ranges(T, cu_seqlens):
-            for j in range(0, eos - bos, cs):
-                s, e = bos + j, min(bos + j + cs, eos)
-                valid = e - s
-                for h in range(H):
-                    hg = h // grp
-                    Ab = Af[0, s:e, h, :valid]
-                    gc = gf[0, s:e, h]
-                    vb = vf[0, s:e, h, :] * bf[0, s:e, h, None]
-                    kb = (
-                        kf[0, s:e, hg, :] * bf[0, s:e, h, None] * torch.exp(gc)[:, None]
-                    )
-                    u[0, s:e, h, :] = Ab @ vb
-                    w[0, s:e, h, :] = Ab @ kb
-        return w, u
-
-    def chunk_o(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v_new: torch.Tensor,
-        h_states: torch.Tensor,
-        g_cumsum: torch.Tensor,
-        cs: int,
-        cu_seqlens=None,
-    ) -> torch.Tensor:
-        """CPU reference for chunk_o (PTO gating convention: min(Δg, 0))."""
-        B, T, Hg, Dd = q.shape
-        H = v_new.shape[2]
-        grp = H // Hg
-        qf, kf, vf, hf, gf = (
-            q.to(self.dtype),
-            k.to(self.dtype),
-            v_new.to(self.dtype),
-            h_states.to(self.dtype),
-            g_cumsum.to(self.dtype),
-        )
-        o = torch.zeros(B, T, H, Dd, dtype=self.dtype)
-        ranges = _seq_ranges(T, cu_seqlens)
-        ci_base = 0
-        for bos, eos in ranges:
-            nc = (eos - bos + cs - 1) // cs
-            for h in range(H):
-                hg = h // grp
-                for ci in range(nc):
-                    s, e = bos + ci * cs, min(bos + (ci + 1) * cs, eos)
-                    vlen = e - s
-                    qc, kc, vc, gc = (
-                        qf[0, s:e, hg, :],
-                        kf[0, s:e, hg, :],
-                        vf[0, s:e, h, :],
-                        gf[0, s:e, h],
-                    )
-                    inter = (qc @ hf[ci_base + ci, h]) * torch.exp(gc)[:, None]
-                    qk = qc @ kc.T
-                    causal = torch.arange(vlen)[:, None] >= torch.arange(vlen)[None, :]
-                    gate = torch.exp(
-                        torch.minimum(
-                            gc[:, None] - gc[None, :], torch.zeros(vlen, vlen)
-                        )
-                    )
-                    o[0, s:e, h, :] = inter + (qk * gate * causal.to(self.dtype)) @ vc
-            ci_base += nc
-        return o
-
+torch.manual_seed(42)
 
 # ---------------------------------------------------------------------------
 # Test cases
@@ -338,31 +123,31 @@ def build_test_cases() -> list[TestCase]:
 
 def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-    ref_cumsum = tc.ref_gdn.cumsum
-    ref_kkt = tc.ref_gdn.kkt
+
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
         else None
     )
     N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
-    torch.manual_seed(42)
-    k = F.normalize(
-        torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2
+    _, k, _, beta, g_in = generate_random_inputs(T, H, HG, D)
+
+    g_sum = tc.ref_gdn.cumsum(g_in, C, tc.cu_seqlens_list).to(g_in.dtype)
+    k_npu, beta_npu, g_sum_npu = (
+        k.to(torch.float16).to(dev),
+        beta.to(torch.float16).to(dev),
+        g_sum.to(torch.float32).to(dev),
     )
-    beta = torch.rand(1, T, H, device=dev, dtype=torch.float16)
-    g_in = F.logsigmoid(torch.randn(1, T, H, device=dev, dtype=torch.float32))
-    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(g_in.dtype).to(dev)
-    g_t, beta_t = transpose_gates(g_sum), transpose_beta(beta)
-    msk = torch.tril(torch.ones(C, C, device=dev), diagonal=-1).float()
+    g_t, beta_t = transpose_gates(g_sum_npu), transpose_beta(beta_npu)
+    mask = torch.tril(torch.ones(C, C, device=dev, dtype=torch.float32), diagonal=-1)
     A_out = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
     stream = torch.npu.current_stream()._as_parameter_
     torch.npu.synchronize()
     run_scaled_dot_kkt(
-        k,
-        beta,
-        g_sum,
-        msk,
+        k_npu,
+        beta_npu,
+        g_sum_npu,
+        mask,
         A_out,
         stream=stream,
         g_t=g_t,
@@ -373,17 +158,34 @@ def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         key_heads=HG,
     )
     torch.npu.synchronize()
-    ref = ref_kkt(k.cpu(), beta.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
+    ref = tc.ref_gdn.kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
 
     return ACCURACY.stats_ok(A_out.cpu().to(tc.dtype), ref.to(tc.dtype), chunk_size=C)
 
 
+def test_solve_tril(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
+    T = tc.T
+
+    cu = (
+        torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
+        if tc.cu_seqlens_list
+        else None
+    )
+    _, k, _, beta, g_in = generate_random_inputs(T, H, HG, D)
+    g_sum = tc.ref_gdn.cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(tc.dtype)
+    A_raw = tc.ref_gdn.kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
+
+    A_dev = A_raw.to(torch.float16).to(dev)
+    tri_inv = load_tri_inverse()
+    A_inv = solve_tril(A_dev, cu, C, H, tri_inv)
+    torch.npu.synchronize()
+    ref = tc.ref_gdn.solve_tril(A_dev.cpu(), C, tc.cu_seqlens_list)
+    return ACCURACY.stats_ok(A_inv.cpu().to(tc.dtype), ref.to(tc.dtype), chunk_size=C)
+
+
 def test_wy_fast(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-    ref_cumsum = tc.ref_gdn.cumsum
-    ref_wy_fast = tc.ref_gdn.wy_fast
-    ref_solve_tril = tc.ref_gdn.solve_tril
-    ref_kkt = tc.ref_gdn.kkt
+
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
@@ -391,11 +193,10 @@ def test_wy_fast(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     )
     N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
 
-    torch.manual_seed(42)
     _, k, v, beta, g_in = generate_random_inputs(T, H, HG, D)
-    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list)
-    A = ref_kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
-    A_inv = ref_solve_tril(A, C, tc.cu_seqlens_list)
+    g_sum = tc.ref_gdn.cumsum(g_in.cpu(), C, tc.cu_seqlens_list)
+    A = tc.ref_gdn.kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
+    A_inv = tc.ref_gdn.solve_tril(A, C, tc.cu_seqlens_list)
     stream = torch.npu.current_stream()._as_parameter_
 
     k_npu, v_npu, beta_npu, g_sum_npu, A_inv_npu = (
@@ -426,7 +227,7 @@ def test_wy_fast(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         key_heads=HG,
     )
     torch.npu.synchronize()
-    w_ref, u_ref = ref_wy_fast(k, v, beta, A_inv, g_sum, C, tc.cu_seqlens_list)
+    w_ref, u_ref = tc.ref_gdn.wy_fast(k, v, beta, A_inv, g_sum, C, tc.cu_seqlens_list)
     return ACCURACY.stats_ok(
         w_out.cpu().to(tc.dtype), w_ref.to(tc.dtype), chunk_size=C
     ) and ACCURACY.stats_ok(u_out.cpu().to(tc.dtype), u_ref.to(tc.dtype), chunk_size=C)
@@ -434,11 +235,7 @@ def test_wy_fast(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
 
 def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-    ref_cumsum = tc.ref_gdn.cumsum
-    ref_wy_fast = tc.ref_gdn.wy_fast
-    ref_solve_tril = tc.ref_gdn.solve_tril
-    ref_kkt = tc.ref_gdn.kkt
-    ref_chunk_h = tc.ref_gdn.chunk_h
+
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
@@ -446,12 +243,11 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     )
     N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
 
-    torch.manual_seed(42)
     _, k, v, beta, g_in = generate_random_inputs(T, H, HG, D)
-    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list)
-    A = ref_kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
-    A_inv = ref_solve_tril(A, C, tc.cu_seqlens_list)
-    w, u = ref_wy_fast(k, v, beta, A_inv, g_sum, C, tc.cu_seqlens_list)
+    g_sum = tc.ref_gdn.cumsum(g_in.cpu(), C, tc.cu_seqlens_list)
+    A = tc.ref_gdn.kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
+    A_inv = tc.ref_gdn.solve_tril(A, C, tc.cu_seqlens_list)
+    w, u = tc.ref_gdn.wy_fast(k, v, beta, A_inv, g_sum, C, tc.cu_seqlens_list)
     stream = torch.npu.current_stream()._as_parameter_
 
     k_npu, g_sum_npu, w_npu, u_npu = (
@@ -462,7 +258,6 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     )
     g_t = transpose_gates(g_sum_npu)
 
-    stream = torch.npu.current_stream()._as_parameter_
     tc_n = total_chunks(N_seq, T, C, cu)
     h_out = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
     v_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
@@ -483,7 +278,7 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         key_heads=HG,
     )
     torch.npu.synchronize()
-    h_ref, v_ref, _ = ref_chunk_h(
+    h_ref, v_ref, _ = tc.ref_gdn.chunk_h(
         k, w.to(torch.float16), u.to(torch.float16), g_sum, C, tc.cu_seqlens_list
     )
     ok_h = ACCURACY.stats_ok(
@@ -495,12 +290,7 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
 
 def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-    ref_cumsum = tc.ref_gdn.cumsum
-    ref_wy_fast = tc.ref_gdn.wy_fast
-    ref_solve_tril = tc.ref_gdn.solve_tril
-    ref_kkt = tc.ref_gdn.kkt
-    ref_chunk_h = tc.ref_gdn.chunk_h
-    ref_chunk_o = tc.ref_gdn.chunk_o
+
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
@@ -508,13 +298,12 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     )
     N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
 
-    torch.manual_seed(42)
     q, k, v, beta, g_in = generate_random_inputs(T, H, HG, D)
-    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list)
-    A = ref_kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
-    A_inv = ref_solve_tril(A, C, tc.cu_seqlens_list)
-    w, u = ref_wy_fast(k, v, beta, A_inv, g_sum, C, tc.cu_seqlens_list)
-    h_states, v_new, _ = ref_chunk_h(k, w, u, g_sum, C, tc.cu_seqlens_list)
+    g_sum = tc.ref_gdn.cumsum(g_in.cpu(), C, tc.cu_seqlens_list)
+    A = tc.ref_gdn.kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
+    A_inv = tc.ref_gdn.solve_tril(A, C, tc.cu_seqlens_list)
+    w, u = tc.ref_gdn.wy_fast(k, v, beta, A_inv, g_sum, C, tc.cu_seqlens_list)
+    h_states, v_new, _ = tc.ref_gdn.chunk_h(k, w, u, g_sum, C, tc.cu_seqlens_list)
 
     stream = torch.npu.current_stream()._as_parameter_
 
@@ -526,7 +315,7 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         h_states.to(torch.float16).npu(),
     )
 
-    o_ref = ref_chunk_o(
+    o_ref = tc.ref_gdn.chunk_o(
         q_npu.cpu(),
         k_npu.cpu(),
         v_new_npu.cpu(),
@@ -560,14 +349,14 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
 
 def test_cumsum(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
-    ref_cumsum = tc.ref_gdn.cumsum
+
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
         else None
     )
     N_seq = len(tc.cu_seqlens_list) - 1 if tc.cu_seqlens_list else 1
-    torch.manual_seed(42)
+
     g = torch.randn(1, T, H, device=dev, dtype=torch.float32)
     g_sum = torch.empty_like(g)
     stream = torch.npu.current_stream()._as_parameter_
@@ -575,33 +364,8 @@ def test_cumsum(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
         g, g_sum, stream=stream, chunk_size=C, cu_seqlens=cu, batch_size_override=N_seq
     )
     torch.npu.synchronize()
-    ref = ref_cumsum(g.cpu(), C, tc.cu_seqlens_list)
+    ref = tc.ref_gdn.cumsum(g.cpu(), C, tc.cu_seqlens_list)
     return ACCURACY.stats_ok(g_sum.cpu().to(tc.dtype), ref.to(tc.dtype))
-
-
-def test_solve_tril(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
-    T = tc.T
-    ref_solve_tril = tc.ref_gdn.solve_tril
-    ref_cumsum = tc.ref_gdn.cumsum
-    ref_kkt = tc.ref_gdn.kkt
-    cu = (
-        torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
-        if tc.cu_seqlens_list
-        else None
-    )
-    torch.manual_seed(42)
-    k = F.normalize(torch.randn(1, T, HG, D, dtype=tc.dtype), dim=-1, p=2)
-    beta = torch.rand(1, T, H, dtype=tc.dtype)
-    g_in = F.logsigmoid(torch.randn(1, T, H, dtype=tc.dtype))
-    g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(tc.dtype)
-    A_raw = ref_kkt(k, beta, g_sum, C, tc.cu_seqlens_list)
-
-    A_dev = A_raw.to(torch.float16).to(dev)
-    tri_inv = load_tri_inverse()
-    A_inv = solve_tril(A_dev, cu, C, H, tri_inv)
-    torch.npu.synchronize()
-    ref = ref_solve_tril(A_dev.cpu(), C, tc.cu_seqlens_list)
-    return ACCURACY.stats_ok(A_inv.cpu().to(tc.dtype), ref.to(tc.dtype), chunk_size=C)
 
 
 _STAGES = {
