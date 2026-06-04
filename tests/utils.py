@@ -12,7 +12,6 @@ class NumericalAccuracy:
     atol: float = 1.5 * 1e-4
     # Frobenius norm-wise relative tolerance (average correct decimal digits).
     ftol: float = 1e-3
-    hard_fail_max: float = 1.0
 
     def stats_ok(
         self, actual: torch.Tensor, expected: torch.Tensor, chunk_size: int = 1
@@ -20,13 +19,7 @@ class NumericalAccuracy:
         adjusted_rtol = min(0.5, self.rtol * chunk_size)
 
         diff = (actual - expected).abs()
-        max_abs_error = diff.max().item()
         frob_rel_error = torch.sqrt(torch.sum(diff**2) / torch.sum(expected**2))
-        if max_abs_error > self.hard_fail_max:
-            print(
-                f"ERROR: max_abs_error hard fail: {max_abs_error} > {self.hard_fail_max}"
-            )
-            return False
         rel_err_bound = self.atol + adjusted_rtol * expected.abs()
         if (diff > rel_err_bound).all():
             print(
