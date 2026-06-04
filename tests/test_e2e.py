@@ -37,6 +37,7 @@ if _TRITON_BASELINE not in sys.path:
 from megagdn_pto.fast_inverse import load_tri_inverse, solve_tril
 from megagdn_pto.kernel_libs import (
     BLOCK_DIM,
+    run_chunk_cumsum,
     run_chunk_h,
     run_chunk_o,
     run_scaled_dot_kkt,
@@ -45,17 +46,9 @@ from megagdn_pto.kernel_libs import (
     transpose_beta,
     transpose_gates,
 )
-from tests.test_single_kernels import (
-    ref_solve_tril,
-    ref_chunk_h,
-    ref_chunk_o,
-    ref_cumsum,
-    ref_kkt,
-    ref_wy,
-    _seq_ranges,
-    stats_ok,
-)
+from tests.ref_gdn import RefGDN
 from megagdn_pto.mega_kernel import run_mega_kernel
+from tests.utils import NumericalAccuracy
 
 C_PTO = 128
 C_TRITON = 64
@@ -66,26 +59,7 @@ MAX_RMSE_CROSS = 0.02
 MIN_R2_CROSS = 0.999
 MIN_PEARSON_CROSS = 0.999
 
-
-# ---------------------------------------------------------------------------
-# Full CPU reference pipeline
-# ---------------------------------------------------------------------------
-
-
-def cpu_pipeline(q, k, v, g_in, beta, cu_seqlens_list, H, Hg, scale=1.0):
-    """Complete CPU fp32 reference for the GDN pipeline."""
-    cu = cu_seqlens_list
-    g_sum = ref_cumsum(g_in, C_PTO, cu)
-    A = ref_kkt(k, beta, g_sum, C_PTO, cu)
-    A_inv = ref_solve_tril(A.float(), C_PTO, cu).to(torch.float32)
-    w, u = ref_wy(k, v, beta, A_inv, g_sum, C_PTO, cu)
-    _, v_new, _ = ref_chunk_h(k, w.float(), u.float(), g_sum, C_PTO, cu)
-    N_seq = 1 if cu is None else len(cu) - 1
-    tc = total_chunks(N_seq, q.shape[1], C_PTO, torch.tensor(cu) if cu else None)
-    _, _, h_states_list = ref_chunk_h(k, w.float(), u.float(), g_sum, C_PTO, cu)
-    h_states, v_new, _ = ref_chunk_h(k, w.float(), u.float(), g_sum, C_PTO, cu)
-    o = ref_chunk_o(q, k, v_new.float(), h_states, g_sum, C_PTO, cu)
-    return (o * scale).float()
+ACCURACY = NumericalAccuracy()
 
 
 # ---------------------------------------------------------------------------
@@ -104,8 +78,16 @@ def pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale=1.0, tri_inv_func=None)
     if tri_inv_func is None:
         tri_inv_func = load_tri_inverse()
 
-    # 1. Cumsum (CPU reference, exact match with PTO)
-    g_sum = ref_cumsum(g_in.cpu(), C_PTO, cu_cpu).to(dev)
+    # 1. Cumsum
+    g_sum = torch.empty_like(g_in)
+    run_chunk_cumsum(
+        g_in,
+        g_sum,
+        stream=stream,
+        chunk_size=C_PTO,
+        cu_seqlens=cu32,
+        batch_size_override=N_seq,
+    )
     g_t = transpose_gates(g_sum)
     beta_t = transpose_beta(beta)
 
@@ -284,12 +266,13 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
     o_pto = pto_pipeline(q, k, v, g_in, beta, cu32, H, Hg, scale, tri_inv_func)
 
     # CPU reference pipeline
-    o_cpu = cpu_pipeline(
-        q.cpu().float(),
-        k.cpu().float(),
-        v.cpu().float(),
+    cpu_ref_gdn = RefGDN(torch.double)
+    o_cpu = cpu_ref_gdn.run_full_pipeline(
+        q.cpu(),
+        k.cpu(),
+        v.cpu(),
         g_in.cpu(),
-        beta.cpu().float(),
+        beta.cpu(),
         cu_cpu,
         H,
         Hg,
@@ -310,8 +293,8 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
         key_heads=Hg,
     )
 
-    ok_pto = stats_ok(o_pto.float().cpu(), o_cpu)
-    ok_mega = stats_ok(o_mega.float().cpu(), o_cpu)
+    ok_pto = ACCURACY.stats_ok(o_pto.double().cpu(), o_cpu.double())
+    ok_mega = ACCURACY.stats_ok(o_mega.double().cpu(), o_cpu.double())
 
     ok_cross = True
     if triton_ok:
@@ -323,7 +306,7 @@ def run_one(T_or_cu, T_total, H, Hg, dev, scale, tri_inv_func, triton_ok):
             print(f"    [Triton skipped: {str(e).split(chr(10))[0][:80]}]")
             ok_cross = True  # not a failure, triton may not support all shapes
 
-    return ok_pto and ok_cross and ok_mega, label, ok_pto, ok_cross, ok_mega
+    return (ok_pto and ok_cross and ok_mega), label, ok_pto, ok_cross, ok_mega
 
 
 def main() -> None:
