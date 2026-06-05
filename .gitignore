@@ -10,6 +10,13 @@ build/
 
 # Compiled kernel binaries (rebuilt on demand)
 kernels/pto/compiled_lib/*.so
+kernels/pto_a5/compiled_lib/*.so
+
+# A5 simulator outputs (cannsim is very verbose)
+benchmarks/a5_sim/outputs/
+benchmarks/a5_sim/cannsim*.log
+benchmarks/a5_sim/cannsim_*/
+benchmarks/a5_sim/log_ca/
 
 # Benchmark outputs (tracked separately after generation)
 outputs/data/smoke_*/

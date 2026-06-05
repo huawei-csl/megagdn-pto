@@ -213,6 +213,7 @@ def run_scaled_dot_kkt(
     batch_size_override: int | None = None,
     block_dim: int | None = None,
     key_heads: int | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     """Compute gated intra-chunk attention matrix A ``[B,T,H,C]``.
 
@@ -225,7 +226,10 @@ def run_scaled_dot_kkt(
     batch = k.shape[0] if batch_size_override is None else batch_size_override
     cu32 = _ensure_int32(cu_seqlens)
     T = g_sum.shape[1]
-    ws = torch.zeros(bd * 2, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
+    if workspace is None:
+        ws = torch.zeros(bd * 2, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
+    else:
+        ws = workspace
     lib = load_scaled_dot_kkt(H, k.shape[3], chunk_size, key_heads=kh)
     lib.call_kernel(
         bd, stream,
@@ -276,6 +280,8 @@ def run_wy_fast(
     batch_size_override: int | None = None,
     block_dim: int | None = None,
     key_heads: int | None = None,
+    workspace_a1: torch.Tensor | None = None,
+    workspace_a2: torch.Tensor | None = None,
 ) -> None:
     """Compute W-Y decomposition vectors w, u.
 
@@ -288,8 +294,14 @@ def run_wy_fast(
     batch = k.shape[0] if batch_size_override is None else batch_size_override
     cu32 = _ensure_int32(cu_seqlens)
     T = g_sum.shape[1]
-    ws_a1 = torch.zeros(bd, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
-    ws_a2 = torch.zeros_like(ws_a1)
+    if workspace_a1 is None:
+        ws_a1 = torch.zeros(bd, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
+    else:
+        ws_a1 = workspace_a1
+    if workspace_a2 is None:
+        ws_a2 = torch.zeros_like(ws_a1)
+    else:
+        ws_a2 = workspace_a2
     lib = load_wy_fast(H, k.shape[3], chunk_size, key_heads=kh)
     lib.call_kernel(
         bd, stream,
@@ -340,6 +352,7 @@ def run_chunk_h(
     batch_size_override: int | None = None,
     block_dim: int | None = None,
     key_heads: int | None = None,
+    workspace: torch.Tensor | None = None,
 ) -> None:
     """Compute chunk states S and per-token v_new (de-interfered values).
 
