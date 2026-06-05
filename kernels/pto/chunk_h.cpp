@@ -94,6 +94,14 @@
 #include <runtime/rt_ffts.h>
 using namespace pto;
 
+#ifndef GDN_D
+#define GDN_D 128
+#endif
+
+#ifndef GDN_C
+#define GDN_C 128
+#endif
+
 #ifdef __CCE_AICORE__
 
 namespace {
@@ -286,7 +294,7 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 
 #endif
 
-template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
+template <int32_t HiddenSize, int32_t ChunkSize>
 AICORE void chunk_h_kernel(
     __gm__ half *K_handle, __gm__ half *W_handle, __gm__ half *U_handle,
     __gm__ float *G_handle,
@@ -297,6 +305,7 @@ AICORE void chunk_h_kernel(
     __gm__ half *workspace_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads,
     uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
@@ -327,12 +336,12 @@ AICORE void chunk_h_kernel(
 
   constexpr int32_t D = HiddenSize;
   constexpr int32_t C = ChunkSize;
-  constexpr int32_t H = NumHeads;
+  const int32_t H = static_cast<int32_t>(num_heads);
   const int32_t Hg = static_cast<int32_t>(num_key_heads);
-  if (Hg <= 0 || (H % Hg) != 0) return;
+  if (H <= 0 || Hg <= 0 || (H % Hg) != 0) return;
   const int32_t GROUP = H / Hg;
   constexpr int32_t HalfC = C / 2;
-  constexpr int32_t BSND_QKV_STRIDE = H * D;
+  const int32_t BSND_QKV_STRIDE = H * D;
   const int32_t BSND_K_STRIDE = Hg * D;
   constexpr int32_t DD = D * D;
 
@@ -356,8 +365,8 @@ AICORE void chunk_h_kernel(
   TASSIGN(kv_l0, C * D * sizeof(float));
 
   constexpr int32_t G_BLOCK_UB = 0;
-  // Leading UB scratch: legacy kernels used ``C * NumHeads * sizeof(float)``, which overflows UB when
-  // ``NumHeads`` is 32/48/64. Keep the same slack as the historical ``GDN_H=16`` build (8192 bytes).
+  // Leading UB scratch: legacy kernels used ``C * H * sizeof(float)``, which overflows UB when
+  // Keep the same slack as the historical H=16 build (8192 bytes).
   constexpr int32_t ZERO_UB =
       ChunkSize * 16 * static_cast<int32_t>(sizeof(float));
   constexpr int32_t S_UB = ZERO_UB + 64 * sizeof(float);
@@ -906,10 +915,6 @@ AICORE void chunk_h_kernel(
 #endif
 }
 
-#ifndef GDN_HG
-#define GDN_HG GDN_H
-#endif
-
 extern "C" __global__ AICORE void launch_chunk_h(
     __gm__ uint8_t *K, __gm__ uint8_t *W, __gm__ uint8_t *U,
     __gm__ uint8_t *G,
@@ -920,10 +925,11 @@ extern "C" __global__ AICORE void launch_chunk_h(
     __gm__ uint8_t *workspace,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads,
     uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
-  chunk_h_kernel<GDN_H, GDN_D, GDN_C>(
+  chunk_h_kernel<GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(K),
       reinterpret_cast<__gm__ half *>(W),
       reinterpret_cast<__gm__ half *>(U),
@@ -932,11 +938,10 @@ extern "C" __global__ AICORE void launch_chunk_h(
       reinterpret_cast<__gm__ half *>(V),
       reinterpret_cast<__gm__ half *>(FS),
       reinterpret_cast<__gm__ half *>(H0),
-      has_initial_state,
-      output_final_state,
+      has_initial_state, output_final_state,
       reinterpret_cast<__gm__ half *>(workspace),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
+      batch_size, seq_len, total_tokens, num_heads, num_key_heads, ffts_addr);
 }
 
 extern "C" void call_kernel(
@@ -949,6 +954,7 @@ extern "C" void call_kernel(
     uint8_t *workspace,
     uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads,
     uint32_t num_key_heads)
 {
   uint32_t fftsLen{0};
@@ -956,5 +962,5 @@ extern "C" void call_kernel(
   rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
   launch_chunk_h<<<block_dim, nullptr, stream>>>(
       K, W, U, G, S, V, FS, H0, has_initial_state, output_final_state, workspace, cu_seqlens,
-      batch_size, seq_len, total_tokens, num_key_heads, fftsAddr);
+      batch_size, seq_len, total_tokens, num_heads, num_key_heads, fftsAddr);
 }

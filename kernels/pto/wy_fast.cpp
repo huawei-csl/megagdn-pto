@@ -57,14 +57,6 @@
 #include <type_traits>
 using namespace pto;
 
-#ifndef GDN_H
-#define GDN_H 16
-#endif
-
-#ifndef GDN_HG
-#define GDN_HG GDN_H
-#endif
-
 #ifndef GDN_D
 #define GDN_D 128
 #endif
@@ -263,7 +255,7 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 
 #endif
 
-template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
+template <int32_t HiddenSize, int32_t ChunkSize>
 AICORE void wy_fast_kernel(
     __gm__ half *K_handle, __gm__ half *V_handle,
     __gm__ half *Beta_handle, __gm__ float *G_handle,
@@ -272,6 +264,7 @@ AICORE void wy_fast_kernel(
     __gm__ half *W_handle, __gm__ half *U_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads,
     uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
@@ -300,15 +293,12 @@ AICORE void wy_fast_kernel(
   constexpr uint32_t KTail =
       (HiddenSize % 128 == 0) ? 128 : (HiddenSize % 128);
 
-  constexpr int32_t H = NumHeads;
+  const int32_t H = static_cast<int32_t>(num_heads);
   const int32_t Hg = static_cast<int32_t>(num_key_heads);
-  if (Hg <= 0 || (H % Hg) != 0) return;
+  if (H <= 0 || Hg <= 0 || (H % Hg) != 0) return;
   const int32_t GROUP = H / Hg;
-  constexpr int32_t BSND_V_STRIDE = H * HiddenSize;
+  const int32_t BSND_V_STRIDE = H * HiddenSize;
   const int32_t BSND_QK_STRIDE = Hg * HiddenSize;
-
-  constexpr int32_t GHeadTileCols = ((NumHeads + 7) / 8) * 8;
-  constexpr int32_t BetaHeadTileCols = ((NumHeads + 15) / 16) * 16;
 
   constexpr int32_t BetaHalfUbAddr = 0;
   constexpr int32_t A1HalfUbAddr   = 256;
@@ -391,7 +381,7 @@ AICORE void wy_fast_kernel(
   int64_t total_work = 0;
   if (cu_seqlens == nullptr) {
     int64_t chunks_per_seq = (seq_len + ChunkSize - 1) / ChunkSize;
-    total_work = num_seqs * chunks_per_seq * NumHeads;
+    total_work = num_seqs * chunks_per_seq * H;
   }
 
 #if defined(__DAV_C220_VEC__)
@@ -409,7 +399,7 @@ AICORE void wy_fast_kernel(
       int64_t nc = (slen + ChunkSize - 1) / ChunkSize;
 
       for (int64_t ci = 0; ci < nc; ++ci) {
-        for (int32_t head_idx = 0; head_idx < NumHeads; ++head_idx) {
+        for (int32_t head_idx = 0; head_idx < H; ++head_idx) {
           if (gi % static_cast<int64_t>(block_num) ==
               static_cast<int64_t>(cid)) {
             int64_t chunk_start = ci * ChunkSize;
@@ -451,11 +441,11 @@ AICORE void wy_fast_kernel(
             if (local_rows > 0) {
               int64_t a_gm_offset =
                   ((chunk_token_start +
-                    static_cast<int64_t>(vid) * HalfChunk) *
-                   NumHeads + head_idx) *
+                   static_cast<int64_t>(vid) * HalfChunk) *
+                   H + head_idx) *
                   static_cast<int64_t>(ChunkSize);
               GmShape2D a_shape(local_rows, ChunkSize);
-              GmStride2D a_stride(NumHeads * ChunkSize);
+              GmStride2D a_stride(H * ChunkSize);
               GmTensor2D<half> a_global(A_handle + a_gm_offset, a_shape,
                                         a_stride);
               DynVecTile<half, HalfChunk, ChunkSize, pto::PadValue::Zero> a_load(
@@ -574,7 +564,7 @@ AICORE void wy_fast_kernel(
       int64_t nc = (slen + ChunkSize - 1) / ChunkSize;
 
       for (int64_t ci = 0; ci < nc; ++ci) {
-        for (int32_t h = 0; h < NumHeads; ++h) {
+        for (int32_t h = 0; h < H; ++h) {
           if (gi % static_cast<int64_t>(block_num) ==
               static_cast<int64_t>(cid)) {
             int64_t chunk_start = ci * ChunkSize;
@@ -614,11 +604,11 @@ AICORE void wy_fast_kernel(
             if (local_rows > 0) {
               int64_t a_gm_offset =
                   ((chunk_token_start +
-                    static_cast<int64_t>(vid) * HalfChunk) *
-                   NumHeads + head_idx) *
+                   static_cast<int64_t>(vid) * HalfChunk) *
+                   H + head_idx) *
                   static_cast<int64_t>(ChunkSize);
               GmShape2D a_shape(local_rows, ChunkSize);
-              GmStride2D a_stride(NumHeads * ChunkSize);
+              GmStride2D a_stride(H * ChunkSize);
               GmTensor2D<half> a_global(A_handle + a_gm_offset, a_shape,
                                         a_stride);
               DynVecTile<half, HalfChunk, ChunkSize, pto::PadValue::Zero> a_load(
@@ -732,7 +722,7 @@ AICORE void wy_fast_kernel(
       int64_t nc = (slen + ChunkSize - 1) / ChunkSize;
 
       for (int64_t ci = 0; ci < nc; ++ci) {
-        for (int32_t head_idx = 0; head_idx < NumHeads; ++head_idx) {
+        for (int32_t head_idx = 0; head_idx < H; ++head_idx) {
           if (gi % static_cast<int64_t>(block_num) ==
               static_cast<int64_t>(cid)) {
             int64_t chunk_start = ci * ChunkSize;
@@ -853,7 +843,7 @@ AICORE void wy_fast_kernel(
       int64_t nc = (slen + ChunkSize - 1) / ChunkSize;
 
       for (int64_t ci = 0; ci < nc; ++ci) {
-        for (int32_t h = 0; h < NumHeads; ++h) {
+        for (int32_t h = 0; h < H; ++h) {
           if (gi % static_cast<int64_t>(block_num) ==
               static_cast<int64_t>(cid)) {
             int64_t chunk_start = ci * ChunkSize;
@@ -976,10 +966,11 @@ extern "C" __global__ AICORE void launch_wy_fast(
     __gm__ uint8_t *W_handle, __gm__ uint8_t *U_handle,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads,
     uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
-  wy_fast_kernel<GDN_H, GDN_D, GDN_C>(
+  wy_fast_kernel<GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(K_handle),
       reinterpret_cast<__gm__ half *>(V_handle),
       reinterpret_cast<__gm__ half *>(Beta_handle),
@@ -990,7 +981,7 @@ extern "C" __global__ AICORE void launch_wy_fast(
       reinterpret_cast<__gm__ half *>(W_handle),
       reinterpret_cast<__gm__ half *>(U_handle),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
+      batch_size, seq_len, total_tokens, num_heads, num_key_heads, ffts_addr);
 }
 
 extern "C" void call_kernel(
@@ -1000,6 +991,7 @@ extern "C" void call_kernel(
     uint8_t *w, uint8_t *u,
     uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads,
     uint32_t num_key_heads)
 {
   uint32_t fftsLen{0};
@@ -1010,5 +1002,5 @@ extern "C" void call_kernel(
       workspace_a1, workspace_a2,
       w, u,
       cu_seqlens,
-      batch_size, seq_len, total_tokens, num_key_heads, fftsAddr);
+      batch_size, seq_len, total_tokens, num_heads, num_key_heads, fftsAddr);
 }

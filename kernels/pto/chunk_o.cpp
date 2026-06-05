@@ -84,17 +84,7 @@
 using namespace pto;
 
 // ── Compile-time configuration (overridable at build time via -D flags) ──
-// GDN_H: number of attention heads (default 16)
-// GDN_D: hidden dimension per head (default 128)
-// GDN_C: chunk size in tokens (default 128)
-#ifndef GDN_H
-#define GDN_H 16
-#endif
-
-#ifndef GDN_HG
-#define GDN_HG GDN_H
-#endif
-
+// D/C stay compile-time because tile shapes depend on them. H/Hg are runtime.
 #ifndef GDN_D
 #define GDN_D 128
 #endif
@@ -147,7 +137,7 @@ using GmTensor2D = pto::GlobalTensor<T, GmShape2D, GmStride2D>;
 
 #endif  // __CCE_AICORE__
 
-template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
+template <int32_t HiddenSize, int32_t ChunkSize>
 AICORE void chunk_o_kernel(
     __gm__ half *Q_handle, __gm__ half *K_handle, __gm__ half *V_handle,
     __gm__ half *S_handle, __gm__ float *G_handle,
@@ -159,6 +149,7 @@ AICORE void chunk_o_kernel(
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
     int64_t total_tokens,
+    uint32_t num_heads,
     uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
@@ -171,11 +162,11 @@ AICORE void chunk_o_kernel(
   constexpr uint32_t CTail =
       (ChunkSize % 128 == 0) ? 128 : (ChunkSize % 128);
 
-  constexpr int32_t H = NumHeads;
+  const int32_t H = static_cast<int32_t>(num_heads);
   const int32_t Hg = static_cast<int32_t>(num_key_heads);
-  if (Hg <= 0 || (H % Hg) != 0) return;
+  if (H <= 0 || Hg <= 0 || (H % Hg) != 0) return;
   const int32_t GROUP = H / Hg;
-  constexpr int32_t BSND_V_STRIDE = H * HiddenSize;
+  const int32_t BSND_V_STRIDE = H * HiddenSize;
   const int32_t BSND_QK_STRIDE = Hg * HiddenSize;
 
   // Workspace sizes (in elements) shared between Cube and Vec via GM
@@ -282,7 +273,7 @@ AICORE void chunk_o_kernel(
   int64_t total_work = 0;
   if (cu_seqlens == nullptr) {
     int64_t chunks_per_seq = (seq_len + ChunkSize - 1) / ChunkSize;
-    total_work = num_seqs * chunks_per_seq * NumHeads;
+    total_work = num_seqs * chunks_per_seq * H;
   }
 
 // =====================================================================
@@ -306,9 +297,9 @@ AICORE void chunk_o_kernel(
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
-      int32_t head_idx = static_cast<int32_t>(work_idx % NumHeads);
+      int32_t head_idx = static_cast<int32_t>(work_idx % H);
       int32_t head_g = head_idx / GROUP;
-      int64_t chunk_head_idx = work_idx / NumHeads;
+      int64_t chunk_head_idx = work_idx / H;
       int64_t seq_idx = chunk_head_idx / chunks_per_seq;
       int64_t ci = chunk_head_idx % chunks_per_seq;
 
@@ -335,7 +326,7 @@ AICORE void chunk_o_kernel(
 
       int64_t chunk_global_idx = seq_idx * chunks_per_seq + ci;
       int64_t s_offset =
-          (chunk_global_idx * NumHeads + head_idx) *
+          (chunk_global_idx * H + head_idx) *
           static_cast<int64_t>(HiddenSize) *
           static_cast<int64_t>(HiddenSize);
 
@@ -487,7 +478,8 @@ AICORE void chunk_o_kernel(
         TASSIGN(_l1, 131072);
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = valid_rows; _gs.shape[4] = HiddenSize;
-        GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, BSND_V_STRIDE, 1>> _gm(V_handle + v_off, _gs);
+        GmStride2D _stride(BSND_V_STRIDE);
+        GmTensor2D<half> _gm(V_handle + v_off, _gs, _stride);
         TLOAD(_l1, _gm);
         if (valid_rows != ChunkSize) TFILLPAD(_l1, _l1);
       }
@@ -544,7 +536,7 @@ AICORE void chunk_o_kernel(
       int64_t nc = (slen + ChunkSize - 1) / ChunkSize;
 
       for (int64_t ci = 0; ci < nc; ++ci) {
-        for (int32_t h = 0; h < NumHeads; ++h) {
+        for (int32_t h = 0; h < H; ++h) {
           if (gi % static_cast<int64_t>(block_num) ==
               static_cast<int64_t>(cid)) {
             if (!first_cube_iter_v) wait_flag_dev(3);
@@ -568,7 +560,7 @@ AICORE void chunk_o_kernel(
                  static_cast<int64_t>(head_idx)) *
                 static_cast<int64_t>(HiddenSize);
             int64_t s_offset =
-                (chunk_global_idx * NumHeads + head_idx) *
+                (chunk_global_idx * H + head_idx) *
                 static_cast<int64_t>(HiddenSize) *
                 static_cast<int64_t>(HiddenSize);
 
@@ -685,7 +677,8 @@ AICORE void chunk_o_kernel(
               TASSIGN(_l1, 131072);
               Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
               _gs.shape[3] = valid_rows; _gs.shape[4] = HiddenSize;
-              GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, BSND_V_STRIDE, 1>> _gm(V_handle + v_off, _gs);
+              GmStride2D _stride(BSND_V_STRIDE);
+              GmTensor2D<half> _gm(V_handle + v_off, _gs, _stride);
               TLOAD(_l1, _gm);
               if (valid_rows != ChunkSize) TFILLPAD(_l1, _l1);
             }
@@ -771,8 +764,8 @@ AICORE void chunk_o_kernel(
     for (int64_t work_idx = static_cast<int64_t>(cid);
          work_idx < total_work;
          work_idx += static_cast<int64_t>(block_num)) {
-      int32_t head_idx = static_cast<int32_t>(work_idx % NumHeads);
-      int64_t chunk_head_idx = work_idx / NumHeads;
+      int32_t head_idx = static_cast<int32_t>(work_idx % H);
+      int64_t chunk_head_idx = work_idx / H;
       int64_t seq_idx = chunk_head_idx / chunks_per_seq;
       int64_t ci = chunk_head_idx % chunks_per_seq;
 
@@ -978,8 +971,8 @@ AICORE void chunk_o_kernel(
       {
         Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
         _gs.shape[3] = local_rows; _gs.shape[4] = HiddenSize;
-        GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, BSND_V_STRIDE, 1>> _gm(
-            O_handle + o_offset, _gs);
+        GmStride2D _stride(BSND_V_STRIDE);
+        GmTensor2D<half> _gm(O_handle + o_offset, _gs, _stride);
         UbND<half, HalfChunk, HiddenSize, DYNAMIC, DYNAMIC> _st(local_rows, HiddenSize);
         TASSIGN(_st, OHalfUbAddr);
         TSTORE(_gm, _st);
@@ -998,7 +991,7 @@ AICORE void chunk_o_kernel(
       int64_t nc = (slen + ChunkSize - 1) / ChunkSize;
 
       for (int64_t ci = 0; ci < nc; ++ci) {
-        for (int32_t h = 0; h < NumHeads; ++h) {
+        for (int32_t h = 0; h < H; ++h) {
           if (gi % static_cast<int64_t>(block_num) ==
               static_cast<int64_t>(cid)) {
             int64_t chunk_start = ci * ChunkSize;
@@ -1176,8 +1169,8 @@ AICORE void chunk_o_kernel(
               {
                 Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
                 _gs.shape[3] = local_rows; _gs.shape[4] = HiddenSize;
-                GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, BSND_V_STRIDE, 1>> _gm(
-                    O_handle + o_offset, _gs);
+                GmStride2D _stride(BSND_V_STRIDE);
+                GmTensor2D<half> _gm(O_handle + o_offset, _gs, _stride);
                 UbND<half, HalfChunk, HiddenSize, DYNAMIC, DYNAMIC> _st(local_rows, HiddenSize);
                 TASSIGN(_st, OHalfUbAddr);
                 TSTORE(_gm, _st);
@@ -1210,10 +1203,11 @@ extern "C" __global__ AICORE void launch_chunk_o(
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
     int64_t total_tokens,
+    uint32_t num_heads,
     uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
-  chunk_o_kernel<GDN_H, GDN_D, GDN_C>(
+  chunk_o_kernel<GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(Q_handle),
       reinterpret_cast<__gm__ half *>(K_handle),
       reinterpret_cast<__gm__ half *>(V_handle),
@@ -1225,7 +1219,7 @@ extern "C" __global__ AICORE void launch_chunk_o(
       reinterpret_cast<__gm__ half *>(workspace_qk_gated),
       reinterpret_cast<__gm__ half *>(O_handle),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
+      batch_size, seq_len, total_tokens, num_heads, num_key_heads, ffts_addr);
 }
 
 // ── Host launcher (called from Python ctypes) ─────────────────────────
@@ -1242,6 +1236,7 @@ extern "C" void call_kernel(
     uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
     int64_t total_tokens,
+    uint32_t num_heads,
     uint32_t num_key_heads)
 {
   uint32_t fftsLen{0};
@@ -1252,5 +1247,5 @@ extern "C" void call_kernel(
       workspace_qk, workspace_qs_qkv, workspace_qk_gated,
       o,
       cu_seqlens,
-      batch_size, seq_len, total_tokens, num_key_heads, fftsAddr);
+      batch_size, seq_len, total_tokens, num_heads, num_key_heads, fftsAddr);
 }

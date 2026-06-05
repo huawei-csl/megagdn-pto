@@ -1,8 +1,8 @@
 // mega_kernel.cpp — GDN Mega-Kernel (group-value / GQA): all PTO stages in one launch
 //
 // Same pipeline as pto_mega_kernel, but scaled_dot_kkt / wy_fast / chunk_h / chunk_o use
-// templates (H, Hg) from dynamic_bsnd_groupvalue; cumsum still uses H (value heads) like
-// dynamic_bsnd.
+// runtime H/Hg dispatch from dynamic_bsnd_groupvalue; cumsum still uses H
+// (value heads) like dynamic_bsnd.
 //
 // Stages:
 //   1. cumsum      (Vec)
@@ -13,12 +13,6 @@
 //   6. chunk_h     (Cube+Vec)
 //   7. chunk_o     (Cube+Vec)
 
-#ifndef GDN_H
-#define GDN_H 16
-#endif
-#ifndef GDN_HG
-#define GDN_HG GDN_H
-#endif
 #ifndef GDN_D
 #define GDN_D 128
 #endif
@@ -363,7 +357,7 @@ AICORE inline void mega_kernel_impl(
 
     SyncAllImpl<false>();
 
-    mk_kkt::kkt_kernel<H, D, C>(
+    mk_kkt::kkt_kernel<D, C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
         reinterpret_cast<__gm__ half *>(beta_t_ptr),
         reinterpret_cast<__gm__ float *>(g_t_ptr),
@@ -371,7 +365,8 @@ AICORE inline void mega_kernel_impl(
         reinterpret_cast<__gm__ half *>(kkt_ws_ptr),
         reinterpret_cast<__gm__ half *>(A_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
+        batch_size, seq_len, total_tokens, static_cast<uint32_t>(H),
+        num_key_heads, ffts_addr);
 
 #if defined(__DAV_C220_CUBE__)
     pipe_barrier(PIPE_ALL);
@@ -411,7 +406,7 @@ AICORE inline void mega_kernel_impl(
     return;
 #endif
 
-    mk_wy::wy_fast_kernel<H, D, C>(
+    mk_wy::wy_fast_kernel<D, C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
         reinterpret_cast<__gm__ half *>(v_ptr),
         reinterpret_cast<__gm__ half *>(beta_t_ptr),
@@ -422,7 +417,8 @@ AICORE inline void mega_kernel_impl(
         reinterpret_cast<__gm__ half *>(w_ptr),
         reinterpret_cast<__gm__ half *>(u_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
+        batch_size, seq_len, total_tokens, static_cast<uint32_t>(H),
+        num_key_heads, ffts_addr);
 
 #if defined(__DAV_C220_VEC__)
     if (get_block_idx() < num_matrices) {
@@ -439,7 +435,7 @@ AICORE inline void mega_kernel_impl(
 
     SyncAllImpl<false>();
 
-    mk_h::chunk_h_kernel<H, D, C>(
+    mk_h::chunk_h_kernel<D, C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
         reinterpret_cast<__gm__ half *>(w_ptr),
         reinterpret_cast<__gm__ half *>(u_ptr),
@@ -452,7 +448,8 @@ AICORE inline void mega_kernel_impl(
         1,
         reinterpret_cast<__gm__ half *>(h_ws_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
+        batch_size, seq_len, total_tokens, static_cast<uint32_t>(H),
+        num_key_heads, ffts_addr);
 
 #ifdef MEGA_STOP_AFTER_H
     pipe_barrier(PIPE_ALL);
@@ -461,7 +458,7 @@ AICORE inline void mega_kernel_impl(
 
     SyncAllImpl<false>();
 
-    mk_o::chunk_o_kernel<H, D, C>(
+    mk_o::chunk_o_kernel<D, C>(
         reinterpret_cast<__gm__ half *>(q_ptr),
         reinterpret_cast<__gm__ half *>(k_ptr),
         reinterpret_cast<__gm__ half *>(v_new_ptr),
@@ -473,7 +470,8 @@ AICORE inline void mega_kernel_impl(
         reinterpret_cast<__gm__ half *>(o_ws_gated_ptr),
         reinterpret_cast<__gm__ half *>(o_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, num_key_heads, ffts_addr);
+        batch_size, seq_len, total_tokens, static_cast<uint32_t>(H),
+        num_key_heads, ffts_addr);
 
 #if defined(__DAV_C220_CUBE__)
     if (get_block_idx() < num_matrices) {

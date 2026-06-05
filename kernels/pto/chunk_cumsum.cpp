@@ -53,15 +53,9 @@
 #include <runtime/rt_ffts.h>
 using namespace pto;
 
-// GDN_H, GDN_C: Compile-time constants injected by the build system.
-//   GDN_H = number of attention heads (e.g., 16)
-//   GDN_C = chunk size in tokens (e.g., 128)
+// GDN_C: Compile-time chunk size injected by the build system.
 // Using compile-time constants allows the compiler to optimize tile sizes,
 // unroll loops, and compute UB addresses at compile time.
-#ifndef GDN_H
-#define GDN_H 16
-#endif
-
 #ifndef GDN_C
 #define GDN_C 128
 #endif
@@ -398,13 +392,29 @@ extern "C" __global__ AICORE void launch_cumsum(
     __gm__ uint8_t *g_ptr, __gm__ uint8_t *g_sum_ptr,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
+    uint32_t num_heads,
     uint64_t ffts_addr)
 {
-  cumsum_kernel<GDN_H, GDN_C>(
-      reinterpret_cast<__gm__ float *>(g_ptr),
-      reinterpret_cast<__gm__ float *>(g_sum_ptr),
-      reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, ffts_addr);
+#define DISPATCH_CUMSUM_H(H)                                      \
+  case H:                                                         \
+    cumsum_kernel<H, GDN_C>(                                      \
+        reinterpret_cast<__gm__ float *>(g_ptr),                  \
+        reinterpret_cast<__gm__ float *>(g_sum_ptr),              \
+        reinterpret_cast<__gm__ int32_t *>(cu_seqlens),           \
+        batch_size, seq_len, ffts_addr);                          \
+    return
+
+  switch (num_heads) {
+    DISPATCH_CUMSUM_H(16);
+    DISPATCH_CUMSUM_H(24);
+    DISPATCH_CUMSUM_H(32);
+    DISPATCH_CUMSUM_H(48);
+    DISPATCH_CUMSUM_H(64);
+    default:
+      return;
+  }
+
+#undef DISPATCH_CUMSUM_H
 }
 
 // ── Host-side launcher (called from Python via ctypes) ────────────
@@ -416,11 +426,12 @@ extern "C" __global__ AICORE void launch_cumsum(
 extern "C" void call_kernel(
     uint32_t block_dim, void *stream,
     uint8_t *g_ptr, uint8_t *g_sum_ptr, uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len)
+    int64_t batch_size, int64_t seq_len,
+    uint32_t num_heads)
 {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
   rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
   launch_cumsum<<<block_dim, nullptr, stream>>>(
-      g_ptr, g_sum_ptr, cu_seqlens, batch_size, seq_len, fftsAddr);
+      g_ptr, g_sum_ptr, cu_seqlens, batch_size, seq_len, num_heads, fftsAddr);
 }

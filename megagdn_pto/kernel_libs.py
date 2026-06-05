@@ -43,6 +43,19 @@ def _ensure_int32(cu: torch.Tensor | None) -> torch.Tensor | None:
     return cu if cu.dtype == torch.int32 else cu.to(torch.int32)
 
 
+_SUPPORTED_HEADS = frozenset({16, 24, 32, 48, 64})
+
+
+def _check_supported_heads(value_heads: int, key_heads: int | None = None) -> None:
+    if value_heads not in _SUPPORTED_HEADS:
+        raise ValueError(
+            f"H={value_heads} is not supported by the compiled dispatch binary; "
+            f"choose one of {_SUPPORTED_HEADS}"
+        )
+    if key_heads is not None and value_heads % key_heads != 0:
+        raise ValueError(f"H={value_heads} must be divisible by key_heads={key_heads}")
+
+
 def transpose_gates(g_sum: torch.Tensor) -> torch.Tensor:
     """``[1, T, H]`` → ``[H, T]`` contiguous (per-head gate layout for kernels)."""
     return g_sum.squeeze(0).t().contiguous()
@@ -101,19 +114,15 @@ def _load(
     cpp_name: str,
     so_stem: str,
     *,
-    num_heads: int,
     hidden_size: int = 128,
     chunk_size: int = 128,
-    key_heads: int | None = None,
     cpp_mtime_ns: int,
 ) -> ctypes.CDLL:
     lib_path = compile_chunk_kernel(
         cpp_name,
         so_stem,
-        num_heads=num_heads,
         hidden_size=hidden_size,
         chunk_size=chunk_size,
-        key_heads=key_heads,
         cpp_mtime_ns=cpp_mtime_ns,
     )
     return ctypes.CDLL(os.path.abspath(lib_path))
@@ -123,28 +132,26 @@ def _load(
 # chunk_cumsum  — chunk-local prefix sum of log-gate values G
 # ---------------------------------------------------------------------------
 
-def load_chunk_cumsum(
-    num_heads: int,
-    hidden_size: int = 128,
-    chunk_size: int = 128,
-) -> ctypes.CDLL:
+def load_chunk_cumsum(chunk_size: int = 128) -> ctypes.CDLL:
     """Compile + load the standalone chunk_cumsum kernel.
 
     Signature::
         void call_kernel(uint32_t block_dim, void *stream,
                          uint8_t *g, uint8_t *g_sum,
                          uint8_t *cu_seqlens,
-                         int64_t batch_size, int64_t seq_len)
+                         int64_t batch_size, int64_t seq_len,
+                         uint32_t num_heads)
     """
     lib = _load(
         "chunk_cumsum.cpp", "chunk_cumsum",
-        num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
+        chunk_size=chunk_size,
         cpp_mtime_ns=_mtime("chunk_cumsum.cpp"),
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 3
         + [ctypes.c_int64, ctypes.c_int64]
+        + [ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
     return lib
@@ -165,12 +172,13 @@ def run_chunk_cumsum(
     ``g``, ``g_sum``: ``[B, T, H]`` float32.
     """
     H = g.shape[2]
+    _check_supported_heads(H)
     bd = block_dim or BLOCK_DIM
     batch = g.shape[0] if batch_size_override is None else batch_size_override
     T = g.shape[1]
     cu32 = _ensure_int32(cu_seqlens)
-    lib = load_chunk_cumsum(H, g.shape[2], chunk_size)
-    lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T)
+    lib = load_chunk_cumsum(chunk_size)
+    lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T, H)
 
 
 # ---------------------------------------------------------------------------
@@ -178,22 +186,19 @@ def run_chunk_cumsum(
 # ---------------------------------------------------------------------------
 
 def load_scaled_dot_kkt(
-    num_heads: int,
     hidden_size: int = 128,
     chunk_size: int = 128,
-    *,
-    key_heads: int | None = None,
 ) -> ctypes.CDLL:
     lib = _load(
         "scaled_dot_kkt.cpp", "scaled_dot_kkt",
-        num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
-        key_heads=key_heads, cpp_mtime_ns=_mtime("scaled_dot_kkt.cpp"),
+        hidden_size=hidden_size, chunk_size=chunk_size,
+        cpp_mtime_ns=_mtime("scaled_dot_kkt.cpp"),
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 7
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
-        + [ctypes.c_uint32]
+        + [ctypes.c_uint32, ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
     return lib
@@ -219,19 +224,19 @@ def run_scaled_dot_kkt(
 
     ``k``: ``[B, T, Hg, D]``; ``beta``, ``g_sum``: ``[B, T, H]``; ``A_out``: ``[B, T, H, C]``.
     """
-    hg = k.shape[2]
-    kh = key_heads if key_heads is not None else hg
     H = beta.shape[2]
+    kh = key_heads if key_heads is not None else k.shape[2]
+    _check_supported_heads(H, kh)
     bd = block_dim or BLOCK_DIM
     batch = k.shape[0] if batch_size_override is None else batch_size_override
     cu32 = _ensure_int32(cu_seqlens)
     T = g_sum.shape[1]
     ws = torch.zeros(bd * 2, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
-    lib = load_scaled_dot_kkt(H, k.shape[3], chunk_size, key_heads=kh)
+    lib = load_scaled_dot_kkt(k.shape[3], chunk_size)
     lib.call_kernel(
         bd, stream,
         _vp(k), _vp(beta_t), _vp(g_t), _vp(mask), _vp(ws), _vp(A_out), _vp(cu32),
-        batch, k.shape[1], T, kh,
+        batch, k.shape[1], T, H, kh,
     )
 
 
@@ -240,22 +245,19 @@ def run_scaled_dot_kkt(
 # ---------------------------------------------------------------------------
 
 def load_wy_fast(
-    num_heads: int,
     hidden_size: int = 128,
     chunk_size: int = 128,
-    *,
-    key_heads: int | None = None,
 ) -> ctypes.CDLL:
     lib = _load(
         "wy_fast.cpp", "wy_fast",
-        num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
-        key_heads=key_heads, cpp_mtime_ns=_mtime("wy_fast.cpp"),
+        hidden_size=hidden_size, chunk_size=chunk_size,
+        cpp_mtime_ns=_mtime("wy_fast.cpp"),
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 10
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
-        + [ctypes.c_uint32]
+        + [ctypes.c_uint32, ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
     return lib
@@ -283,21 +285,21 @@ def run_wy_fast(
 
     ``k``: ``[B, T, Hg, D]``; ``v``, ``w_out``, ``u_out``: ``[B, T, H, D]``; ``A``: ``[B, T, H, C]``.
     """
-    hg = k.shape[2]
-    kh = key_heads if key_heads is not None else hg
     H = v.shape[2]
+    kh = key_heads if key_heads is not None else k.shape[2]
+    _check_supported_heads(H, kh)
     bd = block_dim or BLOCK_DIM
     batch = k.shape[0] if batch_size_override is None else batch_size_override
     cu32 = _ensure_int32(cu_seqlens)
     T = g_sum.shape[1]
     ws_a1 = torch.zeros(bd, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
     ws_a2 = torch.zeros_like(ws_a1)
-    lib = load_wy_fast(H, k.shape[3], chunk_size, key_heads=kh)
+    lib = load_wy_fast(k.shape[3], chunk_size)
     lib.call_kernel(
         bd, stream,
         _vp(k), _vp(v), _vp(beta_t), _vp(g_t), _vp(A),
         _vp(ws_a1), _vp(ws_a2), _vp(w_out), _vp(u_out), _vp(cu32),
-        batch, k.shape[1], T, kh,
+        batch, k.shape[1], T, H, kh,
     )
 
 
@@ -306,16 +308,13 @@ def run_wy_fast(
 # ---------------------------------------------------------------------------
 
 def load_chunk_h(
-    num_heads: int,
     hidden_size: int = 128,
     chunk_size: int = 128,
-    *,
-    key_heads: int | None = None,
 ) -> ctypes.CDLL:
     lib = _load(
         "chunk_h.cpp", "chunk_h",
-        num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
-        key_heads=key_heads, cpp_mtime_ns=_mtime("chunk_h.cpp"),
+        hidden_size=hidden_size, chunk_size=chunk_size,
+        cpp_mtime_ns=_mtime("chunk_h.cpp"),
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
@@ -323,7 +322,7 @@ def load_chunk_h(
         + [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64]
         + [ctypes.c_void_p] * 2
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
-        + [ctypes.c_uint32]
+        + [ctypes.c_uint32, ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
     return lib
@@ -353,20 +352,15 @@ def run_chunk_h(
     ``s_out``: ``[total_chunks*H, D, D]``; ``final_state_out`` may be
     ``[N_seq*H, D, D]`` or ``[N_seq, H, D, D]``.
     """
-    hg = k.shape[2]
-    kh = key_heads if key_heads is not None else hg
     H = w.shape[2]
     D = k.shape[3]
+    kh = key_heads if key_heads is not None else k.shape[2]
+    _check_supported_heads(H, kh)
     bd = block_dim or BLOCK_DIM
     batch = k.shape[0] if batch_size_override is None else batch_size_override
     cu32 = _ensure_int32(cu_seqlens)
     T = g_sum.shape[1]
     ws = torch.zeros(bd * 4, D, D, device=k.device, dtype=torch.float16)
-
-    if kh <= 0 or H % kh != 0:
-        raise ValueError(f"H={H} must be divisible by key_heads={kh}")
-    if kh != hg:
-        raise ValueError(f"key_heads={kh} must match k.shape[2]={hg}")
 
     if final_state_out is None:
         final_state_buf = None
@@ -396,13 +390,14 @@ def run_chunk_h(
             )
         h0 = initial_state.to(device=k.device, dtype=torch.float16).contiguous()
         has_initial_state = 1
-    lib = load_chunk_h(H, D, chunk_size, key_heads=kh)
+    stream = torch.npu.current_stream()._as_parameter_
+    lib = load_chunk_h(D, chunk_size)
     lib.call_kernel(
         bd, stream,
         _vp(k), _vp(w), _vp(u), _vp(g_t),
         _vp(s_out), _vp(v_new_out), _vp(final_state_buf),
         _vp(h0), has_initial_state, output_final_state, _vp(ws), _vp(cu32),
-        batch, k.shape[1], T, kh,
+        batch, k.shape[1], T, H, kh,
     )
 
 
@@ -411,22 +406,19 @@ def run_chunk_h(
 # ---------------------------------------------------------------------------
 
 def load_chunk_o(
-    num_heads: int,
     hidden_size: int = 128,
     chunk_size: int = 128,
-    *,
-    key_heads: int | None = None,
 ) -> ctypes.CDLL:
     lib = _load(
         "chunk_o.cpp", "chunk_o",
-        num_heads=num_heads, hidden_size=hidden_size, chunk_size=chunk_size,
-        key_heads=key_heads, cpp_mtime_ns=_mtime("chunk_o.cpp"),
+        hidden_size=hidden_size, chunk_size=chunk_size,
+        cpp_mtime_ns=_mtime("chunk_o.cpp"),
     )
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 11
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
-        + [ctypes.c_uint32]
+        + [ctypes.c_uint32, ctypes.c_uint32]
     )
     lib.call_kernel.restype = None
     return lib
@@ -453,10 +445,10 @@ def run_chunk_o(
 
     ``q``, ``k``: ``[B, T, Hg, D]``; ``v_new``, ``o_out``: ``[B, T, H, D]``.
     """
-    hg = q.shape[2]
-    kh = key_heads if key_heads is not None else hg
     H = v_new.shape[2]
     D = q.shape[3]
+    kh = key_heads if key_heads is not None else q.shape[2]
+    _check_supported_heads(H, kh)
     bd = block_dim or BLOCK_DIM
     batch = q.shape[0] if batch_size_override is None else batch_size_override
     cu32 = _ensure_int32(cu_seqlens)
@@ -464,10 +456,10 @@ def run_chunk_o(
     ws_qk = torch.zeros(bd, chunk_size, chunk_size, device=q.device, dtype=torch.float16)
     ws_qs = torch.zeros(bd, chunk_size, D, device=q.device, dtype=torch.float16)
     ws_gated = torch.zeros(bd, chunk_size, chunk_size, device=q.device, dtype=torch.float16)
-    lib = load_chunk_o(H, D, chunk_size, key_heads=kh)
+    lib = load_chunk_o(D, chunk_size)
     lib.call_kernel(
         bd, stream,
         _vp(q), _vp(k), _vp(v_new), _vp(s), _vp(g_t), _vp(mask),
         _vp(ws_qk), _vp(ws_qs), _vp(ws_gated), _vp(o_out), _vp(cu32),
-        batch, q.shape[1], T, kh,
+        batch, q.shape[1], T, H, kh,
     )
