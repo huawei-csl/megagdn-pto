@@ -128,7 +128,8 @@ def bench_gate_cumsum(HV: int, T: int, cu_seqlens, dev, stream, bd: int):
     def run_kda():
         lib_kda.call_kernel(bd, stream, _vp(g_kda), _vp(gs_kda), _vp(cu32), batch, T)
 
-    run_kda(); torch.npu.synchronize()
+    run_kda()
+    torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: [B, T, HV] fp32 — scalar gate per head per token
@@ -139,7 +140,8 @@ def bench_gate_cumsum(HV: int, T: int, cu_seqlens, dev, stream, bd: int):
     def run_gdn():
         lib_gdn.call_kernel(bd, stream, _vp(g_gdn), _vp(gs_gdn), _vp(cu32), batch, T)
 
-    run_gdn(); torch.npu.synchronize()
+    run_gdn()
+    torch.npu.synchronize()
     ms_gdn = _bench_npu(run_gdn)
 
     _print_stage(
@@ -175,7 +177,8 @@ def bench_kkt(HV: int, HG: int, T: int, cu_seqlens, dev, stream, bd: int):
                             _vp(mask_kda), _vp(ws_in_kda), _vp(ws_out_kda), _vp(L_kda),
                             _vp(cu32), batch, T, T)
 
-    run_kda(); torch.npu.synchronize()
+    run_kda()
+    torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: k [B,T,HG,D] fp16; β [B,HV,T] fp16 (head-major); g [B,HV,T] fp32 (head-major)
@@ -195,7 +198,8 @@ def bench_kkt(HV: int, HG: int, T: int, cu_seqlens, dev, stream, bd: int):
                             _vp(mask_gdn), _vp(ws_gdn), _vp(A_gdn),
                             _vp(cu32), batch, T, T)
 
-    run_gdn(); torch.npu.synchronize()
+    run_gdn()
+    torch.npu.synchronize()
     ms_gdn = _bench_npu(run_gdn)
 
     _print_stage(
@@ -228,7 +232,8 @@ def bench_solve_tril(HV: int, T: int, cu_seqlens, dev, stream, bd: int):
                                   cu_seqlens=cu32, block_dim=bd,
                                   stream_ptr=stream, is_lower=True)
 
-    run_kda(); torch.npu.synchronize()
+    run_kda()
+    torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: A already fp16
@@ -240,7 +245,8 @@ def bench_solve_tril(HV: int, T: int, cu_seqlens, dev, stream, bd: int):
                                   cu_seqlens=cu32, block_dim=bd,
                                   stream_ptr=stream, is_lower=True)
 
-    run_gdn(); torch.npu.synchronize()
+    run_gdn()
+    torch.npu.synchronize()
     ms_gdn = _bench_npu(run_gdn)
 
     _print_stage(
@@ -277,7 +283,8 @@ def bench_wy(HV: int, HG: int, T: int, cu_seqlens, dev, stream, bd: int):
                             _vp(u_kda), _vp(w_kda),
                             _vp(cu32), batch, T, T)
 
-    run_kda(); torch.npu.synchronize()
+    run_kda()
+    torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: k [B,T,HG,D] fp16; v/A_inv [B,T,HV,D/C] fp16; β/g head-major
@@ -301,7 +308,8 @@ def bench_wy(HV: int, HG: int, T: int, cu_seqlens, dev, stream, bd: int):
                             _vp(w_gdn), _vp(u_gdn),
                             _vp(cu32), batch, T, T)
 
-    run_gdn(); torch.npu.synchronize()
+    run_gdn()
+    torch.npu.synchronize()
     ms_gdn = _bench_npu(run_gdn)
 
     _print_stage("wy_kda fp16  vs  wy_fast fp16", ms_kda, ms_gdn)
@@ -332,7 +340,8 @@ def bench_chunk_h(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
                             _vp(s_kda), _vp(vcorr_kda), _vp(ws_kda), _vp(cu32),
                             batch, T, T)
 
-    run_kda(); torch.npu.synchronize()
+    run_kda()
+    torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: k [B,T,HG,D] fp16; w/u BSND fp16; g head-major fp32; state [tc*HV,D,D] fp16
@@ -352,7 +361,8 @@ def bench_chunk_h(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
                             _vp(s_gdn), _vp(vnew_gdn), _vp(fs_gdn), _vp(ws_gdn), _vp(cu32),
                             batch, T, T)
 
-    run_gdn(); torch.npu.synchronize()
+    run_gdn()
+    torch.npu.synchronize()
     ms_gdn = _bench_npu(run_gdn)
 
     _print_stage(
@@ -400,7 +410,8 @@ def bench_chunk_o(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
                               _vp(ws_o_kda), _vp(o_kda), _vp(cu32),
                               batch, T, T)
 
-    run_kda(); torch.npu.synchronize()
+    run_kda()
+    torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: pre-populate s and v_new via chunk_h warmup
@@ -433,7 +444,8 @@ def bench_chunk_o(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
                               _vp(mask_gdn), _vp(ws1_gdn), _vp(ws2_gdn), _vp(ws3_gdn), _vp(o_gdn),
                               _vp(cu32), batch, T, T)
 
-    run_gdn(); torch.npu.synchronize()
+    run_gdn()
+    torch.npu.synchronize()
     ms_gdn = _bench_npu(run_gdn)
 
     _print_stage(
@@ -543,7 +555,8 @@ def bench_e2e(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd: in
                           _vp(ws_o), _vp(o_kda), _vp(cu32),
                           batch, T, T)
 
-    run_kda(); torch.npu.synchronize()
+    run_kda()
+    torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # ── GDN megakernel ───────────────────────────────────────────────────────
@@ -557,7 +570,8 @@ def bench_e2e(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd: in
         run_mega_kernel(q_gdn, k_gdn, v_gdn, g_gdn, beta_gdn, cu_seqlens,
                         stream=stream, chunk_size=C, scale=scale, key_heads=HG)
 
-    run_gdn(); torch.npu.synchronize()
+    run_gdn()
+    torch.npu.synchronize()
     ms_gdn = _bench_npu(run_gdn)
 
     kda_over_gdn = _ratio(ms_kda, ms_gdn)

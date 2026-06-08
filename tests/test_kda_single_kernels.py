@@ -22,7 +22,7 @@ Stage device requirements:
   - cumsum: runs on NPU (requires --device); calls gate_cumsum_kda PTO kernel.
   - all others: CPU float32 reference only.
 
-Usage::
+Usage:
 
     python tests/test_kda_single_kernels.py --device npu:0
     python tests/test_kda_single_kernels.py --device npu:0 --quick
@@ -85,7 +85,7 @@ def ref_gate_cumsum(g: torch.Tensor, chunk_size: int, cu_seqlens=None) -> torch.
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 – L matrix (gated K×K product, strictly lower triangular)
+# Stage 2 – L matrix (gated K @ K.T product, strictly lower triangular)
 # ---------------------------------------------------------------------------
 def ref_kkt_kda(
     k: torch.Tensor,
@@ -142,9 +142,9 @@ def ref_inversion_kda(A: torch.Tensor, cs: int, cu_seqlens=None) -> torch.Tensor
             s, e = bos + j, min(bos + j + cs, eos)
             v = e - s
             for h in range(H):
-                Ac = Af[0, s:e, h, :v]  # [v, v], strictly lower triangular
-                inv = torch.linalg.inv(torch.eye(v) + Ac)
-                out[0, s:e, h, :v] = inv
+                Ac = Af[0, s:e, h, :v].double().numpy()  # [v, v], strictly lower triangular
+                inv = np.linalg.inv(np.eye(v) + Ac)
+                out[0, s:e, h, :v] = torch.from_numpy(inv).float()
     return out
 
 
@@ -521,7 +521,7 @@ def _make_inputs(tc: TestCase, H: int, HV: int | None = None):
     # (random orthogonal vectors), keeping (I+L) well-conditioned.
     q = q / q.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     k = k / k.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    v       = torch.randn(1, T, HV, V_DIM)
+    v = torch.randn(1, T, HV, V_DIM)
     # Keep cumulative gate magnitudes within fp16 range:
     # for CHUNK=128 the kernel computes exp(-g_cs); with values in (-0.05, 0)
     # the worst-case cumsum is bounded by ~6.4 so exp stays within fp16 (~600).
