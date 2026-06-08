@@ -317,12 +317,12 @@ def run_one(
     e2e_accuracy = NumericalAccuracy(rtol=5e-3, atol=1e-4, ftol=2e-3)
     ok_pto = e2e_accuracy.stats_ok(o_pto.float(), o_cpu.float())
     ok_mega = e2e_accuracy.stats_ok(o_mega.float(), o_cpu.float())
-    ok_xchk = e2e_accuracy.stats_ok(o_mega.float(), o_pto.float())
-    ok = ok_pto and ok_mega and ok_xchk
+    ok_cross_check = e2e_accuracy.stats_ok(o_mega.float(), o_pto.float())
+    ok = ok_pto and ok_mega and ok_cross_check
     label = (
         f"{label}  [staged={'ok' if ok_pto else 'X'} "
         f"mega={'ok' if ok_mega else 'X'} "
-        f"mega~staged={'ok' if ok_xchk else 'X'}]"
+        f"mega~staged={'ok' if ok_cross_check else 'X'}]"
     )
     return ok, label
 
