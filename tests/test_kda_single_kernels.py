@@ -207,7 +207,8 @@ def test_gate_cumsum(tc: TestCase, H: int, dev: "torch.device | None" = None) ->
     torch.npu.synchronize()
 
     ref = tc.ref_kda.gate_cumsum(g_dev.cpu(), CHUNK, tc.cu_seqlens_list)
-    return ACCURACY.stats_ok(g_sum.cpu(), ref)
+    acc = NumericalAccuracy(rtol=5e-3, atol=0, ftol=2e-3)
+    return acc.stats_ok(g_sum.cpu(), ref)
 
 
 def test_kkt(tc: TestCase, H: int, dev=None) -> bool:

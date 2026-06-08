@@ -47,7 +47,6 @@ CHUNK = 128  # small chunk for fast CPU tests
 K = 128  # key/query dimension
 V_DIM = 128  # value dimension
 
-ACCURACY = NumericalAccuracy()
 # ---------------------------------------------------------------------------
 # PTO pipeline (all 6 stages on NPU)
 # ---------------------------------------------------------------------------
@@ -296,8 +295,8 @@ def run_one(
     # workspaces in kkt_kda / chunk_o_kda (which stage exp(g_cs) and
     # exp(-g_cs) separately for Cube-core GEMMs) don't overflow.  Larger
     # magnitudes blow up exp(-g_cs) past fp16 max (~65504) -> inf -> NaN.
-    g_log = -torch.rand(1, T, HV, K) * 0.05
-    beta_sig = torch.sigmoid(torch.randn(1, T, HV))
+    g_log = -torch.rand(1, T, HV, K).to(torch.half) * 0.05
+    beta_sig = torch.sigmoid(torch.randn(1, T, HV)).to(torch.half)
 
     # PTO staged pipeline (all stages on NPU)
     o_pto = pto_pipeline_kda(
@@ -315,9 +314,10 @@ def run_one(
         q, k, v, g_log, beta_sig, cu_list, scale, chunk_size
     )
 
-    ok_pto = ACCURACY.stats_ok(o_pto.float(), o_cpu.float())
-    ok_mega = ACCURACY.stats_ok(o_mega.float(), o_cpu.float())
-    ok_xchk = ACCURACY.stats_ok(o_mega.float(), o_pto.float())
+    e2e_accuracy = NumericalAccuracy(rtol=5e-3, atol=1e-4, ftol=2e-3)
+    ok_pto = e2e_accuracy.stats_ok(o_pto.float(), o_cpu.float())
+    ok_mega = e2e_accuracy.stats_ok(o_mega.float(), o_cpu.float())
+    ok_xchk = e2e_accuracy.stats_ok(o_mega.float(), o_pto.float())
     ok = ok_pto and ok_mega and ok_xchk
     label = (
         f"{label}  [staged={'ok' if ok_pto else 'X'} "
