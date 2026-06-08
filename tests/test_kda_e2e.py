@@ -314,10 +314,10 @@ def run_one(
         q, k, v, g_log, beta_sig, cu_list, scale, chunk_size
     )
 
-    e2e_accuracy = NumericalAccuracy(rtol=5e-3, atol=1e-4, ftol=2e-3)
-    ok_pto = e2e_accuracy.stats_ok(o_pto.float(), o_cpu.float())
-    ok_mega = e2e_accuracy.stats_ok(o_mega.float(), o_cpu.float())
-    ok_cross_check = e2e_accuracy.stats_ok(o_mega.float(), o_pto.float())
+    e2e_accuracy = NumericalAccuracy(rtol=5e-3, atol=0, ftol=2e-3)
+    ok_pto = e2e_accuracy.stats_ok(o_pto, o_cpu)
+    ok_mega = e2e_accuracy.stats_ok(o_mega, o_cpu)
+    ok_cross_check = e2e_accuracy.stats_ok(o_mega, o_pto)
     ok = ok_pto and ok_mega and ok_cross_check
     label = (
         f"{label}  [staged={'ok' if ok_pto else 'X'} "
