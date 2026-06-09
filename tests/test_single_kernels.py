@@ -303,9 +303,8 @@ def test_kkt(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     g_t, beta_t = transpose_gates(g_sum), transpose_beta(beta)
     msk = torch.tril(torch.ones(C, C, device=dev), diagonal=-1).float()
     A_out = torch.zeros(1, T, H, C, device=dev, dtype=torch.float16)
-    stream = torch.npu.current_stream()._as_parameter_
     run_scaled_dot_kkt(k, beta, g_sum, msk, A_out,
-                       stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C,
+                       g_t=g_t, beta_t=beta_t, chunk_size=C,
                        cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
     torch.npu.synchronize()
     ref = ref_kkt(k.cpu(), beta.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
@@ -326,14 +325,13 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     w = (k_h * beta[..., None] * torch.exp(g_sum)[..., None]).to(torch.float16)
     u = (v * beta[..., None]).to(torch.float16)
     g_t = transpose_gates(g_sum)
-    stream = torch.npu.current_stream()._as_parameter_
     tc_n = total_chunks(N_seq, T, C, cu)
     h0 = (0.01 * torch.randn(N_seq, H, D, D, device=dev, dtype=torch.float16)).contiguous()
     s_out = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
     v_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     fs_out = torch.zeros(N_seq, H, D, D, device=dev, dtype=torch.float16)
     run_chunk_h(k, w, u, g_sum, s_out, v_out, fs_out,
-                stream=stream, g_t=g_t, chunk_size=C,
+                g_t=g_t, chunk_size=C,
                 cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG,
                 initial_state=h0)
     torch.npu.synchronize()
@@ -357,11 +355,10 @@ def test_wy(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     g_in = F.logsigmoid(torch.randn(1, T, H, device=dev, dtype=torch.float32))
     g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(dev)
     g_t, beta_t = transpose_gates(g_sum), transpose_beta(beta)
-    stream = torch.npu.current_stream()._as_parameter_
     w_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     u_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     run_wy_fast(k, v, beta, g_sum, A, w_out, u_out,
-                stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C,
+                g_t=g_t, beta_t=beta_t, chunk_size=C,
                 cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
     torch.npu.synchronize()
     w_ref, u_ref = ref_wy(k.cpu(), v.cpu(), beta.cpu(), A.cpu(), g_sum.cpu(), C, tc.cu_seqlens_list)
@@ -380,21 +377,20 @@ def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     g_in = F.logsigmoid(torch.randn(1, T, H, device=dev, dtype=torch.float32))
     g_sum = ref_cumsum(g_in.cpu(), C, tc.cu_seqlens_list).to(dev)
     g_t = transpose_gates(g_sum)
-    stream = torch.npu.current_stream()._as_parameter_
     tc_n = total_chunks(N_seq, T, C, cu)
     s_out = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
     v_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     fs_out = torch.zeros(N_seq, H, D, D, device=dev, dtype=torch.float16)
     h0 = (0.01 * torch.randn(N_seq, H, D, D, device=dev, dtype=torch.float16)).contiguous()
     run_chunk_h(k, w, u, g_sum, s_out, v_out, fs_out,
-                stream=stream, g_t=g_t, chunk_size=C,
+                g_t=g_t, chunk_size=C,
                 cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG,
                 initial_state=h0)
     torch.npu.synchronize()
     msk = torch.tril(torch.ones(C, C, device=dev), diagonal=0).float()
     o_out = torch.empty(1, T, H, D, device=dev, dtype=torch.float16)
     run_chunk_o(q, k, v_out, s_out, g_sum, msk, o_out,
-                stream=stream, g_t=g_t, chunk_size=C,
+                g_t=g_t, chunk_size=C,
                 cu_seqlens=cu, batch_size_override=N_seq, key_heads=HG)
     torch.npu.synchronize()
     s_re = s_out.float().cpu().view(tc_n, H, D, D)
@@ -409,8 +405,7 @@ def test_cumsum(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     torch.manual_seed(42)
     g = torch.randn(1, T, H, device=dev, dtype=torch.float32)
     g_sum = torch.empty_like(g)
-    stream = torch.npu.current_stream()._as_parameter_
-    run_chunk_cumsum(g, g_sum, stream=stream, chunk_size=C,
+    run_chunk_cumsum(g, g_sum, chunk_size=C,
                      cu_seqlens=cu, batch_size_override=N_seq)
     torch.npu.synchronize()
     ref = ref_cumsum(g.cpu(), C, tc.cu_seqlens_list)

@@ -161,7 +161,6 @@ def run_chunk_cumsum(
     g: torch.Tensor,
     g_sum: torch.Tensor,
     *,
-    stream,
     chunk_size: int = 128,
     cu_seqlens: torch.Tensor | None = None,
     batch_size_override: int | None = None,
@@ -178,6 +177,7 @@ def run_chunk_cumsum(
     T = g.shape[1]
     cu32 = _ensure_int32(cu_seqlens)
     lib = load_chunk_cumsum(chunk_size)
+    stream = torch.npu.current_stream()._as_parameter_
     lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T, H)
 
 
@@ -211,7 +211,6 @@ def run_scaled_dot_kkt(
     mask: torch.Tensor,
     A_out: torch.Tensor,
     *,
-    stream,
     g_t: torch.Tensor,
     beta_t: torch.Tensor,
     chunk_size: int = 128,
@@ -233,6 +232,7 @@ def run_scaled_dot_kkt(
     T = g_sum.shape[1]
     ws = torch.zeros(bd * 2, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
     lib = load_scaled_dot_kkt(k.shape[3], chunk_size)
+    stream = torch.npu.current_stream()._as_parameter_
     lib.call_kernel(
         bd, stream,
         _vp(k), _vp(beta_t), _vp(g_t), _vp(mask), _vp(ws), _vp(A_out), _vp(cu32),
@@ -272,7 +272,6 @@ def run_wy_fast(
     w_out: torch.Tensor,
     u_out: torch.Tensor,
     *,
-    stream,
     g_t: torch.Tensor,
     beta_t: torch.Tensor,
     chunk_size: int = 128,
@@ -295,6 +294,7 @@ def run_wy_fast(
     ws_a1 = torch.zeros(bd, chunk_size, chunk_size, device=k.device, dtype=torch.float16)
     ws_a2 = torch.zeros_like(ws_a1)
     lib = load_wy_fast(k.shape[3], chunk_size)
+    stream = torch.npu.current_stream()._as_parameter_
     lib.call_kernel(
         bd, stream,
         _vp(k), _vp(v), _vp(beta_t), _vp(g_t), _vp(A),
@@ -337,7 +337,6 @@ def run_chunk_h(
     v_new_out: torch.Tensor,
     final_state_out: torch.Tensor | None,
     *,
-    stream,
     g_t: torch.Tensor,
     chunk_size: int = 128,
     cu_seqlens: torch.Tensor | None = None,
@@ -390,8 +389,8 @@ def run_chunk_h(
             )
         h0 = initial_state.to(device=k.device, dtype=torch.float16).contiguous()
         has_initial_state = 1
-    stream = torch.npu.current_stream()._as_parameter_
     lib = load_chunk_h(D, chunk_size)
+    stream = torch.npu.current_stream()._as_parameter_
     lib.call_kernel(
         bd, stream,
         _vp(k), _vp(w), _vp(u), _vp(g_t),
@@ -433,7 +432,6 @@ def run_chunk_o(
     mask: torch.Tensor,
     o_out: torch.Tensor,
     *,
-    stream,
     g_t: torch.Tensor,
     chunk_size: int = 128,
     cu_seqlens: torch.Tensor | None = None,
@@ -457,6 +455,7 @@ def run_chunk_o(
     ws_qs = torch.zeros(bd, chunk_size, D, device=q.device, dtype=torch.float16)
     ws_gated = torch.zeros(bd, chunk_size, chunk_size, device=q.device, dtype=torch.float16)
     lib = load_chunk_o(D, chunk_size)
+    stream = torch.npu.current_stream()._as_parameter_
     lib.call_kernel(
         bd, stream,
         _vp(q), _vp(k), _vp(v_new), _vp(s), _vp(g_t), _vp(mask),
