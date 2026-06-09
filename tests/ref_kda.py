@@ -131,7 +131,8 @@ def _seq_ranges(T: int, cu_seqlens=None) -> list[tuple[int, int]]:
 
 
 class RefKDA:
-    """CPU float32 reference implementations for each KDA stage.
+    """CPU reference implementations for each KDA stage.
+    All stages are executed in self.dtype precision.
 
     Matches the math of ``kda_naive.naive_chunk_kda`` exactly, which is used as
     ground truth in test_kda_e2e.py.
@@ -149,16 +150,6 @@ class RefKDA:
     - Aqk[r,c] = q_r·(k_c*exp(g_cs[r]-g_cs[c])) for r>=c  (causal, includes diagonal)
     - output: (q*exp(g_cs)) @ S + Aqk @ (u - w @ S)
     - state:  S_new[k,:] = exp(g_total[k]) * S[k,:] + sum_c k_rest[c,k]*v_corr[c,:]
-
-    Stage device requirements:
-    - cumsum: runs on NPU (requires --device); calls gate_cumsum_kda PTO kernel.
-    - all others: CPU float32 reference only.
-
-    Usage::
-
-        python tests/test_kda_single_kernels.py --device npu:0
-        python tests/test_kda_single_kernels.py --device npu:0 --quick
-        python tests/test_kda_single_kernels.py --device npu:0 --stage kkt,inv
     """
 
     def __init__(self, dtype: torch.dtype):
@@ -445,7 +436,7 @@ class RefKDA:
             chunk_size, cu_seqlens: as in other stages
 
         Returns:
-            o: [B, T, HV, V]  float32
+            o: [B, T, HV, V]  self.dtype
         """
         B, T, HV, Kd = q.shape
         Vd = v_corr.shape[-1]
@@ -485,7 +476,7 @@ class RefKDA:
         scale: float,
         chunk_size: int = 128,
     ) -> torch.Tensor:
-        """Complete CPU float32 KDA reference.  Matches naive_chunk_kda exactly.
+        """Complete CPU KDA reference.  Matches naive_chunk_kda exactly.
 
         Args:
             q:            [B, T, H,  K]  (NOT L2-normalised; naive doesn't)
