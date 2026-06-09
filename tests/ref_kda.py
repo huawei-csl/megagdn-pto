@@ -1,9 +1,12 @@
+# Parts of this code were imported from the original implementations
+# found in: https://github.com/fla-org/flash-linear-attention/
+# with the corresponding Copyright notice:
+#
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 #
 # This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-# For a list of all contributors, visit:
-#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+# LICENSE file in the root directory of the source tree:
+#   https://github.com/fla-org/flash-linear-attention/
 
 import torch
 from einops import rearrange
