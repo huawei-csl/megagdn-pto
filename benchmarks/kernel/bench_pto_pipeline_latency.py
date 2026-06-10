@@ -153,7 +153,6 @@ def staged_separate_launch(
     T = q.shape[1]
     Ddim = q.shape[3]
     N_seq = int(cu32.numel()) - 1
-    stream = torch.npu.current_stream()._as_parameter_
 
     from megagdn_pto.kernel_libs import (
         chunk_gdn_causal_masks,
@@ -174,7 +173,7 @@ def staged_separate_launch(
     g_sum = torch.empty(1, T, H, device=dev, dtype=torch.float32)
     run_chunk_cumsum(
         g.float(), g_sum,
-        stream=stream, chunk_size=C_PTO,
+        chunk_size=C_PTO,
         cu_seqlens=cu32, batch_size_override=N_seq,
     )
     g_t = transpose_gates(g_sum)
@@ -183,7 +182,7 @@ def staged_separate_launch(
     A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
     run_scaled_dot_kkt(
         k, beta, g_sum, msk_lower, A,
-        stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
+        g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
         cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg,
     )
 
@@ -193,7 +192,7 @@ def staged_separate_launch(
     u = torch.empty_like(v)
     run_wy_fast(
         k, v, beta, g_sum, A_inv, w, u,
-        stream=stream, g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
+        g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
         cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg,
     )
 
@@ -203,14 +202,14 @@ def staged_separate_launch(
     fs = torch.zeros(N_seq * H, Ddim, Ddim, device=dev, dtype=torch.float16)
     run_chunk_h(
         k, w, u, g_sum, s, v_new, fs,
-        stream=stream, g_t=g_t, chunk_size=C_PTO,
+        g_t=g_t, chunk_size=C_PTO,
         cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg,
     )
 
     o = torch.empty_like(v)
     run_chunk_o(
         q, k, v_new, s, g_sum, msk_full, o,
-        stream=stream, g_t=g_t, chunk_size=C_PTO,
+        g_t=g_t, chunk_size=C_PTO,
         cu_seqlens=cu32, batch_size_override=N_seq, key_heads=Hg,
     )
     return (o * scale).to(q.dtype), fs
@@ -249,7 +248,6 @@ def main() -> int:
     torch.manual_seed(0)
     torch.npu.set_device(args.device)
     dev = torch.device(args.device)
-    stream = torch.npu.current_stream()._as_parameter_
     tri = load_tri_inverse()
     scale = 128 ** -0.5
     Hg = args.hg
@@ -275,8 +273,10 @@ def main() -> int:
             cu = cu32.contiguous()
 
             def run_mega():
-                run_mega_kernel(q_w, k_w, v_w, g_w, beta_w, cu, stream=stream,
-                               chunk_size=patch_mod.C_PTO, scale=scale, key_heads=Hg)
+                run_mega_kernel(
+                    q_w, k_w, v_w, g_w, beta_w, cu,
+                    chunk_size=patch_mod.C_PTO, scale=scale, key_heads=Hg,
+                )
 
             def run_separate():
                 staged_separate_launch(

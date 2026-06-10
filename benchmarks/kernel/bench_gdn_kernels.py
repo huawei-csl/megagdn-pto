@@ -282,14 +282,14 @@ def _print_stage(name, ms_pto, ms_t64, ms_t128):
 
 
 def bench_chunk_cumsum(H, T, cu_seqlens, dev, stream, bd):
-    lib = load_chunk_cumsum(H, D, C_PTO)
+    lib = load_chunk_cumsum(C_PTO)
     g = torch.randn(1, T, H, device=dev, dtype=torch.float32)
     g_sum = torch.empty_like(g)
     batch = len(cu_seqlens) - 1
     cu32 = cu_seqlens.to(torch.int32)
 
     def run_pto():
-        lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T)
+        lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T, H)
 
     run_pto(); torch.npu.synchronize()
     ms_pto = _bench_npu(run_pto)
@@ -300,7 +300,7 @@ def bench_chunk_cumsum(H, T, cu_seqlens, dev, stream, bd):
 
 
 def bench_kkt(H, HG, T, cu_seqlens, dev, stream, bd):
-    lib_k = load_scaled_dot_kkt(H, D, C_PTO, key_heads=HG)
+    lib_k = load_scaled_dot_kkt(D, C_PTO)
     k = torch.randn(1, T, HG, D, device=dev, dtype=torch.float16)
     beta = torch.rand(1, T, H, device=dev, dtype=torch.float16)
     g_sum = torch.randn(1, T, H, device=dev, dtype=torch.float32)
@@ -312,7 +312,7 @@ def bench_kkt(H, HG, T, cu_seqlens, dev, stream, bd):
 
     def run_pto():
         lib_k.call_kernel(bd, stream, _vp(k), _vp(beta_t), _vp(g_t), _vp(msk),
-                          _vp(ws), _vp(A), _vp(cu_seqlens), batch, T, T)
+                          _vp(ws), _vp(A), _vp(cu_seqlens), batch, T, T, H, HG)
 
     run_pto(); torch.npu.synchronize()
     ms_pto = _bench_npu(run_pto)
@@ -373,7 +373,7 @@ def bench_solve_tril(H, T, cu_seqlens, dev, tri_inv):
 
 
 def bench_wy_fast(H, HG, T, cu_seqlens, dev, stream, bd):
-    lib = load_wy_fast(H, D, C_PTO, key_heads=HG)
+    lib = load_wy_fast(D, C_PTO)
     k = torch.randn(1, T, HG, D, device=dev, dtype=torch.float16)
     v = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
     beta = torch.rand(1, T, H, device=dev, dtype=torch.float16)
@@ -389,7 +389,7 @@ def bench_wy_fast(H, HG, T, cu_seqlens, dev, stream, bd):
     def run_pto():
         lib.call_kernel(bd, stream, _vp(k), _vp(v), _vp(beta_t), _vp(g_t), _vp(A),
                         _vp(ws1), _vp(ws2), _vp(w_out), _vp(u_out), _vp(cu_seqlens),
-                        batch, T, T)
+                        batch, T, T, H, HG)
 
     run_pto(); torch.npu.synchronize()
     ms_pto = _bench_npu(run_pto)
@@ -400,7 +400,7 @@ def bench_wy_fast(H, HG, T, cu_seqlens, dev, stream, bd):
 
 
 def bench_chunk_h(H, HG, T, tc, cu_seqlens, dev, stream, bd):
-    lib = load_chunk_h(H, D, C_PTO, key_heads=HG)
+    lib = load_chunk_h(D, C_PTO)
     k = torch.randn(1, T, HG, D, device=dev, dtype=torch.float16)
     w = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
     u = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
@@ -414,8 +414,8 @@ def bench_chunk_h(H, HG, T, tc, cu_seqlens, dev, stream, bd):
 
     def run_pto():
         lib.call_kernel(bd, stream, _vp(k), _vp(w), _vp(u), _vp(g_t),
-                        _vp(s), _vp(v_new), _vp(fs), _vp(ws), _vp(cu_seqlens),
-                        batch, T, T)
+                        _vp(s), _vp(v_new), _vp(fs), ctypes.c_void_p(), 0, 1,
+                        _vp(ws), _vp(cu_seqlens), batch, T, T, H, HG)
 
     run_pto(); torch.npu.synchronize()
     ms_pto = _bench_npu(run_pto)
@@ -426,8 +426,8 @@ def bench_chunk_h(H, HG, T, tc, cu_seqlens, dev, stream, bd):
 
 
 def bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd):
-    lib_h = load_chunk_h(H, D, C_PTO, key_heads=HG)
-    lib_o = load_chunk_o(H, D, C_PTO, key_heads=HG)
+    lib_h = load_chunk_h(D, C_PTO)
+    lib_o = load_chunk_o(D, C_PTO)
     k = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
     q = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
     w = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
@@ -441,8 +441,8 @@ def bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd):
     batch = len(cu_seqlens) - 1
     # Populate s and v_new via chunk_h warmup
     lib_h.call_kernel(bd, stream, _vp(k), _vp(w), _vp(u), _vp(g_t),
-                      _vp(s), _vp(v_new), _vp(fs), _vp(ws_h), _vp(cu_seqlens),
-                      batch, T, T)
+                      _vp(s), _vp(v_new), _vp(fs), ctypes.c_void_p(), 0, 1,
+                      _vp(ws_h), _vp(cu_seqlens), batch, T, T, H, HG)
     torch.npu.synchronize()
     msk = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
     ws1 = torch.zeros(bd, C_PTO, C_PTO, device=dev, dtype=torch.float16)
@@ -453,7 +453,7 @@ def bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd):
     def run_pto():
         lib_o.call_kernel(bd, stream, _vp(q), _vp(k), _vp(v_new), _vp(s), _vp(g_t),
                           _vp(msk), _vp(ws1), _vp(ws2), _vp(ws3), _vp(o), _vp(cu_seqlens),
-                          batch, T, T)
+                          batch, T, T, H, HG)
 
     run_pto(); torch.npu.synchronize()
     ms_pto = _bench_npu(run_pto)
@@ -463,7 +463,7 @@ def bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd):
     return ms_pto, ms_t64, ms_t128
 
 
-def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
+def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
     """Mega-kernel vs staged PTO (aggregated)."""
     q = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
     k = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
@@ -473,8 +473,10 @@ def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
     scale = D ** -0.5
 
     def run_mega():
-        run_mega_kernel(q, k, v, g_in, beta, cu_seqlens, stream=stream,
-                        chunk_size=C_PTO, scale=scale, key_heads=HG)
+        run_mega_kernel(
+            q, k, v, g_in, beta, cu_seqlens,
+            chunk_size=C_PTO, scale=scale, key_heads=HG,
+        )
 
     run_mega(); torch.npu.synchronize()
     ms_mega = _bench_npu(run_mega)
@@ -502,7 +504,7 @@ def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
         msk_l = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
         msk_f = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
         A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
-        run_scaled_dot_kkt(k, beta, g_sum, msk_l, A, stream=stream,
+        run_scaled_dot_kkt(k, beta, g_sum, msk_l, A,
                            g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                            cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
@@ -510,19 +512,19 @@ def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
         torch.npu.synchronize()
         w = torch.empty_like(v)
         u = torch.empty_like(v)
-        run_wy_fast(k, v, beta, g_sum, A_inv, w, u, stream=stream,
+        run_wy_fast(k, v, beta, g_sum, A_inv, w, u,
                     g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
         s = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
         v_new = torch.empty_like(v)
         fs = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
-        run_chunk_h(k, w, u, g_sum, s, v_new, fs, stream=stream,
+        run_chunk_h(k, w, u, g_sum, s, v_new, fs,
                     g_t=g_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
         o = torch.empty_like(v)
-        run_chunk_o(q, k, v_new, s, g_sum, msk_f, o, stream=stream,
+        run_chunk_o(q, k, v_new, s, g_sum, msk_f, o,
                     g_t=g_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
@@ -653,7 +655,7 @@ def main() -> None:
             row["chunk_o_speedup_vs128"] = ms_t128 / ms_pto if ms_t128 else None
             gc.collect()
         if args.mega:
-            ms_mega, ms_staged = bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv)
+            ms_mega, ms_staged = bench_mega(H, HG, T, cu_seqlens, dev, tri_inv)
             row["mega_ms"] = ms_mega
             row["staged_ms"] = ms_staged
             row["mega_speedup"] = ms_staged / ms_mega if ms_mega else None
