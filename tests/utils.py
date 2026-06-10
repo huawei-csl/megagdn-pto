@@ -18,9 +18,12 @@ class NumericalAccuracy:
     ) -> bool:
         adjusted_rtol = min(0.5, self.rtol * chunk_size)
 
-        diff = (actual - expected).abs()
-        frob_rel_error = torch.sqrt(torch.sum(diff**2) / torch.sum(expected**2))
-        rel_err_bound = self.atol + adjusted_rtol * expected.abs()
+        actual_fp64 = actual.double()
+        expected_fp64 = expected.double()
+
+        diff = (actual_fp64 - expected_fp64).abs()
+        frob_rel_error = torch.sqrt(torch.sum(diff**2) / torch.sum(expected_fp64**2))
+        rel_err_bound = self.atol + adjusted_rtol * expected_fp64.abs()
         if (diff > rel_err_bound).all():
             print(
                 f"ERROR: max relative error larger than the bound: {(diff).max().item()}. ATOL={self.atol} RTOL={adjusted_rtol}"
