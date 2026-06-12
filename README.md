@@ -16,6 +16,7 @@ See full report [in English](blog/mega_gdn_en.md) or [in Chinese](blog/mega_gdn_
 - (2026/05/19) This work is presented on [CANN official account](https://mp.weixin.qq.com/s/PRTgUvSQ69Z61RsDpgoUDQ) and [NeuralTalk account](https://mp.weixin.qq.com/s/uSClZLlZUgdVJ2DWhOxbAw)!
 - (2026/05/20) MegaGDN kernel is [merged to SGlang ecosystem](https://github.com/sgl-project/sgl-kernel-npu/pull/462)!
 - (2026/06/03) Various TP degrees are supported, see [this PR](https://github.com/sgl-project/sgl-kernel-npu/pull/517) and [this follow-up PR](https://github.com/sgl-project/sgl-kernel-npu/pull/533)
+- (2026/06/09) Initial support for KDA (Kimi Linear) in [this PR](https://github.com/huawei-csl/megagdn-pto/pull/9)
 
 # To reproduce
 
