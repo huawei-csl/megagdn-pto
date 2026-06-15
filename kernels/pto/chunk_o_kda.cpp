@@ -39,10 +39,17 @@
 //   S       [total_chunks, HV, K, V] fp32  — snapshots from chunk_h_kda
 //   G_cs    [HV, T, K]               fp32  — per-dim cumulative gate (head-major)
 //   Msk     [C, C]                   fp32  — inclusive lower-tri mask (rows >= cols)
-//   workspace [per-core scratch]     fp16  — 7 slots × K*V halves
+//   workspace [per-core scratch]     float32 — 7 slots × K*V floats
 //   O       [B, T, HV, V]            fp32  — output (BSND)
 //
-// Workspace per AI core (7 slots, fp16; assumes K == V == HiddenSize):
+// NOTE: the workspace (and all three GEMMs) are fp32, not fp16: k_eff =
+//   k*exp(-g_cs) and the unmasked QK = q_eff @ k_eff^T blow up to ~e^64 (per-128
+//   chunk |g_cs|≈64) which overflows fp16 (max 6.5e4) -> inf -> inf*mask=NaN.
+//   fp32 (max 3.4e38) holds them, and the inclusive mask zeroes the upper-tri
+//   cleanly.  q/k/v/S inputs arrive as fp16 from GM and are cast up; O is cast
+//   back to fp16 on write.
+//
+// Workspace per AI core (7 slots, float32; assumes K == V == HiddenSize):
 //   WS_Q   [C, K]   Vec writes q*exp(g_cs)  → Cube reads (GEMM1 A, GEMM2 A)
 //   WS_K   [C, K]   Vec writes k*exp(-g_cs) → Cube reads (GEMM1 B, transposed)
 //   WS_V   [C, V]   Vec writes V_corr fp16  → Cube reads (GEMM3 B)
@@ -195,8 +202,8 @@ template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
 AICORE void chunk_o_kda_kernel(
     __gm__ half *Q_handle, __gm__ half *K_handle,
     __gm__ half *V_handle, __gm__ half *S_handle,
-    __gm__ half *G_handle, __gm__ float *Mask_handle,
-    __gm__ half  *workspace_handle,
+    __gm__ float *G_handle, __gm__ float *Mask_handle,
+    __gm__ float *workspace_handle,
     __gm__ half *O_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
@@ -215,7 +222,7 @@ AICORE void chunk_o_kda_kernel(
   constexpr int32_t HM_STRIDE   = HiddenSize;    // head-major Q, K, G stride
   constexpr int32_t KV = K_DIM * V_DIM;
 
-  // ── Workspace slots (fp16 half-elements, per AI core) ────────────────────
+  // ── Workspace slots (fp32 elements, per AI core) ─────────────────────────
   constexpr int32_t WS_Q   = 0;
   constexpr int32_t WS_K   = WS_Q   + C * K_DIM;
   constexpr int32_t WS_V   = WS_K   + C * K_DIM;
@@ -233,16 +240,16 @@ AICORE void chunk_o_kda_kernel(
   //   s_l1   @  64*1024 : [K, V]     — input to GEMM2
   //   qkm_l1 @  96*1024 : [C, C]     — masked Aqk, input to GEMM3
   //   v_l1   @ 128*1024 : [C, V]     — V_corr, input to GEMM3
-  TileMatL1<half, C, K_DIM, C, K_DIM> q_l1;
+  TileMatL1<float, C, K_DIM, C, K_DIM> q_l1;
   TASSIGN(q_l1, 0);
-  TileMatL1<half, C, K_DIM, C, K_DIM> k_l1;
-  TASSIGN(k_l1, C * K_DIM * sizeof(half));
-  TileMatL1<half, K_DIM, V_DIM, K_DIM, V_DIM> s_l1;
-  TASSIGN(s_l1, (C * K_DIM + C * K_DIM) * sizeof(half));
-  TileMatL1<half, C, C, C, C> qkm_l1;
-  TASSIGN(qkm_l1, (C * K_DIM + C * K_DIM + KV) * sizeof(half));
-  TileMatL1<half, C, V_DIM, C, V_DIM> v_l1;
-  TASSIGN(v_l1, (C * K_DIM + C * K_DIM + KV + C * C) * sizeof(half));
+  TileMatL1<float, C, K_DIM, C, K_DIM> k_l1;
+  TASSIGN(k_l1, C * K_DIM * sizeof(float));
+  TileMatL1<float, K_DIM, V_DIM, K_DIM, V_DIM> s_l1;
+  TASSIGN(s_l1, (C * K_DIM + C * K_DIM) * sizeof(float));
+  TileMatL1<float, C, C, C, C> qkm_l1;
+  TASSIGN(qkm_l1, (C * K_DIM + C * K_DIM + KV) * sizeof(float));
+  TileMatL1<float, C, V_DIM, C, V_DIM> v_l1;
+  TASSIGN(v_l1, (C * K_DIM + C * K_DIM + KV + C * C) * sizeof(float));
 
   // L0C accumulators (separate physical L0C, not L1).
   //   qk_l0  @ 0 : [C, C]   — GEMM1 result; stored to GM, then space reused
@@ -311,9 +318,9 @@ AICORE void chunk_o_kda_kernel(
       {
         GmShape2D q_shape(C, K_DIM);
         GmStride2D q_stride(K_DIM);
-        GmTensor2D<half> q_global(workspace_handle + ws_base + WS_Q,
+        GmTensor2D<float> q_global(workspace_handle + ws_base + WS_Q,
                                   q_shape, q_stride);
-        DynMatL1<half, C, K_DIM> q_l1_load(C, K_DIM);
+        DynMatL1<float, C, K_DIM> q_l1_load(C, K_DIM);
         TASSIGN(q_l1_load, 0);
         TLOAD(q_l1_load, q_global);
       }
@@ -321,31 +328,31 @@ AICORE void chunk_o_kda_kernel(
       {
         GmShape2D k_shape(C, K_DIM);
         GmStride2D k_stride(K_DIM);
-        GmTensor2D<half> k_global(workspace_handle + ws_base + WS_K,
+        GmTensor2D<float> k_global(workspace_handle + ws_base + WS_K,
                                   k_shape, k_stride);
-        DynMatL1<half, C, K_DIM> k_l1_load(C, K_DIM);
-        TASSIGN(k_l1_load, C * K_DIM * sizeof(half));
+        DynMatL1<float, C, K_DIM> k_l1_load(C, K_DIM);
+        TASSIGN(k_l1_load, C * K_DIM * sizeof(float));
         TLOAD(k_l1_load, k_global);
       }
       // Load S [K, V] fp16 from WS_S.
       {
         GmShape2D s_shape(K_DIM, V_DIM);
         GmStride2D s_stride(V_DIM);
-        GmTensor2D<half> s_global(workspace_handle + ws_base + WS_S,
+        GmTensor2D<float> s_global(workspace_handle + ws_base + WS_S,
                                   s_shape, s_stride);
-        DynMatL1<half, K_DIM, V_DIM> s_l1_load(K_DIM, V_DIM);
-        TASSIGN(s_l1_load, (C * K_DIM + C * K_DIM) * sizeof(half));
+        DynMatL1<float, K_DIM, V_DIM> s_l1_load(K_DIM, V_DIM);
+        TASSIGN(s_l1_load, (C * K_DIM + C * K_DIM) * sizeof(float));
         TLOAD(s_l1_load, s_global);
       }
       // Load V_corr [C, V] fp16 from WS_V.
       {
         GmShape2D v_shape(C, V_DIM);
         GmStride2D v_stride(V_DIM);
-        GmTensor2D<half> v_global(workspace_handle + ws_base + WS_V,
+        GmTensor2D<float> v_global(workspace_handle + ws_base + WS_V,
                                   v_shape, v_stride);
-        DynMatL1<half, C, V_DIM> v_l1_load(C, V_DIM);
+        DynMatL1<float, C, V_DIM> v_l1_load(C, V_DIM);
         TASSIGN(v_l1_load,
-                (C * K_DIM + C * K_DIM + KV + C * C) * sizeof(half));
+                (C * K_DIM + C * K_DIM + KV + C * C) * sizeof(float));
         TLOAD(v_l1_load, v_global);
       }
 
@@ -353,14 +360,14 @@ AICORE void chunk_o_kda_kernel(
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
       // GEMM1: QK = Q @ K^T — [C, K] @ [K, C] → [C, C].
-      gemm_oneshot<half, float, C, C, K_DIM, /*transpose_B=*/true>(
+      gemm_oneshot<float, float, C, C, K_DIM, /*transpose_B=*/true>(
           q_l1, k_l1, qk_l0);
 
-      // Store QK fp16 → WS_QK.
+      // Store QK fp32 → WS_QK (unmasked upper-tri can be ~e^64; fp32 holds it).
       {
         GmShape2D qk_shape(C, C);
         GmStride2D qk_stride(C);
-        GmTensor2D<half> qk_global(workspace_handle + ws_base + WS_QK,
+        GmTensor2D<float> qk_global(workspace_handle + ws_base + WS_QK,
                                    qk_shape, qk_stride);
         TileAcc<float, C, C, C, C> qk_store;
         TASSIGN(qk_store, 0);
@@ -371,14 +378,14 @@ AICORE void chunk_o_kda_kernel(
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
       // GEMM2: QS = Q @ S — [C, K] @ [K, V] → [C, V].
-      gemm_oneshot<half, float, C, V_DIM, K_DIM, /*transpose_B=*/false>(
+      gemm_oneshot<float, float, C, V_DIM, K_DIM, /*transpose_B=*/false>(
           q_l1, s_l1, qs_l0);
 
-      // Store QS fp16 → WS_QS.
+      // Store QS fp32 → WS_QS.
       {
         GmShape2D qs_shape(C, V_DIM);
         GmStride2D qs_stride(V_DIM);
-        GmTensor2D<half> qs_global(workspace_handle + ws_base + WS_QS,
+        GmTensor2D<float> qs_global(workspace_handle + ws_base + WS_QS,
                                    qs_shape, qs_stride);
         TileAcc<float, C, V_DIM, C, V_DIM> qs_store;
         TASSIGN(qs_store, C * C * sizeof(float));
@@ -393,11 +400,11 @@ AICORE void chunk_o_kda_kernel(
       {
         GmShape2D qkm_shape(C, C);
         GmStride2D qkm_stride(C);
-        GmTensor2D<half> qkm_global(workspace_handle + ws_base + WS_QK,
+        GmTensor2D<float> qkm_global(workspace_handle + ws_base + WS_QK,
                                     qkm_shape, qkm_stride);
-        DynMatL1<half, C, C> qkm_l1_load(C, C);
+        DynMatL1<float, C, C> qkm_l1_load(C, C);
         TASSIGN(qkm_l1_load,
-                (C * K_DIM + C * K_DIM + KV) * sizeof(half));
+                (C * K_DIM + C * K_DIM + KV) * sizeof(float));
         TLOAD(qkm_l1_load, qkm_global);
       }
 
@@ -405,14 +412,14 @@ AICORE void chunk_o_kda_kernel(
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
       // GEMM3: QKV = QK_masked @ V_corr — [C, C] @ [C, V] → [C, V].
-      gemm_oneshot<half, float, C, V_DIM, C, /*transpose_B=*/false>(
+      gemm_oneshot<float, float, C, V_DIM, C, /*transpose_B=*/false>(
           qkm_l1, v_l1, qkv_l0);
 
-      // Store QKV fp16 → WS_QKV.
+      // Store QKV fp32 → WS_QKV.
       {
         GmShape2D qkv_shape(C, V_DIM);
         GmStride2D qkv_stride(V_DIM);
-        GmTensor2D<half> qkv_global(workspace_handle + ws_base + WS_QKV,
+        GmTensor2D<float> qkv_global(workspace_handle + ws_base + WS_QKV,
                                     qkv_shape, qkv_stride);
         TileAcc<float, C, V_DIM, C, V_DIM> qkv_store;
         TASSIGN(qkv_store, 0);
@@ -498,8 +505,6 @@ AICORE void chunk_o_kda_kernel(
       TASSIGN(q_ub, SLOT_B_ADDR);
       TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> exp_ub;
       TASSIGN(exp_ub, SLOT_C_ADDR);
-      TileUbDataND<half,  HalfC, K_DIM, HalfC, K_DIM> qh_ub;
-      TASSIGN(qh_ub, SLOT_D_ADDR);
 
       // ── (A.1) Load Q and G_cs (head-major fp16) ──────────────────────
       if (valid_rows > 0) {
@@ -529,51 +534,45 @@ AICORE void chunk_o_kda_kernel(
         {
           GmShape2D g_shape(valid_rows, K_DIM);
           GmStride2D g_stride(HM_STRIDE);
-          GmTensor2D<half> g_global(G_handle + hk_base, g_shape, g_stride);
-          TileUbDataND<half, HalfC, K_DIM, HalfC, K_DIM,
+          GmTensor2D<float> g_global(G_handle + hk_base, g_shape, g_stride);
+          TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM,
                        pto::PadValue::Zero> g_stg_full;
-          TASSIGN(g_stg_full, SLOT_D_ADDR);
-          DynVecTile<half, HalfC, K_DIM, pto::PadValue::Zero> g_load(
+          TASSIGN(g_stg_full, SLOT_A_ADDR);
+          DynVecTile<float, HalfC, K_DIM, pto::PadValue::Zero> g_load(
               valid_rows, K_DIM);
-          TASSIGN(g_load, SLOT_D_ADDR);
-          TLOAD(g_load, g_global);
+          TASSIGN(g_load, SLOT_A_ADDR);
+          TLOAD(g_load, g_global);  // g_cs fp32 → g_ub directly
           if (valid_rows != HalfC) {
             TFILLPAD_INPLACE(g_stg_full, g_load);
           }
         }
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        {
-          TileUbDataND<half, HalfC, K_DIM, HalfC, K_DIM> g_stg_cvt;
-          TASSIGN(g_stg_cvt, SLOT_D_ADDR);
-          TCVT(g_ub, g_stg_cvt, pto::RoundMode::CAST_NONE);
-          pipe_barrier(PIPE_V);
-        }
       } else {
         TEXPANDS(q_ub, 0.0f);
         TEXPANDS(g_ub, 0.0f);
       }
 
       // ── (A.2) q_eff = Q * exp(g_cs) ──────────────────────────────────
+      // exp(g_cs) ≤ 1 (g_cs ≤ 0) so q_eff is bounded; kept fp32 to match the
+      // fp32 GEMM (k_eff below overflows fp16).
       TEXP(exp_ub, g_ub);
       pipe_barrier(PIPE_V);
       TMUL(q_ub, q_ub, exp_ub);
       pipe_barrier(PIPE_V);
-      TCVT(qh_ub, q_ub, pto::RoundMode::CAST_NONE);
-      pipe_barrier(PIPE_V);
 
-      // Store q_eff fp16 → WS_Q (full HalfC rows; padded zeros for invalid).
+      // Store q_eff fp32 → WS_Q (full HalfC rows; padded zeros for invalid).
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       {
         GmShape2D q_shape(HalfC, K_DIM);
         GmStride2D q_stride(K_DIM);
-        GmTensor2D<half> q_global(
+        GmTensor2D<float> q_global(
             workspace_handle + ws_base + WS_Q +
                 static_cast<int64_t>(vid) * HalfC * K_DIM,
             q_shape, q_stride);
-        DynVecTile<half, HalfC, K_DIM> q_store(HalfC, K_DIM);
-        TASSIGN(q_store, SLOT_D_ADDR);
+        DynVecTile<float, HalfC, K_DIM> q_store(HalfC, K_DIM);
+        TASSIGN(q_store, SLOT_B_ADDR);
         TSTORE(q_global, q_store);
       }
 
@@ -617,10 +616,9 @@ AICORE void chunk_o_kda_kernel(
       pipe_barrier(PIPE_V);
       TEXP(exp_ub, exp_ub);
       pipe_barrier(PIPE_V);
-      // q_ub now holds K (we reused the buffer).
+      // q_ub now holds K (we reused the buffer).  k_eff = K*exp(-g_cs):
+      // exp(-g_cs) reaches ~e^64, so this MUST stay fp32 (overflows fp16).
       TMUL(q_ub, q_ub, exp_ub);
-      pipe_barrier(PIPE_V);
-      TCVT(qh_ub, q_ub, pto::RoundMode::CAST_NONE);
       pipe_barrier(PIPE_V);
 
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -628,12 +626,12 @@ AICORE void chunk_o_kda_kernel(
       {
         GmShape2D k_shape(HalfC, K_DIM);
         GmStride2D k_stride(K_DIM);
-        GmTensor2D<half> k_global(
+        GmTensor2D<float> k_global(
             workspace_handle + ws_base + WS_K +
                 static_cast<int64_t>(vid) * HalfC * K_DIM,
             k_shape, k_stride);
-        DynVecTile<half, HalfC, K_DIM> k_store(HalfC, K_DIM);
-        TASSIGN(k_store, SLOT_D_ADDR);
+        DynVecTile<float, HalfC, K_DIM> k_store(HalfC, K_DIM);
+        TASSIGN(k_store, SLOT_B_ADDR);
         TSTORE(k_global, k_store);
       }
 
@@ -649,6 +647,8 @@ AICORE void chunk_o_kda_kernel(
         TileUbDataND<half, HalfC, V_DIM, HalfC, V_DIM,
                      pto::PadValue::Zero> vh_ub;
         TASSIGN(vh_ub, SLOT_D_ADDR);
+        TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> v_f_ub;
+        TASSIGN(v_f_ub, SLOT_A_ADDR);
 
         int64_t v_offset = (chunk_start * H + head) * V_DIM +
                            static_cast<int64_t>(vid) * HalfC * BSND_STRIDE;
@@ -663,27 +663,25 @@ AICORE void chunk_o_kda_kernel(
           if (valid_rows != HalfC) {
             TFILLPAD_INPLACE(vh_ub, v_load);
           }
-        } else {
-          TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> v_zero;
-          TASSIGN(v_zero, SLOT_A_ADDR);
-          TEXPANDS(v_zero, 0.0f);
+          set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+          wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+          TCVT(v_f_ub, vh_ub, pto::RoundMode::CAST_NONE);  // fp16 → fp32
           pipe_barrier(PIPE_V);
-          TCVT(vh_ub, v_zero, pto::RoundMode::CAST_NONE);
+        } else {
+          TEXPANDS(v_f_ub, 0.0f);
           pipe_barrier(PIPE_V);
         }
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         GmShape2D vw_shape(HalfC, V_DIM);
         GmStride2D vw_stride(V_DIM);
-        GmTensor2D<half> vw_global(
+        GmTensor2D<float> vw_global(
             workspace_handle + ws_base + WS_V +
                 static_cast<int64_t>(vid) * HalfC * V_DIM,
             vw_shape, vw_stride);
-        DynVecTile<half, HalfC, V_DIM> v_store(HalfC, V_DIM);
-        TASSIGN(v_store, SLOT_D_ADDR);
+        DynVecTile<float, HalfC, V_DIM> v_store(HalfC, V_DIM);
+        TASSIGN(v_store, SLOT_A_ADDR);
         TSTORE(vw_global, v_store);
       }
 
@@ -697,6 +695,8 @@ AICORE void chunk_o_kda_kernel(
       {
         TileUbDataND<half, HalfC, V_DIM, HalfC, V_DIM> sh_ub;
         TASSIGN(sh_ub, SLOT_D_ADDR);
+        TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> s_f_ub;
+        TASSIGN(s_f_ub, SLOT_A_ADDR);
 
         int64_t s_in_offset =
             (chunk_offset + static_cast<int64_t>(ci)) * H * KV +
@@ -710,18 +710,19 @@ AICORE void chunk_o_kda_kernel(
         TLOAD(s_load, s_global);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        TCVT(s_f_ub, sh_ub, pto::RoundMode::CAST_NONE);  // fp16 → fp32
         pipe_barrier(PIPE_V);
 
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         GmShape2D sw_shape(HalfC, V_DIM);
         GmStride2D sw_stride(V_DIM);
-        GmTensor2D<half> sw_global(
+        GmTensor2D<float> sw_global(
             workspace_handle + ws_base + WS_S +
                 static_cast<int64_t>(vid) * HalfC * V_DIM,
             sw_shape, sw_stride);
-        DynVecTile<half, HalfC, V_DIM> s_store(HalfC, V_DIM);
-        TASSIGN(s_store, SLOT_D_ADDR);
+        DynVecTile<float, HalfC, V_DIM> s_store(HalfC, V_DIM);
+        TASSIGN(s_store, SLOT_A_ADDR);
         TSTORE(sw_global, s_store);
       }
 
@@ -736,37 +737,34 @@ AICORE void chunk_o_kda_kernel(
       pipe_barrier(PIPE_ALL);
 
       {
-        TileUbDataND<half,  HalfC, C, HalfC, C> qkh_ub;
-        TASSIGN(qkh_ub, SLOT_D_ADDR);
         TileUbDataND<float, HalfC, C, HalfC, C> qk_ub;
         TASSIGN(qk_ub, SLOT_C_ADDR);
         TileUbDataND<float, HalfC, C, HalfC, C> mask_view;
         TASSIGN(mask_view, MASK_UB_ADDR);
 
-        // Load QK [HalfC, C] fp16 → UB (only this vid's rows).
+        // Load QK [HalfC, C] fp32 → SLOT_C (only this vid's rows).
         GmShape2D qk_shape(HalfC, C);
         GmStride2D qk_stride(C);
-        GmTensor2D<half> qk_global(
+        GmTensor2D<float> qk_global(
             workspace_handle + ws_base + WS_QK +
                 static_cast<int64_t>(vid) * HalfC * C,
             qk_shape, qk_stride);
-        DynVecTile<half, HalfC, C> qk_load(HalfC, C);
-        TASSIGN(qk_load, SLOT_D_ADDR);
+        DynVecTile<float, HalfC, C> qk_load(HalfC, C);
+        TASSIGN(qk_load, SLOT_C_ADDR);
         TLOAD(qk_load, qk_global);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-        TCVT(qk_ub, qkh_ub, pto::RoundMode::CAST_NONE);
-        pipe_barrier(PIPE_V);
+        // Inclusive causal mask zeroes the upper-tri, where QK = exp(g_r-g_c) > 1
+        // (up to ~e^64).  fp32 keeps these finite, so mask*QK = 0 (fp16 would be
+        // inf -> inf*0 = NaN).
         TMUL(qk_ub, qk_ub, mask_view);
-        pipe_barrier(PIPE_V);
-        TCVT(qkh_ub, qk_ub, pto::RoundMode::CAST_NONE);
         pipe_barrier(PIPE_V);
 
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        DynVecTile<half, HalfC, C> qk_store(HalfC, C);
-        TASSIGN(qk_store, SLOT_D_ADDR);
+        DynVecTile<float, HalfC, C> qk_store(HalfC, C);
+        TASSIGN(qk_store, SLOT_C_ADDR);
         TSTORE(qk_global, qk_store);
       }
       pipe_barrier(PIPE_ALL);
@@ -783,53 +781,39 @@ AICORE void chunk_o_kda_kernel(
       pipe_barrier(PIPE_ALL);
 
       if (valid_rows > 0) {
-        TileUbDataND<half,  HalfC, V_DIM, HalfC, V_DIM> qsh_ub;
-        TASSIGN(qsh_ub, SLOT_D_ADDR);
         TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> qs_ub;
         TASSIGN(qs_ub, SLOT_A_ADDR);
+        TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> qkv_ub;
+        TASSIGN(qkv_ub, SLOT_B_ADDR);
 
-        // Load QS fp16 → SLOT_D.
+        // Load QS fp32 → SLOT_A.
         {
           GmShape2D qs_shape(HalfC, V_DIM);
           GmStride2D qs_stride(V_DIM);
-          GmTensor2D<half> qs_global(
+          GmTensor2D<float> qs_global(
               workspace_handle + ws_base + WS_QS +
                   static_cast<int64_t>(vid) * HalfC * V_DIM,
               qs_shape, qs_stride);
-          DynVecTile<half, HalfC, V_DIM> qs_load(HalfC, V_DIM);
-          TASSIGN(qs_load, SLOT_D_ADDR);
+          DynVecTile<float, HalfC, V_DIM> qs_load(HalfC, V_DIM);
+          TASSIGN(qs_load, SLOT_A_ADDR);
           TLOAD(qs_load, qs_global);
         }
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-
-        // Cast QS to fp32 → SLOT_A (frees SLOT_D for QKV load).
-        TCVT(qs_ub, qsh_ub, pto::RoundMode::CAST_NONE);
-        pipe_barrier(PIPE_V);
-
-        // Load QKV fp16 → SLOT_D (reuse).
-        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-        TileUbDataND<half,  HalfC, V_DIM, HalfC, V_DIM> qkvh_ub;
-        TASSIGN(qkvh_ub, SLOT_D_ADDR);
-        TileUbDataND<float, HalfC, V_DIM, HalfC, V_DIM> qkv_ub;
-        TASSIGN(qkv_ub, SLOT_B_ADDR);
+        // Load QKV fp32 → SLOT_B.
         {
           GmShape2D qkv_shape(HalfC, V_DIM);
           GmStride2D qkv_stride(V_DIM);
-          GmTensor2D<half> qkv_global(
+          GmTensor2D<float> qkv_global(
               workspace_handle + ws_base + WS_QKV +
                   static_cast<int64_t>(vid) * HalfC * V_DIM,
               qkv_shape, qkv_stride);
-          DynVecTile<half, HalfC, V_DIM> qkv_load(HalfC, V_DIM);
-          TASSIGN(qkv_load, SLOT_D_ADDR);
+          DynVecTile<float, HalfC, V_DIM> qkv_load(HalfC, V_DIM);
+          TASSIGN(qkv_load, SLOT_B_ADDR);
           TLOAD(qkv_load, qkv_global);
         }
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-        TCVT(qkv_ub, qkvh_ub, pto::RoundMode::CAST_NONE);
-        pipe_barrier(PIPE_V);
+        // O = QS + QKV  (both bounded; fp32).
         TADD(qs_ub, qs_ub, qkv_ub);
         pipe_barrier(PIPE_V);
 
@@ -874,9 +858,9 @@ extern "C" __global__ AICORE void launch_chunk_o_kda(
       reinterpret_cast<__gm__ half *>(K),
       reinterpret_cast<__gm__ half *>(V_corr),
       reinterpret_cast<__gm__ half *>(S),
-      reinterpret_cast<__gm__ half *>(G),
+      reinterpret_cast<__gm__ float *>(G),
       reinterpret_cast<__gm__ float *>(Mask),
-      reinterpret_cast<__gm__ half  *>(workspace),
+      reinterpret_cast<__gm__ float *>(workspace),
       reinterpret_cast<__gm__ half *>(O),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
       batch_size, seq_len, total_tokens, ffts_addr);

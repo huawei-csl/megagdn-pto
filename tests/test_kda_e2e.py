@@ -103,7 +103,8 @@ def pto_pipeline_kda(
 
     # ── Stage 1: gate_cumsum_kda — NPU PTO kernel ────────────────────────────
     g_dev = g_log.half().to(dev)
-    g_sum_dev = torch.empty_like(g_dev)
+    # g_sum is fp32 (cumulative gate reaches ~-64; fp16 there corrupts exp(g_cs)).
+    g_sum_dev = torch.empty(1, T, HV, Kd, device=dev, dtype=torch.float32)
     run_gate_cumsum_kda(
         g_dev,
         g_sum_dev,
@@ -281,6 +282,7 @@ def run_one(
     scale: float,
     chunk_size: int,
     tri_inv_func,
+    g_scale: float = 1.0,
 ) -> tuple[bool, str]:
     cu_list = T_or_cu if isinstance(T_or_cu, list) else None
     T = T_total if cu_list else T_or_cu
@@ -291,11 +293,11 @@ def run_one(
     q = F.normalize(torch.randn(1, T, H, K), dim=-1, p=2)
     k = F.normalize(torch.randn(1, T, H, K), dim=-1, p=2)
     v = torch.randn(1, T, HV, V_DIM)
-    # Values in (-0.05, 0): cumulative |g_cs| stays under ~7 so the fp16
-    # workspaces in kkt_kda / chunk_o_kda (which stage exp(g_cs) and
-    # exp(-g_cs) separately for Cube-core GEMMs) don't overflow.  Larger
-    # magnitudes blow up exp(-g_cs) past fp16 max (~65504) -> inf -> NaN.
-    g_log = -torch.rand(1, T, HV, K).to(torch.half) * 0.05
+    # Gate in (-g_scale, 0).  With g_scale=1.0 (default) the per-128-chunk
+    # cumulative |g_cs| reaches ~64, matching production KDA gates: exp(-g_cs)
+    # ≈ e^64 ≈ 6e27 — finite in the fp32 kkt_kda/chunk_o_kda workspaces, but it
+    # overflows fp16 (max 6.5e4).  This range is the actual NaN regression test.
+    g_log = -torch.rand(1, T, HV, K).to(torch.half) * g_scale
     beta_sig = torch.sigmoid(torch.randn(1, T, HV)).to(torch.half)
 
     # PTO staged pipeline (all stages on NPU)
@@ -344,6 +346,13 @@ def main() -> None:
     )
     parser.add_argument("--chunk-size", type=int, default=CHUNK)
     parser.add_argument(
+        "--g-scale",
+        type=float,
+        default=1.0,
+        help="Gate magnitude: g in (-g_scale, 0). Default 1.0 (production-like; "
+        "|g_cs|~64 exercises the fp32 exp(-g_cs) path).",
+    )
+    parser.add_argument(
         "--quick", action="store_true", help="Run only T=16 fixed-length"
     )
     args = parser.parse_args()
@@ -370,7 +379,8 @@ def main() -> None:
     for i, (T_or_cu, T_total) in enumerate(shapes):
         t0 = time.time()
         ok, label = run_one(
-            T_or_cu, T_total, H, HV, dev, scale, chunk_size, tri_inv_func
+            T_or_cu, T_total, H, HV, dev, scale, chunk_size, tri_inv_func,
+            g_scale=args.g_scale,
         )
         dt = time.time() - t0
         status = "PASS" if ok else "FAIL"

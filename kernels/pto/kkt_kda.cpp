@@ -12,8 +12,14 @@
 //   g_cs    [HV, total_tokens, K]  float32  — within-chunk cumulative gate sum
 //   beta    [HV, total_tokens]     float32  — post-sigmoid beta in (0, 1)
 //   mask    [C, C]                 float32  — strictly-lower-tri mask (1 below diag, else 0)
-//   ws_in   [block_dim*2, 2*C, K]  half     — workspace: slot A_eff (rows 0..C-1) + B_eff (C..2C-1)
-//   ws_out  [block_dim*2, C, C]    half     — workspace: GEMM result L_full
+//   ws_in   [block_dim*2, 2*C, K]  float32  — workspace: slot A_eff (rows 0..C-1) + B_eff (C..2C-1)
+//   ws_out  [block_dim*2, C, C]    float32  — workspace: GEMM result L_full
+//
+// NOTE: ws_in/ws_out are fp32 (not fp16): A_eff=k*exp(g_cs) and B_eff=k*exp(-g_cs)
+//   stage exp(±g_cs) separately, and per-128-chunk |g_cs| can reach ~64 →
+//   exp(-g_cs)≈e^64≈6e27 overflows fp16 (max 6.5e4) but fits fp32 (max 3.4e38).
+//   The K·K^T GEMM is therefore (float,float,float). L_out stays fp16 (bounded
+//   ≤ beta ≤ 1 after the strict-lower mask).
 //
 // Output:
 //   L_out   [total_tokens, HV, C]  float32  — strictly-lower-tri L matrix (BSND)
@@ -124,11 +130,11 @@ using L1MatZN = pto::Tile<pto::TileType::Mat, T, R, C, pto::BLayout::RowMajor,
 template <int32_t NumHeads, int32_t KDim, int32_t ChunkSize>
 AICORE void kkt_kda_kernel(
     __gm__ half *k_ptr,
-    __gm__ half *g_cs_ptr,
+    __gm__ float *g_cs_ptr,
     __gm__ half *beta_ptr,
     __gm__ float *mask_ptr,
-    __gm__ half *ws_in_ptr,
-    __gm__ half *ws_out_ptr,
+    __gm__ float *ws_in_ptr,
+    __gm__ float *ws_out_ptr,
     __gm__ half *L_out_ptr,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
@@ -170,11 +176,12 @@ AICORE void kkt_kda_kernel(
     // ── GM type aliases ──────────────────────────────────────────────────────
     using GmShapeDyn = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
     using GmHalfK = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
+    using GmFloatK = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
     using GmHalf_1 = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, 1, 1>>;
     using GmHalfOut = GlobalTensor<half, GmShapeDyn,
                                    Stride<1, 1, 1, NumHeads * ChunkSize, 1>>;
-    using GmHalfWsIn = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
-    using GmHalfWsOut = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
+    using GmFloatWsIn = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
+    using GmFloatWsOut = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
 
     // =========================================================================
     // VEC PHASE — both vids do real work on HalfChunk rows each
@@ -255,33 +262,25 @@ AICORE void kkt_kda_kernel(
             // ── PRE-COMPUTE (only if this vid has valid rows) ───────────────
             if (local_valid > 0)
             {
-                // Load g_cs fp16 → HalfBufAddr staging → TCVT to fp32 GUbAddr
+                // Load g_cs fp32 directly → GUbAddr (gate kept in fp32)
                 {
                     GmShapeDyn gs;
                     gs.shape[3] = local_valid;
                     gs.shape[4] = KDim;
-                    GmHalfK gm(g_cs_ptr + hk_base, gs);
-                    UbND<half, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero>
-                        g_h_ld(local_valid, KDim);
-                    TASSIGN(g_h_ld, HalfBufAddr);
-                    TLOAD(g_h_ld, gm);
+                    GmFloatK gm(g_cs_ptr + hk_base, gs);
+                    UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero>
+                        g_f_ld(local_valid, KDim);
+                    TASSIGN(g_f_ld, GUbAddr);
+                    TLOAD(g_f_ld, gm);
                     if (local_valid != HalfChunk || KDim != KTC)
                     {
-                        UbND<half, HalfChunk, KTC, HalfChunk, KTC, PadValue::Zero> g_h_pad;
-                        TASSIGN(g_h_pad, HalfBufAddr);
-                        TFILLPAD_INPLACE(g_h_pad, g_h_ld);
+                        UbND<float, HalfChunk, KTC, HalfChunk, KTC, PadValue::Zero> g_f_pad;
+                        TASSIGN(g_f_pad, GUbAddr);
+                        TFILLPAD_INPLACE(g_f_pad, g_f_ld);
                     }
                 }
                 set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                {
-                    UbND<half, HalfChunk, KTC> g_h_cvt;
-                    TASSIGN(g_h_cvt, HalfBufAddr);
-                    UbND<float, HalfChunk, KTC> g_fp32_dst;
-                    TASSIGN(g_fp32_dst, GUbAddr);
-                    TCVT(g_fp32_dst, g_h_cvt, pto::RoundMode::CAST_NONE);
-                    pipe_barrier(PIPE_V);
-                }
                 // Load k fp16 → HalfBufAddr staging → TCVT to fp32 KUbAddr
                 {
                     GmShapeDyn gs;
@@ -316,18 +315,16 @@ AICORE void kkt_kda_kernel(
                 TASSIGN(k_ub, KUbAddr);
                 UbND<float, HalfChunk, KTC> ab_ub;
                 TASSIGN(ab_ub, ABUbAddr);
-                UbND<half, HalfChunk, KTC> half_ub;
-                TASSIGN(half_ub, HalfBufAddr);
 
                 // A = k * exp(g)  (in-place scratch reuse: ab_ub = exp(g), then ab_ub *= k)
+                // Kept in fp32: exp(g) is bounded ≤1 here, but B below stages
+                // exp(-g)≈e^64 which overflows fp16, so the whole GEMM is fp32.
                 TEXP(ab_ub, g_ub);
                 pipe_barrier(PIPE_V);
                 TMUL(ab_ub, k_ub, ab_ub);
                 pipe_barrier(PIPE_V);
-                TCVT(half_ub, ab_ub, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
 
-                // Store A_half (this vid's HalfChunk rows of A) to ws_in[slot]
+                // Store A_eff (fp32; this vid's HalfChunk rows of A) to ws_in[slot]
                 //   ws_in layout: rows 0..C-1 = A, rows C..2C-1 = B
                 //   This vid writes A at offset my_row_offset.
                 {
@@ -335,9 +332,9 @@ AICORE void kkt_kda_kernel(
                     gs.shape[3] = HalfChunk;
                     gs.shape[4] = KDim;
                     int64_t off = ws_in_base + static_cast<int64_t>(my_row_offset) * KDim;
-                    GmHalfWsIn gm_a(ws_in_ptr + off, gs);
-                    UbND<half, HalfChunk, KTC, HalfChunk, KTC> A_st;
-                    TASSIGN(A_st, HalfBufAddr);
+                    GmFloatWsIn gm_a(ws_in_ptr + off, gs);
+                    UbND<float, HalfChunk, KTC, HalfChunk, KTC> A_st;
+                    TASSIGN(A_st, ABUbAddr);
                     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                     TSTORE(gm_a, A_st);
@@ -354,18 +351,16 @@ AICORE void kkt_kda_kernel(
                 pipe_barrier(PIPE_V);
                 TMUL(ab_ub, k_ub, ab_ub);
                 pipe_barrier(PIPE_V);
-                TCVT(half_ub, ab_ub, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
 
-                // Store B_half to ws_in[slot] rows C..2C-1 at offset my_row_offset
+                // Store B_eff (fp32) to ws_in[slot] rows C..2C-1 at offset my_row_offset
                 {
                     GmShapeDyn gs;
                     gs.shape[3] = HalfChunk;
                     gs.shape[4] = KDim;
                     int64_t off = ws_in_base + static_cast<int64_t>(ChunkSize) * KDim + static_cast<int64_t>(my_row_offset) * KDim;
-                    GmHalfWsIn gm_b(ws_in_ptr + off, gs);
-                    UbND<half, HalfChunk, KTC, HalfChunk, KTC> B_st;
-                    TASSIGN(B_st, HalfBufAddr);
+                    GmFloatWsIn gm_b(ws_in_ptr + off, gs);
+                    UbND<float, HalfChunk, KTC, HalfChunk, KTC> B_st;
+                    TASSIGN(B_st, ABUbAddr);
                     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
                     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
                     TSTORE(gm_b, B_st);
@@ -387,40 +382,38 @@ AICORE void kkt_kda_kernel(
             // ── POST-PROCESS (only if this vid has valid rows) ──────────────
             if (local_valid > 0)
             {
-                // Load L_full[my_row_offset..+local_valid, :] from ws_out[slot]
+                // Load L_full[my_row_offset..+local_valid, :] from ws_out[slot] (fp32)
                 {
                     int64_t wo_base = (static_cast<int64_t>(cid) * 2 + slot) * static_cast<int64_t>(WsOutSlotElems);
                     int64_t off = wo_base + static_cast<int64_t>(my_row_offset) * ChunkSize;
                     GmShapeDyn gs;
                     gs.shape[3] = local_valid;
                     gs.shape[4] = ChunkSize;
-                    GmHalfWsOut gm(ws_out_ptr + off, gs);
-                    UbND<half, HalfChunk, ChunkSize, DYNAMIC, DYNAMIC, PadValue::Zero>
-                        L_h_ld(local_valid, ChunkSize);
-                    TASSIGN(L_h_ld, LHalfUbAddr);
-                    TLOAD(L_h_ld, gm);
+                    GmFloatWsOut gm(ws_out_ptr + off, gs);
+                    UbND<float, HalfChunk, ChunkSize, DYNAMIC, DYNAMIC, PadValue::Zero>
+                        L_f_ld(local_valid, ChunkSize);
+                    TASSIGN(L_f_ld, LUbAddr);
+                    TLOAD(L_f_ld, gm);
                     if (local_valid != HalfChunk)
                     {
-                        UbND<half, HalfChunk, ChunkSize, HalfChunk, ChunkSize,
+                        UbND<float, HalfChunk, ChunkSize, HalfChunk, ChunkSize,
                              PadValue::Zero>
-                            L_h_pad;
-                        TASSIGN(L_h_pad, LHalfUbAddr);
-                        TFILLPAD_INPLACE(L_h_pad, L_h_ld);
+                            L_f_pad;
+                        TASSIGN(L_f_pad, LUbAddr);
+                        TFILLPAD_INPLACE(L_f_pad, L_f_ld);
                     }
                 }
                 set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-                UbND<half, HalfChunk, ChunkSize> L_half_ub;
-                TASSIGN(L_half_ub, LHalfUbAddr);
                 UbND<float, HalfChunk, ChunkSize> L_ub;
                 TASSIGN(L_ub, LUbAddr);
                 UbND<float, HalfChunk, ChunkSize> msk_ub;
                 TASSIGN(msk_ub, MskUbAddr);
 
-                // Cast L_full fp16 → fp32, apply mask
-                TCVT(L_ub, L_half_ub, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
+                // Apply strict-lower mask.  The unmasked upper-tri holds
+                // exp(g_r-g_c)>1 (up to ~e^64); in fp32 that is finite (~6e27),
+                // so msk*L = 0 cleanly (fp16 would have been inf → inf*0 = NaN).
                 TMUL(L_ub, L_ub, msk_ub);
                 pipe_barrier(PIPE_V);
 
@@ -515,11 +508,11 @@ AICORE void kkt_kda_kernel(
 // CUBE PHASE: GEMM  A_eff @ B_eff^T  → L_full
 // =========================================================================
 #if defined(__DAV_C220_CUBE__)
-    constexpr int32_t L1BAddr = ChunkSize * KDim * static_cast<int32_t>(sizeof(half));
+    constexpr int32_t L1BAddr = ChunkSize * KDim * static_cast<int32_t>(sizeof(float));
 
-    L1Mat<half, ChunkSize, KDim, ChunkSize, KDim> a_l1;
+    L1Mat<float, ChunkSize, KDim, ChunkSize, KDim> a_l1;
     TASSIGN(a_l1, 0);
-    L1Mat<half, ChunkSize, KDim, ChunkSize, KDim> b_l1;
+    L1Mat<float, ChunkSize, KDim, ChunkSize, KDim> b_l1;
     TASSIGN(b_l1, L1BAddr);
     TileAcc<float, ChunkSize, ChunkSize, ChunkSize, ChunkSize> a_l0;
     TASSIGN(a_l0, 0);
@@ -569,31 +562,31 @@ AICORE void kkt_kda_kernel(
 
             // ── Load A_eff [C, K] from ws_in[slot, 0:C, :] into L1 ──────────
             {
-                L1Mat<half, ChunkSize, KDim, DYNAMIC, DYNAMIC> _l1(ChunkSize, KDim);
+                L1Mat<float, ChunkSize, KDim, DYNAMIC, DYNAMIC> _l1(ChunkSize, KDim);
                 TASSIGN(_l1, 0);
                 Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
                 _gs.shape[3] = ChunkSize;
                 _gs.shape[4] = KDim;
-                GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, KDim, 1>>
+                GlobalTensor<float, decltype(_gs), Stride<1, 1, 1, KDim, 1>>
                     _gm(ws_in_ptr + ws_in_base, _gs);
                 TLOAD(_l1, _gm);
             }
             // ── Load B_eff [C, K] from ws_in[slot, C:2C, :] into L1 ─────────
             {
-                L1Mat<half, ChunkSize, KDim, DYNAMIC, DYNAMIC> _l1(ChunkSize, KDim);
+                L1Mat<float, ChunkSize, KDim, DYNAMIC, DYNAMIC> _l1(ChunkSize, KDim);
                 TASSIGN(_l1, L1BAddr);
                 Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
                 _gs.shape[3] = ChunkSize;
                 _gs.shape[4] = KDim;
-                GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, KDim, 1>>
+                GlobalTensor<float, decltype(_gs), Stride<1, 1, 1, KDim, 1>>
                     _gm(ws_in_ptr + ws_in_base + static_cast<int64_t>(ChunkSize) * KDim, _gs);
                 TLOAD(_l1, _gm);
             }
 
             // ── GEMM: A_eff @ B_eff^T → L0C accumulator ─────────────────────
             {
-                TileLeft<half, ChunkSize, KDim, ChunkSize, KDim> _l0a;
-                TileRight<half, KDim, ChunkSize, KDim, ChunkSize> _l0b;
+                TileLeft<float, ChunkSize, KDim, ChunkSize, KDim> _l0a;
+                TileRight<float, KDim, ChunkSize, KDim, ChunkSize> _l0b;
                 TASSIGN(_l0a, 0x0);
                 TASSIGN(_l0b, 0x0);
                 auto _we = EVENT_ID1;
@@ -607,7 +600,7 @@ AICORE void kkt_kda_kernel(
                 wait_flag(PIPE_M, PIPE_MTE1, _we);
 
                 TEXTRACT(_l0a, a_l1, 0, 0);
-                L1MatZN<half, KDim, ChunkSize> _b_zn;
+                L1MatZN<float, KDim, ChunkSize> _b_zn;
                 TASSIGN(_b_zn, L1BAddr);
                 TRESHAPE(_b_zn, b_l1);
                 TEXTRACT(_l0b, _b_zn, 0, 0);
@@ -630,7 +623,7 @@ AICORE void kkt_kda_kernel(
                 Shape<1, 1, 1, DYNAMIC, DYNAMIC> _gs;
                 _gs.shape[3] = ChunkSize;
                 _gs.shape[4] = ChunkSize;
-                GlobalTensor<half, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>>
+                GlobalTensor<float, decltype(_gs), Stride<1, 1, 1, ChunkSize, 1>>
                     _gm(ws_out_ptr + wo_base, _gs);
                 TSTORE(_gm, _l0);
             }
@@ -664,11 +657,11 @@ extern "C" __global__ AICORE void launch_kkt_kda(
 {
     kkt_kda_kernel<GDN_H, GDN_D, GDN_C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
-        reinterpret_cast<__gm__ half *>(g_cs_ptr),
+        reinterpret_cast<__gm__ float *>(g_cs_ptr),
         reinterpret_cast<__gm__ half *>(beta_ptr),
         reinterpret_cast<__gm__ float *>(mask_ptr),
-        reinterpret_cast<__gm__ half *>(ws_in_ptr),
-        reinterpret_cast<__gm__ half *>(ws_out_ptr),
+        reinterpret_cast<__gm__ float *>(ws_in_ptr),
+        reinterpret_cast<__gm__ float *>(ws_out_ptr),
         reinterpret_cast<__gm__ half *>(L_out_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
         batch_size, seq_len, total_tokens, ffts_addr);

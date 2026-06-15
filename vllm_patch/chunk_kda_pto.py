@@ -100,6 +100,24 @@ def chunk_kda_pto(
     g_w = g.to(torch.float16)
     beta_w = beta.to(torch.float16)
 
+    if os.environ.get("VLLM_PTO_KDA_DUMP") == "1" and not getattr(chunk_kda_pto, "_dumped", False):
+        chunk_kda_pto._dumped = True
+        import sys as _s2
+        for nm, t in (("q_w", q_w), ("k_w", k_w), ("v_w", v_w), ("g_w", g_w), ("beta_w", beta_w)):
+            print(f"[KDA-FP16] {nm} absmax={t.abs().max().item():.5g} "
+                  f"n_inf={int(torch.isinf(t).sum())} n_nan={int(torch.isnan(t).sum())}",
+                  file=_s2.stderr, flush=True)
+        try:
+            torch.save(
+                {"q": q.float().cpu(), "k": k.float().cpu(), "v": v.float().cpu(),
+                 "g": g.float().cpu(), "beta": beta.float().cpu(),
+                 "cu_seqlens": cu32.cpu(), "scale": float(scale)},
+                f"/sources/kda_real_inputs_pid{os.getpid()}.pt",
+            )
+            print(f"[KDA-FP16] dumped real inputs pid={os.getpid()}", file=_s2.stderr, flush=True)
+        except Exception as _e:  # noqa: BLE001
+            print(f"[KDA-FP16] dump failed: {_e}", file=_s2.stderr, flush=True)
+
     o, final_state = run_mega_kernel_kda(
         q_w, k_w, v_w, g_w, beta_w, cu32,
         stream=stream,

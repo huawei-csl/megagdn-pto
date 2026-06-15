@@ -142,9 +142,11 @@ def run_mega_kernel_kda(
     v = v.contiguous()
     g = g.contiguous()
 
-    # Intermediates.
-    g_sum   = torch.empty(1, T, HV, K, device=dev, dtype=torch.float16)
-    g_cs_hm = torch.empty(1, HV, T, K, device=dev, dtype=torch.float16)
+    # Intermediates.  g_sum/g_cs_hm are fp32: the per-128-chunk cumulative gate
+    # reaches ~-64 and fp16 storage there corrupts exp(g_cs) (matches GDN's fp32
+    # gate).
+    g_sum   = torch.empty(1, T, HV, K, device=dev, dtype=torch.float32)
+    g_cs_hm = torch.empty(1, HV, T, K, device=dev, dtype=torch.float32)
     L       = torch.zeros(1, T, HV, C, device=dev, dtype=torch.float16)
     A_inv   = torch.zeros(1, T, HV, C, device=dev, dtype=torch.float16)
     u       = torch.zeros(1, T, HV, V, device=dev, dtype=torch.float16)
@@ -154,12 +156,14 @@ def run_mega_kernel_kda(
     o_out   = torch.zeros(1, T, HV, V, device=dev, dtype=torch.float16)
 
     # Per-AI-core workspaces (shapes match the staged run_*_kda allocations).
-    kkt_ws_in  = torch.zeros(bd * 2, 2 * C, K, device=dev, dtype=torch.float16)
-    kkt_ws_out = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float16)
+    # kkt_ws_in/out and o_ws are fp32: they stage exp(±g_cs) and the unmasked
+    # gated GEMMs, whose values reach ~e^64 and would overflow fp16.
+    kkt_ws_in  = torch.zeros(bd * 2, 2 * C, K, device=dev, dtype=torch.float32)
+    kkt_ws_out = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float32)
     wy_ws_a2   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
     wy_ws_keff = torch.zeros(bd, C, K, device=dev, dtype=torch.float16)
     h_ws       = torch.zeros(bd * 5, K, K, device=dev, dtype=torch.float16)
-    o_ws       = torch.zeros(bd * 7, K, K, device=dev, dtype=torch.float16)
+    o_ws       = torch.zeros(bd * 7, K, K, device=dev, dtype=torch.float32)
 
     # Cold-start FFTS handshake needs all pending work (incl. workspace zero-fill) drained.
     torch.npu.synchronize()

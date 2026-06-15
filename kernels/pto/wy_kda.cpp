@@ -273,7 +273,7 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
 AICORE void wy_kda_kernel(
     __gm__ half *K_handle, __gm__ half *V_handle,
-    __gm__ half *Beta_handle, __gm__ half *G_handle,
+    __gm__ half *Beta_handle, __gm__ float *G_handle,
     __gm__ half *A_handle,
     __gm__ half *workspace_a2_handle, __gm__ half *workspace_keff_handle,
     __gm__ half *U_handle, __gm__ half *W_handle,
@@ -537,29 +537,22 @@ AICORE void wy_kda_kernel(
               {
                 GmShape2D g_shape(local_rows, HiddenSize);
                 GmStride2D g_stride(HiddenSize);
-                GmTensor2D<half> g_global(G_handle + hk_base, g_shape,
-                                          g_stride);
-                TileUbDataND<half, HalfChunk, HiddenSize,
+                GmTensor2D<float> g_global(G_handle + hk_base, g_shape,
+                                           g_stride);
+                TileUbDataND<float, HalfChunk, HiddenSize,
                              HalfChunk, HiddenSize,
                              pto::PadValue::Zero> g_stg_full;
-                TASSIGN(g_stg_full, KeffHalfUbAddr);
-                DynVecTile<half, HalfChunk, HiddenSize,
+                TASSIGN(g_stg_full, GcsUbAddr);
+                DynVecTile<float, HalfChunk, HiddenSize,
                            pto::PadValue::Zero> g_load(local_rows, HiddenSize);
-                TASSIGN(g_load, KeffHalfUbAddr);
-                TLOAD(g_load, g_global);
+                TASSIGN(g_load, GcsUbAddr);
+                TLOAD(g_load, g_global);  // g_cs fp32 → gcs_ub directly
                 if (local_rows != HalfChunk) {
                   TFILLPAD_INPLACE(g_stg_full, g_load);
                 }
               }
               set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
               wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-              {
-                TileUbDataND<half, HalfChunk, HiddenSize,
-                             HalfChunk, HiddenSize> g_stg_cvt;
-                TASSIGN(g_stg_cvt, KeffHalfUbAddr);
-                TCVT(gcs_ub, g_stg_cvt, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
-              }
               // exp(g_cs) in-place over gcs_ub, then K_eff = k * exp(g_cs).
               TEXP(gcs_ub, gcs_ub);
               pipe_barrier(PIPE_V);
@@ -731,29 +724,22 @@ AICORE void wy_kda_kernel(
               {
                 GmShape2D g_shape(local_rows, HiddenSize);
                 GmStride2D g_stride(HiddenSize);
-                GmTensor2D<half> g_global(G_handle + hk_base, g_shape,
-                                          g_stride);
-                TileUbDataND<half, HalfChunk, HiddenSize,
+                GmTensor2D<float> g_global(G_handle + hk_base, g_shape,
+                                           g_stride);
+                TileUbDataND<float, HalfChunk, HiddenSize,
                              HalfChunk, HiddenSize,
                              pto::PadValue::Zero> g_stg_full;
-                TASSIGN(g_stg_full, KeffHalfUbAddr);
-                DynVecTile<half, HalfChunk, HiddenSize,
+                TASSIGN(g_stg_full, GcsUbAddr);
+                DynVecTile<float, HalfChunk, HiddenSize,
                            pto::PadValue::Zero> g_load(local_rows, HiddenSize);
-                TASSIGN(g_load, KeffHalfUbAddr);
-                TLOAD(g_load, g_global);
+                TASSIGN(g_load, GcsUbAddr);
+                TLOAD(g_load, g_global);  // g_cs fp32 → gcs_ub directly
                 if (local_rows != HalfChunk) {
                   TFILLPAD_INPLACE(g_stg_full, g_load);
                 }
               }
               set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
               wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-              {
-                TileUbDataND<half, HalfChunk, HiddenSize,
-                             HalfChunk, HiddenSize> g_stg_cvt;
-                TASSIGN(g_stg_cvt, KeffHalfUbAddr);
-                TCVT(gcs_ub, g_stg_cvt, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
-              }
               TEXP(gcs_ub, gcs_ub);
               pipe_barrier(PIPE_V);
               TMUL(keff_ub, k_ub, gcs_ub);
@@ -1025,7 +1011,7 @@ extern "C" __global__ AICORE void launch_wy_kda(
       reinterpret_cast<__gm__ half *>(K_handle),
       reinterpret_cast<__gm__ half *>(V_handle),
       reinterpret_cast<__gm__ half *>(Beta_handle),
-      reinterpret_cast<__gm__ half *>(G_handle),
+      reinterpret_cast<__gm__ float *>(G_handle),
       reinterpret_cast<__gm__ half *>(A_handle),
       reinterpret_cast<__gm__ half *>(workspace_a2_handle),
       reinterpret_cast<__gm__ half *>(workspace_keff_handle),
