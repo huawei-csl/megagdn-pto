@@ -14,10 +14,10 @@
 #   worker_init.py     — worker/__init__.py with PTO hook pre-injected
 #   kv_cache_utils.py  — debug prints (harmless, safe to keep)
 #
-# Usage:
-#   bash run_kimi_docker.sh [CMD...]
-#   bash run_kimi_docker.sh python tests/test_kimi_load.py
-#   bash run_kimi_docker.sh python benchmarks/eval_acc/run_lm_eval.py \
+# Usage (run from the repo root):
+#   bash docker/run_kimi_docker.sh [CMD...]
+#   bash docker/run_kimi_docker.sh python tests/test_kimi_load.py
+#   bash docker/run_kimi_docker.sh python benchmarks/eval_acc/run_lm_eval.py \
 #       --preset kimi_linear_48b --backend kda_mega
 
 set -euo pipefail
