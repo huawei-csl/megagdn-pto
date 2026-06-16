@@ -29,11 +29,11 @@ _PATCH_ACTIVE = False
 
 
 def _ensure_pto_lib_path() -> None:
-    if "PTO_LIB_PATH" in __import__("os").environ:
+    if "PTO_LIB_PATH" in os.environ:
         return
     fallback = "/sources/pto-isa"
-    if __import__("os").path.isdir(__import__("os").path.join(fallback, "include")):
-        __import__("os").environ["PTO_LIB_PATH"] = fallback
+    if os.path.isdir(os.path.join(fallback, "include")):
+        os.environ["PTO_LIB_PATH"] = fallback
 
 
 def _patch_mla_rope_cache() -> None:
@@ -257,24 +257,6 @@ def apply_kda_patch() -> None:
     _kda_layer_mod = sys.modules.get("vllm.model_executor.layers.kda")
     if _kda_layer_mod is not None and hasattr(_kda_layer_mod, "chunk_kda"):
         _kda_layer_mod.chunk_kda = wrapped
-
-    if os.environ.get("VLLM_PTO_KDA_DEBUG") == "1":
-        _orig_rec = _kda_mod.fused_recurrent_kda
-        _seen = {"n": False}
-
-        def _dbg_recurrent(*a, **kw):
-            if not _seen["n"]:
-                _seen["n"] = True
-                try:
-                    with open("/sources/.kda_recurrent_called", "a") as f:
-                        f.write(f"pid={os.getpid()}\n")
-                except OSError:
-                    pass
-            return _orig_rec(*a, **kw)
-
-        _kda_mod.fused_recurrent_kda = _dbg_recurrent
-        if _kda_layer_mod is not None and hasattr(_kda_layer_mod, "fused_recurrent_kda"):
-            _kda_layer_mod.fused_recurrent_kda = _dbg_recurrent
 
     _PATCH_ACTIVE = True
     _log.warning("KDA PTO patch active: fused megakernel (C=%d).", 128)

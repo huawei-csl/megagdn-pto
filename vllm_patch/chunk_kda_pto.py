@@ -56,23 +56,6 @@ def chunk_kda_pto(
         )
 
     import os
-    if not getattr(chunk_kda_pto, "_dbg", False):
-        chunk_kda_pto._dbg = True
-        try:
-            with open("/sources/.kda_chunk_called", "a") as f:
-                f.write(f"pid={os.getpid()} q={tuple(q.shape)} nan_q={bool(torch.isnan(q).any())} "
-                        f"nan_k={bool(torch.isnan(k).any())} nan_v={bool(torch.isnan(v).any())} "
-                        f"nan_g={bool(torch.isnan(g).any())} nan_beta={bool(torch.isnan(beta).any())}\n")
-        except OSError:
-            pass
-        import sys as _s
-        for name, t in (("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta),
-                        ("init", initial_state)):
-            if t is not None:
-                print(f"[KDA-DBG] {name} shape={tuple(t.shape)} dtype={t.dtype} "
-                      f"nan={bool(torch.isnan(t).any())} absmax={t.abs().max().item():.4g}",
-                      file=_s.stderr, flush=True)
-
     if os.environ.get("VLLM_PTO_KDA_FORCE_TRITON") == "1":
         return _triton()
 
@@ -107,16 +90,6 @@ def chunk_kda_pto(
         batch_size_override=N_seq,
         return_final_state=True,
     )
-
-    if not getattr(chunk_kda_pto, "_dbg_o", False):
-        chunk_kda_pto._dbg_o = True
-        try:
-            with open("/sources/.kda_chunk_called", "a") as f:
-                f.write(f"pid={os.getpid()} o={tuple(o.shape)} nan_o={bool(torch.isnan(o).any())} "
-                        f"absmax_o={o.abs().max().item():.4g} "
-                        f"nan_fstate={bool(torch.isnan(final_state).any())}\n")
-        except OSError:
-            pass
 
     o = o.to(q.dtype)
     if output_final_state:

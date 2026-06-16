@@ -5,7 +5,7 @@
 #   KIMI_IMAGE       — override image (default v0.18.0rc1)
 #   KIMI_NO_MOUNTS=1 — skip the v0.18-specific file overrides (use for v0.19+)
 #
-# v0.18 mounts:
+# v0.18 mounts (vendored upstream overrides in docker/overrides/):
 #   model_runner_v1.py — fixes isinstance crash + MLA hybrid-block reshape
 #   worker_init.py     — worker/__init__.py with PTO hook pre-injected
 #   kv_cache_utils.py  — debug prints (harmless, safe to keep)
@@ -41,14 +41,14 @@ MOUNTS=(
 )
 if [ -z "${KIMI_NO_MOUNTS:-}" ]; then
     MOUNTS+=(
-        -v "${REPO_ROOT}/model_runner_v1.py:/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:ro"
-        -v "${REPO_ROOT}/worker_init.py:/vllm-workspace/vllm-ascend/vllm_ascend/patch/worker/__init__.py:ro"
-        -v "${REPO_ROOT}/kv_cache_utils.py:/vllm-workspace/vllm/vllm/v1/core/kv_cache_utils.py:ro"
+        -v "${REPO_ROOT}/docker/overrides/model_runner_v1.py:/vllm-workspace/vllm-ascend/vllm_ascend/worker/model_runner_v1.py:ro"
+        -v "${REPO_ROOT}/docker/overrides/worker_init.py:/vllm-workspace/vllm-ascend/vllm_ascend/patch/worker/__init__.py:ro"
+        -v "${REPO_ROOT}/docker/overrides/kv_cache_utils.py:/vllm-workspace/vllm/vllm/v1/core/kv_cache_utils.py:ro"
     )
 fi
 if [ -n "${KIMI_V19_HOOK:-}" ]; then
     MOUNTS+=(
-        -v "${REPO_ROOT}/worker_init_v19.py:/vllm-workspace/vllm-ascend/vllm_ascend/patch/worker/__init__.py:ro"
+        -v "${REPO_ROOT}/docker/overrides/worker_init_v19.py:/vllm-workspace/vllm-ascend/vllm_ascend/patch/worker/__init__.py:ro"
     )
 fi
 
