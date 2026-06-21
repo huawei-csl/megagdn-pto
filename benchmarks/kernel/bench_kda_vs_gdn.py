@@ -567,6 +567,7 @@ def bench_e2e(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd: in
          g_sum_bsnd, g_sum_hm, L_kkt, ws_tri, A_inv, u_out, w_out, s_snap,
          v_corr, o_kda, ws_kkt_in, ws_kkt_out, ws_wy_a2, ws_wy_keff, ws_h, ws_o)
     gc.collect()
+    torch.npu.synchronize()
     torch.npu.empty_cache()
 
     # ── GDN megakernel ───────────────────────────────────────────────────────
