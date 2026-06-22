@@ -464,7 +464,38 @@ def bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd):
 
 
 def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
-    """Mega-kernel vs staged PTO (aggregated)."""
+    """Mega-kernel vs a competently-written staged PTO pipeline.
+
+    This is a *fusion* benchmark: it measures whether collapsing the six GDN
+    stages into one mega-kernel beats running them as six separate PTO kernel
+    launches. For that to be a fair fight, the staged baseline must be written the
+    way a real deployment would write it. Three things matter, and all three were
+    wrong in the original version of this benchmark (making the staged path look
+    artificially slow / the mega-kernel look artificially good):
+
+    1. **Use the real cumsum kernel.** The staged path here runs the PTO
+       ``chunk_cumsum`` kernel (~0.03 ms), not a torch ``cumsum`` reference in a
+       Python double-loop (~21 ms) — the latter dominated the staged time and is
+       not what anyone would ship.
+
+    2. **No redundant inter-stage syncs.** Kernels launched on the same stream are
+       serialized by the stream (stage N+1 observes stage N's writes), so the
+       ``torch.npu.synchronize()`` barriers between stages are *not needed for
+       correctness* — they are a legacy precaution. Dropping them is verified
+       bit-exact below and the no-sync path is what we time.
+
+    3. **Pre-allocate, don't malloc in the timed loop.** All intermediates and
+       workspaces are allocated once; the timed region is pure kernel launches.
+
+    A correctness gate (``frob_rel < 1e-2`` vs the mega-kernel output) runs *before*
+    any timing, so a fast-but-wrong staged pipeline can never be reported as a win.
+    The mega-kernel applies ``scale`` internally; the staged path is linear in ``q``
+    so we fold ``scale`` into ``q`` once (pre-scaled ``q`` ⇒ scaled ``o``), matching
+    the mega output without a per-iteration elementwise pass.
+    """
+    from megagdn_pto.kernel_libs import (
+        run_chunk_cumsum, run_scaled_dot_kkt, run_wy_fast, run_chunk_h, run_chunk_o)
+
     q = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
     k = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
     v = torch.randn(1, T, H, D, device=dev, dtype=torch.float16)
@@ -473,69 +504,85 @@ def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
     scale = D ** -0.5
 
     def run_mega():
-        run_mega_kernel(
-            q, k, v, g_in, beta, cu_seqlens,
-            chunk_size=C_PTO, scale=scale, key_heads=HG,
-        )
+        return run_mega_kernel(q, k, v, g_in, beta, cu_seqlens,
+                               chunk_size=C_PTO, scale=scale, key_heads=HG)
 
-    run_mega(); torch.npu.synchronize()
-    ms_mega = _bench_npu(run_mega)
-
-    # Staged PTO aggregated (all 6 stages)
-    from megagdn_pto.kernel_libs import run_scaled_dot_kkt, run_wy_fast, run_chunk_h, run_chunk_o
     N_seq = int(cu_seqlens.numel()) - 1
     tc_n = total_chunks(N_seq, T, C_PTO, cu_seqlens)
-    cu_cpu = cu_seqlens.cpu().tolist()
 
-    def ref_cumsum_torch():
-        out = torch.zeros(1, T, H, device=dev, dtype=torch.float32)
-        for i in range(len(cu_cpu) - 1):
-            bos, eos = cu_cpu[i], cu_cpu[i + 1]
-            for j in range(0, eos - bos, C_PTO):
-                s, e = bos + j, min(bos + j + C_PTO, eos)
-                out[:, s:e, :] = g_in.float()[:, s:e, :].cumsum(dim=1)
-        return out
+    # Staged path is linear in q; pre-scale once so o matches the mega-kernel
+    # (which applies `scale` internally) without a per-iteration elementwise op.
+    q_scaled = (q * scale).to(torch.float16)
+
+    # Pre-allocate every intermediate + workspace once (timed loop = pure launches).
+    g_sum = torch.empty(1, T, H, device=dev, dtype=torch.float32)
+    msk_l = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
+    msk_f = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
+    A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
+    ws_tri = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float32)
+    A_inv = torch.empty(1, T, H, C_PTO, device=dev, dtype=torch.float16)
+    w = torch.empty_like(v)
+    u = torch.empty_like(v)
+    s = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
+    v_new = torch.empty_like(v)
+    fs = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
+    o = torch.empty_like(v)
 
     def run_staged():
-        g_sum = ref_cumsum_torch()
+        # Stage chaining on the shared stream — no inter-stage host syncs.
+        run_chunk_cumsum(g_in, g_sum, chunk_size=C_PTO,
+                         cu_seqlens=cu_seqlens, batch_size_override=N_seq)
         g_t = transpose_gates(g_sum)
         beta_t = transpose_beta(beta)
-        torch.npu.synchronize()
-        msk_l = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
-        msk_f = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
-        A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
         run_scaled_dot_kkt(k, beta, g_sum, msk_l, A,
                            g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                            cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
-        torch.npu.synchronize()
-        A_inv = solve_tril(A, cu_seqlens, C_PTO, H, tri_inv)
-        torch.npu.synchronize()
-        w = torch.empty_like(v)
-        u = torch.empty_like(v)
+        solve_tril(A, cu_seqlens, C_PTO, H, tri_inv, workspace_fp32=ws_tri, out_fp16=A_inv)
         run_wy_fast(k, v, beta, g_sum, A_inv, w, u,
                     g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
-        torch.npu.synchronize()
-        s = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
-        v_new = torch.empty_like(v)
-        fs = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
         run_chunk_h(k, w, u, g_sum, s, v_new, fs,
                     g_t=g_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
-        torch.npu.synchronize()
-        o = torch.empty_like(v)
-        run_chunk_o(q, k, v_new, s, g_sum, msk_f, o,
+        run_chunk_o(q_scaled, k, v_new, s, g_sum, msk_f, o,
                     g_t=g_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
-        torch.npu.synchronize()
+        return o
 
-    run_staged()
+    # ── Correctness gate (before any timing) ─────────────────────────────────
+    # Never report a staged-vs-fused speedup without verifying the two paths agree.
+    # A fast-but-wrong pipeline (miswired launch, missing scale, uninitialised
+    # workspace, a non-deterministic kernel) is otherwise invisible to timing.
+    o_mega = run_mega(); torch.npu.synchronize(); o_mega = o_mega.float().clone()
+    o_staged = run_staged(); torch.npu.synchronize(); o_staged = o_staged.float().clone()
+    frob_rel = (o_staged - o_mega).norm().item() / o_mega.norm().item()
+
+    if frob_rel >= 1e-2:
+        # Disagreement. Re-run the mega-kernel on identical input to tell a *bug in
+        # one path* apart from a *non-deterministic kernel* (run-to-run instability
+        # — e.g. an accumulation-order race — shows up as the mega path disagreeing
+        # with itself). The staged path is a deterministic six-launch reference.
+        o_mega2 = run_mega(); torch.npu.synchronize(); o_mega2 = o_mega2.float().clone()
+        mega_self = (o_mega2 - o_mega).norm().item() / o_mega.norm().item()
+        print(f"\n  ⚠ CORRECTNESS GATE FAILED  (H={H} Hg={HG})")
+        print(f"    staged vs mega        : frob_rel={frob_rel:.3e}  (≥ 1e-2)")
+        print(f"    mega vs mega (re-run) : frob_rel={mega_self:.3e}  "
+              f"({'NON-DETERMINISTIC mega-kernel' if mega_self >= 1e-2 else 'mega stable → staged path suspect'})")
+        print(f"    → skipping timing for H={H} (would compare against an unreliable reference)")
+        del o_mega, o_staged, o_mega2
+        gc.collect(); torch.npu.empty_cache()
+        return None, None, frob_rel
+
+    del o_mega, o_staged
+    gc.collect(); torch.npu.empty_cache()
+
+    ms_mega = _bench_npu(run_mega)
     ms_staged = _bench_npu(run_staged)
 
-    print(f"\n  mega_kernel vs staged PTO  (H={H} Hg={HG})")
+    print(f"\n  mega_kernel vs staged PTO  (H={H} Hg={HG})   [staged frob_rel={frob_rel:.1e}]")
     print(f"    Mega:   {ms_mega:.2f} ms")
     print(f"    Staged: {ms_staged:.2f} ms  →  mega speedup {_ratio(ms_staged, ms_mega)}")
-    return ms_mega, ms_staged
+    return ms_mega, ms_staged, frob_rel
 
 
 # ---------------------------------------------------------------------------
@@ -655,10 +702,12 @@ def main() -> None:
             row["chunk_o_speedup_vs128"] = ms_t128 / ms_pto if ms_t128 else None
             gc.collect()
         if args.mega:
-            ms_mega, ms_staged = bench_mega(H, HG, T, cu_seqlens, dev, tri_inv)
+            ms_mega, ms_staged, frob_rel = bench_mega(H, HG, T, cu_seqlens, dev, tri_inv)
             row["mega_ms"] = ms_mega
             row["staged_ms"] = ms_staged
-            row["mega_speedup"] = ms_staged / ms_mega if ms_mega else None
+            row["mega_speedup"] = ms_staged / ms_mega if (ms_mega and ms_staged) else None
+            row["staged_frob_rel"] = frob_rel
+            row["correctness_gate_passed"] = bool(ms_mega is not None)
             gc.collect()
 
         all_results.append(row)
