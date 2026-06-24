@@ -60,6 +60,32 @@ using namespace pto;
 #define GDN_C 128
 #endif
 
+// ── Recurrent prefix-sum chain synchronization ──────────────────────────────
+// The recurrent chain alternates TADD(acc,acc,g_i) and TMOV(s_i,acc) on a fixed
+// acc_ub address. Both lower to Vec-domain ops (TMOV(UB→UB) → TCopy →
+// pto_copy_ubuf_to_ubuf, scheduled on the V queue by bisheng), so the RAW/WAR
+// hazards on acc_ub are Vec-vs-Vec and must be ordered with a Vec barrier.
+//
+// In isolation a pipe_barrier(PIPE_V) is sufficient and correct. But under the
+// fused mega-kernel's codegen a pipe_barrier(PIPE_V) here is NOT enough: the
+// recurrence races and corrupts the last rows of each chunk non-deterministically
+// (surfaced at H=64, whose wider tile lengthens the race window). WHY PIPE_V is
+// insufficient under fusion is unverified — the same barrier that is correct
+// standalone fails once inlined into the MIX kernel, and we have NOT inspected the
+// emitted IR/assembly to confirm the cause (e.g. whether the fused scheduler
+// reorders or elides the fence). The verified facts are purely behavioral.
+//
+// A cross-pipe set_flag/wait_flag cannot help regardless of the mechanism: flags
+// only synchronize two DIFFERENT pipes, and this is a same-pipe (Vec) dependency —
+// wiring a V↔MTE3 flag around it leaves the real ordering unenforced and produces
+// deterministic-but-WRONG output (~20% frobenius error), which the run-to-run
+// determinism test cannot detect.
+//
+// pipe_barrier(PIPE_ALL) is the fix: it is the strongest available fence and
+// empirically orders the Vec recurrence (correct AND deterministic across all H)
+// whatever is defeating PIPE_V. It is heavier than a PIPE_V barrier, but cumsum is
+// a small, bandwidth-light stage so the cost is negligible.
+
 // ── PTO type aliases (device-only, guarded by __CCE_AICORE__) ───────────────
 // UB tile in row-major (ND) layout, used by Vec engine.
 // T=dtype, R×C=static shape, RV×CV=valid region, P=pad value for TLOAD.
@@ -222,18 +248,16 @@ AICORE void cumsum_kernel(
       UbND<float, 1, HTC> g_row_0;
       TASSIGN(g_row_0, GUbAddr);
       // TMOV(dst, src): Element-wise copy, like dst = src.clone() in UB.
+      // The recurrence on acc_ub is Vec-vs-Vec; pipe_barrier(PIPE_ALL) is the
+      // strongest fence and empirically orders it under fusion (see the chain-sync
+      // note above for why PIPE_V is insufficient here and set_flag cannot substitute).
       TMOV(acc_ub, g_row_0);
-      // pipe_barrier(PIPE_V): Ensures all pending Vec (SIMD) operations complete
-      // before the next Vec instruction begins. Needed because Vec ops are pipelined
-      // and may not finish in order. Think of it as a local __syncthreads() for the
-      // Vec engine only. Much lighter than set_flag/wait_flag (which sync across
-      // different hardware units).
-      pipe_barrier(PIPE_V);
+      pipe_barrier(PIPE_ALL);
 
       UbND<float, 1, HTC> s_row_0;
       TASSIGN(s_row_0, SUbAddr);
       TMOV(s_row_0, acc_ub);
-      pipe_barrier(PIPE_V);
+      pipe_barrier(PIPE_ALL);
 
       // Rows 1..valid-1:  acc[h] += g[i,h];  g_sum[i,h] = acc[h]
       for (int32_t i = 1; i < valid; ++i) {
@@ -242,24 +266,24 @@ AICORE void cumsum_kernel(
         // TADD(dst, a, b): Element-wise add, like dst = a + b. All in UB.
         // Operates on all HTC elements in parallel (SIMD).
         TADD(acc_ub, acc_ub, g_row_i);
-        pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_ALL);
 
         UbND<float, 1, HTC> s_row_i;
         TASSIGN(s_row_i, SUbAddr + i * RowBytes);
         TMOV(s_row_i, acc_ub);
-        pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_ALL);
       }
 
       // Zero-fill rows beyond valid (tail padding for downstream kernels)
       // TEXPANDS(tile, scalar): Fill entire tile with a scalar value.
       // Equivalent to: tile[:] = scalar  (like torch.full_like(tile, scalar))
       TEXPANDS(acc_ub, 0.0f);
-      pipe_barrier(PIPE_V);
+      pipe_barrier(PIPE_ALL);
       for (int32_t i = valid; i < ChunkSize; ++i) {
         UbND<float, 1, HTC> s_row_i;
         TASSIGN(s_row_i, SUbAddr + i * RowBytes);
         TMOV(s_row_i, acc_ub);
-        pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_ALL);
       }
 
       // ── DMA: store g_sum from UB → GM (MTE3 pipe) ────────────────────
@@ -331,34 +355,34 @@ AICORE void cumsum_kernel(
           UbND<float, 1, HTC> g_row_0;
           TASSIGN(g_row_0, GUbAddr);
           TMOV(acc_ub, g_row_0);
-          pipe_barrier(PIPE_V);
+          pipe_barrier(PIPE_ALL);
 
           UbND<float, 1, HTC> s_row_0;
           TASSIGN(s_row_0, SUbAddr);
           TMOV(s_row_0, acc_ub);
-          pipe_barrier(PIPE_V);
+          pipe_barrier(PIPE_ALL);
 
           // acc += g[i]; g_sum[i] = acc
           for (int32_t i = 1; i < valid; ++i) {
             UbND<float, 1, HTC> g_row_i;
             TASSIGN(g_row_i, GUbAddr + i * RowBytes);
             TADD(acc_ub, acc_ub, g_row_i);
-            pipe_barrier(PIPE_V);
+            pipe_barrier(PIPE_ALL);
 
             UbND<float, 1, HTC> s_row_i;
             TASSIGN(s_row_i, SUbAddr + i * RowBytes);
             TMOV(s_row_i, acc_ub);
-            pipe_barrier(PIPE_V);
+            pipe_barrier(PIPE_ALL);
           }
 
           // Zero-fill padding rows
           TEXPANDS(acc_ub, 0.0f);
-          pipe_barrier(PIPE_V);
+          pipe_barrier(PIPE_ALL);
           for (int32_t i = valid; i < ChunkSize; ++i) {
             UbND<float, 1, HTC> s_row_i;
             TASSIGN(s_row_i, SUbAddr + i * RowBytes);
             TMOV(s_row_i, acc_ub);
-            pipe_barrier(PIPE_V);
+            pipe_barrier(PIPE_ALL);
           }
 
           // Store g_sum to GM
