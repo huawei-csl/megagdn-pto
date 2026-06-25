@@ -61,30 +61,44 @@ using namespace pto;
 #endif
 
 // ── Recurrent prefix-sum chain synchronization ──────────────────────────────
-// The recurrent chain alternates TADD(acc,acc,g_i) and TMOV(s_i,acc) on a fixed
-// acc_ub address. Both lower to Vec-domain ops (TMOV(UB→UB) → TCopy →
-// pto_copy_ubuf_to_ubuf, scheduled on the V queue by bisheng), so the RAW/WAR
-// hazards on acc_ub are Vec-vs-Vec and must be ordered with a Vec barrier.
+// The recurrent chain alternates TADD(acc,acc,g_i) (Vec) and TMOV(s_i,acc) (Vec)
+// with TASSIGN address/descriptor setup on each row. TADD/TMOV lower to PIPE_V,
+// but TASSIGN is a SCALAR op (PIPE_S, see opPipeList in pto/common/event.hpp), and
+// on this core the scalar unit ISSUES the vec instructions. So the ordering edge
+// that actually matters is Vec→Scalar: without it, the scalar issuer launches the
+// next TADD/TMOV before the previous vec write to acc_ub has committed → a RAW race
+// on acc_ub.
 //
-// In isolation a pipe_barrier(PIPE_V) is sufficient and correct. But under the
-// fused mega-kernel's codegen a pipe_barrier(PIPE_V) here is NOT enough: the
-// recurrence races and corrupts the last rows of each chunk non-deterministically
-// (surfaced at H=64, whose wider tile lengthens the race window). WHY PIPE_V is
-// insufficient under fusion is unverified — the same barrier that is correct
-// standalone fails once inlined into the MIX kernel, and we have NOT inspected the
-// emitted IR/assembly to confirm the cause (e.g. whether the fused scheduler
-// reorders or elides the fence). The verified facts are purely behavioral.
+// pipe_barrier(PIPE_V) only fences Vec-vs-Vec and never enforces this V↔S edge, so
+// it is insufficient under the fused kernel — the recurrence races and corrupts the
+// last rows of each chunk non-deterministically (surfaced at H=64, whose wider tile
+// lengthens the race window). It happens to be harmless standalone because the
+// scheduler there doesn't reorder across the boundary the same way.
 //
-// A cross-pipe set_flag/wait_flag cannot help regardless of the mechanism: flags
-// only synchronize two DIFFERENT pipes, and this is a same-pipe (Vec) dependency —
-// wiring a V↔MTE3 flag around it leaves the real ordering unenforced and produces
-// deterministic-but-WRONG output (~20% frobenius error), which the run-to-run
-// determinism test cannot detect.
+// The fix is an explicit Vec→Scalar sync: set_flag(PIPE_V, PIPE_S) + wait_flag,
+// here via PtoSetWaitFlag<PIPE_V, PIPE_S>(). This stalls the scalar issuer until the
+// vec pipe drains, serializing the recurrence correctly. EVENT_ID2 is used to avoid
+// colliding with the EVENT_ID0 V↔MTE3 flags already live in this stage.
 //
-// pipe_barrier(PIPE_ALL) is the fix: it is the strongest available fence and
-// empirically orders the Vec recurrence (correct AND deterministic across all H)
-// whatever is defeating PIPE_V. It is heavier than a PIPE_V barrier, but cumsum is
-// a small, bandwidth-light stage so the cost is negligible.
+// MINIMAL placement (per-site bisection, H=64, 50-run determinism + e2e + partial
+// chunks): the V↔S sync is needed at EXACTLY ONE site — immediately after the
+// per-row TADD(acc,acc,g_i) write inside the main loop (in both the fixed-length
+// and varlen paths). That single sync serializes the whole recurrence; every other
+// site (the row-0 prologue, the per-row TMOV(s_i,acc) read, and the partial-chunk
+// tail zero-fill) is fine as a plain pipe_barrier(PIPE_V). Verified: bit2-only is
+// correct AND deterministic for full and partial chunks; all-PIPE_V or
+// prologue-only-V↔S races. (The post-read TMOV site is an equally-valid single
+// choice; we sync after the write because it orders acc before every consumer.)
+//
+// Two things that do NOT work, for the record:
+//   • pipe_barrier(PIPE_ALL) also fixes it, but only incidentally — it is a superset
+//     fence that happens to include the V↔S edge. It is heavier and obscures the
+//     real cause, so we use the targeted V↔S sync instead.
+//   • set_flag(PIPE_V, PIPE_MTE3) does NOT help: it targets the wrong pipe pair
+//     (store-DMA, not the scalar issuer), leaving the real edge unenforced and
+//     producing deterministic-but-WRONG output (~20% frob error) that the run-to-run
+//     determinism test cannot detect — always run the cumsum *correctness* test.
+
 
 // ── PTO type aliases (device-only, guarded by __CCE_AICORE__) ───────────────
 // UB tile in row-major (ND) layout, used by Vec engine.
@@ -248,16 +262,13 @@ AICORE void cumsum_kernel(
       UbND<float, 1, HTC> g_row_0;
       TASSIGN(g_row_0, GUbAddr);
       // TMOV(dst, src): Element-wise copy, like dst = src.clone() in UB.
-      // The recurrence on acc_ub is Vec-vs-Vec; pipe_barrier(PIPE_ALL) is the
-      // strongest fence and empirically orders it under fusion (see the chain-sync
-      // note above for why PIPE_V is insufficient here and set_flag cannot substitute).
       TMOV(acc_ub, g_row_0);
-      pipe_barrier(PIPE_ALL);
+      pipe_barrier(PIPE_V);
 
       UbND<float, 1, HTC> s_row_0;
       TASSIGN(s_row_0, SUbAddr);
       TMOV(s_row_0, acc_ub);
-      pipe_barrier(PIPE_ALL);
+      pipe_barrier(PIPE_V);
 
       // Rows 1..valid-1:  acc[h] += g[i,h];  g_sum[i,h] = acc[h]
       for (int32_t i = 1; i < valid; ++i) {
@@ -265,25 +276,28 @@ AICORE void cumsum_kernel(
         TASSIGN(g_row_i, GUbAddr + i * RowBytes);
         // TADD(dst, a, b): Element-wise add, like dst = a + b. All in UB.
         // Operates on all HTC elements in parallel (SIMD).
+        // *** The one load-bearing sync (see chain-sync note above): Vec→Scalar
+        // after this per-row write to acc_ub, ordering it before the scalar issuer
+        // launches the next row. Every other barrier in this chain is plain PIPE_V.
         TADD(acc_ub, acc_ub, g_row_i);
-        pipe_barrier(PIPE_ALL);
+        PtoSetWaitFlag<PIPE_V, PIPE_S>(EVENT_ID2, EVENT_ID2);
 
         UbND<float, 1, HTC> s_row_i;
         TASSIGN(s_row_i, SUbAddr + i * RowBytes);
         TMOV(s_row_i, acc_ub);
-        pipe_barrier(PIPE_ALL);
+        pipe_barrier(PIPE_V);
       }
 
       // Zero-fill rows beyond valid (tail padding for downstream kernels)
       // TEXPANDS(tile, scalar): Fill entire tile with a scalar value.
       // Equivalent to: tile[:] = scalar  (like torch.full_like(tile, scalar))
       TEXPANDS(acc_ub, 0.0f);
-      pipe_barrier(PIPE_ALL);
+      pipe_barrier(PIPE_V);
       for (int32_t i = valid; i < ChunkSize; ++i) {
         UbND<float, 1, HTC> s_row_i;
         TASSIGN(s_row_i, SUbAddr + i * RowBytes);
         TMOV(s_row_i, acc_ub);
-        pipe_barrier(PIPE_ALL);
+        pipe_barrier(PIPE_V);
       }
 
       // ── DMA: store g_sum from UB → GM (MTE3 pipe) ────────────────────
@@ -355,34 +369,36 @@ AICORE void cumsum_kernel(
           UbND<float, 1, HTC> g_row_0;
           TASSIGN(g_row_0, GUbAddr);
           TMOV(acc_ub, g_row_0);
-          pipe_barrier(PIPE_ALL);
+          pipe_barrier(PIPE_V);
 
           UbND<float, 1, HTC> s_row_0;
           TASSIGN(s_row_0, SUbAddr);
           TMOV(s_row_0, acc_ub);
-          pipe_barrier(PIPE_ALL);
+          pipe_barrier(PIPE_V);
 
           // acc += g[i]; g_sum[i] = acc
           for (int32_t i = 1; i < valid; ++i) {
             UbND<float, 1, HTC> g_row_i;
             TASSIGN(g_row_i, GUbAddr + i * RowBytes);
+            // The one load-bearing sync (see chain-sync note above): Vec→Scalar
+            // after this per-row write to acc_ub. All other barriers here are PIPE_V.
             TADD(acc_ub, acc_ub, g_row_i);
-            pipe_barrier(PIPE_ALL);
+            PtoSetWaitFlag<PIPE_V, PIPE_S>(EVENT_ID2, EVENT_ID2);
 
             UbND<float, 1, HTC> s_row_i;
             TASSIGN(s_row_i, SUbAddr + i * RowBytes);
             TMOV(s_row_i, acc_ub);
-            pipe_barrier(PIPE_ALL);
+            pipe_barrier(PIPE_V);
           }
 
           // Zero-fill padding rows
           TEXPANDS(acc_ub, 0.0f);
-          pipe_barrier(PIPE_ALL);
+          pipe_barrier(PIPE_V);
           for (int32_t i = valid; i < ChunkSize; ++i) {
             UbND<float, 1, HTC> s_row_i;
             TASSIGN(s_row_i, SUbAddr + i * RowBytes);
             TMOV(s_row_i, acc_ub);
-            pipe_barrier(PIPE_ALL);
+            pipe_barrier(PIPE_V);
           }
 
           // Store g_sum to GM
