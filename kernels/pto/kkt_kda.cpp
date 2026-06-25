@@ -45,17 +45,13 @@
 //   Peak @ C=16,  K=128: mask 0.5 + pre 14 ≈ 15 KB ✓
 //
 // Template parameters:
-//   GDN_H = HV, GDN_D = K, GDN_C = C
+//   Compile-time: GDN_D = K, GDN_C = C.  Runtime: num_heads = HV.
 // ============================================================================
 
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 using namespace pto;
-
-#ifndef GDN_H
-#define GDN_H 4
-#endif
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -121,7 +117,7 @@ using L1MatZN = pto::Tile<pto::TileType::Mat, T, R, C, pto::BLayout::RowMajor,
                           RV, CV, pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 #endif
 
-template <int32_t NumHeads, int32_t KDim, int32_t ChunkSize>
+template <int32_t KDim, int32_t ChunkSize>
 AICORE void kkt_kda_kernel(
     __gm__ half *k_ptr,
     __gm__ half *g_cs_ptr,
@@ -132,12 +128,17 @@ AICORE void kkt_kda_kernel(
     __gm__ half *L_out_ptr,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint64_t ffts_addr)
+    int32_t num_heads, uint64_t ffts_addr)
 {
     auto cid = get_block_idx();
     auto block_num = get_block_num();
     auto vid = get_subblockid();
     set_ffts_base_addr(ffts_addr);
+
+    // Head count is a runtime argument (HV).  Only loop bounds, the work-item
+    // decode, and GM strides depend on it — no UB buffer or tile shape does —
+    // so it never needs to be a compile-time constant.
+    const int32_t NumHeads = num_heads;
 
     constexpr int32_t HalfChunk = ChunkSize / 2;
     constexpr int32_t KTC = ((KDim + 7) / 8) * 8;
@@ -171,8 +172,11 @@ AICORE void kkt_kda_kernel(
     using GmShapeDyn = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
     using GmHalfK = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
     using GmHalf_1 = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, 1, 1>>;
+    // L output is BSND-interleaved [total_tokens, NumHeads, ChunkSize]; the
+    // token stride NumHeads*ChunkSize is now runtime, so the GM stride is
+    // DYNAMIC and supplied at construction (see the store site below).
     using GmHalfOut = GlobalTensor<half, GmShapeDyn,
-                                   Stride<1, 1, 1, NumHeads * ChunkSize, 1>>;
+                                   Stride<1, 1, 1, DYNAMIC, 1>>;
     using GmHalfWsIn = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
     using GmHalfWsOut = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
 
@@ -479,7 +483,8 @@ AICORE void kkt_kda_kernel(
                     GmShapeDyn gs;
                     gs.shape[3] = local_valid;
                     gs.shape[4] = ChunkSize;
-                    GmHalfOut gm(L_out_ptr + l_base, gs);
+                    Stride<1, 1, 1, DYNAMIC, 1> out_stride(NumHeads * ChunkSize);
+                    GmHalfOut gm(L_out_ptr + l_base, gs, out_stride);
                     UbND<half, HalfChunk, ChunkSize, DYNAMIC, DYNAMIC>
                         L_h_st(local_valid, ChunkSize);
                     TASSIGN(L_h_st, LHalfUbAddr);
@@ -660,9 +665,9 @@ extern "C" __global__ AICORE void launch_kkt_kda(
     __gm__ uint8_t *L_out_ptr,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint64_t ffts_addr)
+    int32_t num_heads, uint64_t ffts_addr)
 {
-    kkt_kda_kernel<GDN_H, GDN_D, GDN_C>(
+    kkt_kda_kernel<GDN_D, GDN_C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
         reinterpret_cast<__gm__ half *>(g_cs_ptr),
         reinterpret_cast<__gm__ half *>(beta_ptr),
@@ -671,7 +676,7 @@ extern "C" __global__ AICORE void launch_kkt_kda(
         reinterpret_cast<__gm__ half *>(ws_out_ptr),
         reinterpret_cast<__gm__ half *>(L_out_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-        batch_size, seq_len, total_tokens, ffts_addr);
+        batch_size, seq_len, total_tokens, num_heads, ffts_addr);
 }
 
 // ── Host entry point (called from Python via ctypes) ─────────────────────────
@@ -685,7 +690,8 @@ extern "C" void call_kernel(
     uint8_t *ws_out_ptr,
     uint8_t *L_out_ptr,
     uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads)
 {
     uint32_t fftsLen{0};
     uint64_t fftsAddr{0};
@@ -693,5 +699,6 @@ extern "C" void call_kernel(
     launch_kkt_kda<<<block_dim, nullptr, stream>>>(
         k_ptr, g_cs_ptr, beta_ptr, mask_ptr,
         ws_in_ptr, ws_out_ptr, L_out_ptr, cu_seqlens,
-        batch_size, seq_len, total_tokens, fftsAddr);
+        batch_size, seq_len, total_tokens,
+        static_cast<int32_t>(num_heads), fftsAddr);
 }

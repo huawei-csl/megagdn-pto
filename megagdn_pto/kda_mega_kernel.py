@@ -39,9 +39,10 @@ def _load_mega_kernel_kda(
     hidden_size: int = 128,
     chunk_size: int = 128,
 ) -> ctypes.CDLL:
+    # Head count (HV) is a runtime kernel argument now, so the fused .so is
+    # head-count-agnostic; ``num_heads`` here is only the lru_cache key.
     mtime = os.stat(os.path.join(_KERNELS_PTO, "mega_kernel_kda.cpp")).st_mtime_ns
     lib_path = compile_mega_kernel_kda(
-        num_heads=num_heads,
         hidden_size=hidden_size,
         chunk_size=chunk_size,
         cpp_mtime_ns=mtime,
@@ -50,7 +51,8 @@ def _load_mega_kernel_kda(
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 24
-        + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_uint32]
+        + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+           ctypes.c_uint32, ctypes.c_uint32]  # ..., num_matrices, num_heads
     )
     lib.call_kernel.restype = None
     return lib
@@ -150,6 +152,6 @@ def run_mega_kernel_kda(
         _vp(u), _vp(w), _vp(s), _vp(v_corr),
         _vp(kkt_ws_in), _vp(kkt_ws_out), _vp(wy_ws_a2), _vp(wy_ws_keff),
         _vp(h_ws), _vp(o_ws),
-        N_seq, T, T, num_matrices,
+        N_seq, T, T, num_matrices, HV,
     )
     return o_out

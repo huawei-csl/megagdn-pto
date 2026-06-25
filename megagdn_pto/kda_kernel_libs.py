@@ -44,23 +44,22 @@ def load_gate_cumsum_kda(
 ) -> ctypes.CDLL:
     """Compile + load the KDA gate cumsum kernel.
 
-    Template parameters injected at compile time:
-        GDN_H = num_heads  (HV, number of value/gate heads)
-        GDN_D = k_dim      (K, key/gate vector dimension)
-        GDN_C = chunk_size (C, tokens per chunk)
+    Head count (HV) is a *runtime* kernel argument, so the compiled .so is
+    head-count-agnostic (one binary per K/C).  Only GDN_D (K) and GDN_C (C) are
+    compile-time template parameters.  ``num_heads`` here is just the lru_cache
+    key + the value passed to ``call_kernel`` at launch.
 
     C signature::
         void call_kernel(uint32_t block_dim, void *stream,
                          uint8_t *g, uint8_t *g_sum, uint8_t *cu_seqlens,
-                         int64_t batch_size, int64_t seq_len)
+                         int64_t batch_size, int64_t seq_len,
+                         uint32_t num_heads)
     """
     lib_path = compile_chunk_kernel(
         "gate_cumsum_kda.cpp",
         "gate_cumsum_kda",
-        num_heads=num_heads,
         hidden_size=k_dim,
         chunk_size=chunk_size,
-        key_heads=None,
         cpp_mtime_ns=_mtime("gate_cumsum_kda.cpp"),
     )
     lib = ctypes.CDLL(os.path.abspath(lib_path))
@@ -68,6 +67,7 @@ def load_gate_cumsum_kda(
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 3
         + [ctypes.c_int64, ctypes.c_int64]
+        + [ctypes.c_uint32]   # num_heads (runtime)
     )
     lib.call_kernel.restype = None
     return lib
@@ -106,7 +106,7 @@ def run_gate_cumsum_kda(
     cu32 = _ensure_int32(cu_seqlens)
 
     lib = load_gate_cumsum_kda(HV, K, chunk_size)
-    lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T)
+    lib.call_kernel(bd, stream, _vp(g), _vp(g_sum), _vp(cu32), batch, T, HV)
 
 
 # ---------------------------------------------------------------------------
@@ -121,25 +121,22 @@ def load_kkt_kda(
 ) -> ctypes.CDLL:
     """Compile + load the KDA kkt kernel.
 
-    Template parameters injected at compile time:
-        GDN_H = num_heads  (HV, number of value/gate heads)
-        GDN_D = k_dim      (K, key/gate vector dimension)
-        GDN_C = chunk_size (C, tokens per chunk)
+    Head count (HV) is a *runtime* kernel argument; only GDN_D (K) and GDN_C (C)
+    are compile-time template parameters, so the .so is head-count-agnostic.
 
     C signature::
         void call_kernel(uint32_t block_dim, void *stream,
                          uint8_t *k, uint8_t *g_cs, uint8_t *beta,
                          uint8_t *mask, uint8_t *ws_in, uint8_t *ws_out,
                          uint8_t *L_out, uint8_t *cu_seqlens,
-                         int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+                         int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+                         uint32_t num_heads)
     """
     lib_path = compile_chunk_kernel(
         "kkt_kda.cpp",
         "kkt_kda",
-        num_heads=num_heads,
         hidden_size=k_dim,
         chunk_size=chunk_size,
-        key_heads=None,
         cpp_mtime_ns=_mtime("kkt_kda.cpp"),
     )
     lib = ctypes.CDLL(os.path.abspath(lib_path))
@@ -147,6 +144,7 @@ def load_kkt_kda(
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 8   # k, g_cs, beta, mask, ws_in, ws_out, L_out, cu_seqlens
         + [ctypes.c_int64] * 3    # batch_size, seq_len, total_tokens
+        + [ctypes.c_uint32]       # num_heads (runtime)
     )
     lib.call_kernel.restype = None
     return lib
@@ -219,7 +217,7 @@ def run_kkt_kda(
         _vp(k_t), _vp(g_cs_t), _vp(beta_t),
         _vp(mask), _vp(ws_in), _vp(ws_out), _vp(L_out),
         _vp(cu32),
-        batch, T, total_tokens,
+        batch, T, total_tokens, HV,
     )
 
 
@@ -235,10 +233,8 @@ def load_wy_kda(
 ) -> ctypes.CDLL:
     """Compile + load the KDA wy kernel.
 
-    Template parameters injected at compile time:
-        GDN_H = num_heads  (HV)
-        GDN_D = k_dim      (K, also used as V_DIM)
-        GDN_C = chunk_size (C)
+    Head count (HV) is a *runtime* kernel argument; only GDN_D (K) and GDN_C (C)
+    are compile-time template parameters, so the .so is head-count-agnostic.
 
     C signature::
         void call_kernel(uint32_t block_dim, void *stream,
@@ -246,15 +242,14 @@ def load_wy_kda(
                          uint8_t *ws_a2, uint8_t *ws_keff,
                          uint8_t *u, uint8_t *w,
                          uint8_t *cu_seqlens,
-                         int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+                         int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+                         uint32_t num_heads)
     """
     lib_path = compile_chunk_kernel(
         "wy_kda.cpp",
         "wy_kda",
-        num_heads=num_heads,
         hidden_size=k_dim,
         chunk_size=chunk_size,
-        key_heads=None,
         cpp_mtime_ns=_mtime("wy_kda.cpp"),
     )
     lib = ctypes.CDLL(os.path.abspath(lib_path))
@@ -262,6 +257,7 @@ def load_wy_kda(
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 10   # k, v, beta, g_cs, A, ws_a2, ws_keff, u, w, cu_seqlens
         + [ctypes.c_int64] * 3     # batch_size, seq_len, total_tokens
+        + [ctypes.c_uint32]        # num_heads (runtime)
     )
     lib.call_kernel.restype = None
     return lib
@@ -334,7 +330,7 @@ def run_wy_kda(
         _vp(ws_a2), _vp(ws_keff),
         _vp(u_out), _vp(w_out),
         _vp(cu32),
-        batch, T, T,
+        batch, T, T, HV,
     )
 
 
@@ -350,25 +346,22 @@ def load_chunk_h_kda(
 ) -> ctypes.CDLL:
     """Compile + load the KDA chunk_h kernel.
 
-    Template parameters injected at compile time:
-        GDN_H = num_heads  (HV)
-        GDN_D = k_dim      (K, also used as V_DIM)
-        GDN_C = chunk_size (C)
+    Head count (HV) is a *runtime* kernel argument; only GDN_D (K) and GDN_C (C)
+    are compile-time template parameters, so the .so is head-count-agnostic.
 
     C signature::
         void call_kernel(uint32_t block_dim, void *stream,
                          uint8_t *K, uint8_t *W, uint8_t *U, uint8_t *G,
                          uint8_t *S, uint8_t *V_corr,
                          uint8_t *workspace, uint8_t *cu_seqlens,
-                         int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+                         int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+                         uint32_t num_heads)
     """
     lib_path = compile_chunk_kernel(
         "chunk_h_kda.cpp",
         "chunk_h_kda",
-        num_heads=num_heads,
         hidden_size=k_dim,
         chunk_size=chunk_size,
-        key_heads=None,
         cpp_mtime_ns=_mtime("chunk_h_kda.cpp"),
     )
     lib = ctypes.CDLL(os.path.abspath(lib_path))
@@ -376,6 +369,7 @@ def load_chunk_h_kda(
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 8   # K, W, U, G, S, V_corr, workspace, cu_seqlens
         + [ctypes.c_int64] * 3    # batch_size, seq_len, total_tokens
+        + [ctypes.c_uint32]       # num_heads (runtime)
     )
     lib.call_kernel.restype = None
     return lib
@@ -445,7 +439,7 @@ def run_chunk_h_kda(
         bd, stream,
         _vp(k_t), _vp(w.contiguous()), _vp(u), _vp(g_cs_t),
         _vp(s_snapshots_out), _vp(v_corr_out), _vp(ws), _vp(cu32),
-        batch, T, T,
+        batch, T, T, HV,
     )
 
 
@@ -461,10 +455,8 @@ def load_chunk_o_kda(
 ) -> ctypes.CDLL:
     """Compile + load the KDA chunk_o kernel.
 
-    Template parameters injected at compile time:
-        GDN_H = num_heads  (HV)
-        GDN_D = k_dim      (K, also used as V_DIM)
-        GDN_C = chunk_size (C)
+    Head count (HV) is a *runtime* kernel argument; only GDN_D (K) and GDN_C (C)
+    are compile-time template parameters, so the .so is head-count-agnostic.
 
     C signature::
         void call_kernel(uint32_t block_dim, void *stream,
@@ -472,15 +464,14 @@ def load_chunk_o_kda(
                          uint8_t *G, uint8_t *Mask,
                          uint8_t *workspace, uint8_t *O,
                          uint8_t *cu_seqlens,
-                         int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+                         int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+                         uint32_t num_heads)
     """
     lib_path = compile_chunk_kernel(
         "chunk_o_kda.cpp",
         "chunk_o_kda",
-        num_heads=num_heads,
         hidden_size=k_dim,
         chunk_size=chunk_size,
-        key_heads=None,
         cpp_mtime_ns=_mtime("chunk_o_kda.cpp"),
     )
     lib = ctypes.CDLL(os.path.abspath(lib_path))
@@ -488,6 +479,7 @@ def load_chunk_o_kda(
         [ctypes.c_uint32, ctypes.c_void_p]
         + [ctypes.c_void_p] * 9   # Q, K, V_corr, S, G, Mask, workspace, O, cu_seqlens
         + [ctypes.c_int64] * 3    # batch_size, seq_len, total_tokens
+        + [ctypes.c_uint32]       # num_heads (runtime)
     )
     lib.call_kernel.restype = None
     return lib
@@ -569,5 +561,5 @@ def run_chunk_o_kda(
         _vp(q_t), _vp(k_t), _vp(v_corr), _vp(s_snapshots),
         _vp(g_cs_t), _vp(mask),
         _vp(ws), _vp(o_out), _vp(cu32),
-        batch, T, T,
+        batch, T, T, HV,
     )

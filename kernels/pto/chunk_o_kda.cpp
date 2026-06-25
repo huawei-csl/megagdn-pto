@@ -58,10 +58,6 @@
 #include <runtime/rt_ffts.h>
 using namespace pto;
 
-#ifndef GDN_H
-#define GDN_H 16
-#endif
-
 #ifndef GDN_D
 #define GDN_D 128
 #endif
@@ -191,7 +187,7 @@ gemm_oneshot(TileMatL1<T1, M, K, M, K> &A,
 
 #endif
 
-template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
+template <int32_t HiddenSize, int32_t ChunkSize>
 AICORE void chunk_o_kda_kernel(
     __gm__ half *Q_handle, __gm__ half *K_handle,
     __gm__ half *V_handle, __gm__ half *S_handle,
@@ -200,7 +196,7 @@ AICORE void chunk_o_kda_kernel(
     __gm__ half *O_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint64_t ffts_addr)
+    int32_t num_heads, uint64_t ffts_addr)
 {
   auto cid = get_block_idx();
   auto block_num = get_block_num();
@@ -209,9 +205,11 @@ AICORE void chunk_o_kda_kernel(
   constexpr int32_t K_DIM = HiddenSize;
   constexpr int32_t V_DIM = HiddenSize;
   constexpr int32_t C     = ChunkSize;
-  constexpr int32_t H     = NumHeads;       // HV in KDA terminology
+  // Head count (HV) is a runtime argument; it only drives the work-item decode
+  // and the BSND GM stride, never a UB buffer size or tile shape.
+  const int32_t H     = num_heads;          // HV in KDA terminology
   constexpr int32_t HalfC = C / 2;
-  constexpr int32_t BSND_STRIDE = H * HiddenSize;
+  const int32_t BSND_STRIDE = H * HiddenSize;
   constexpr int32_t HM_STRIDE   = HiddenSize;    // head-major Q, K, G stride
   constexpr int32_t KV = K_DIM * V_DIM;
 
@@ -867,9 +865,9 @@ extern "C" __global__ AICORE void launch_chunk_o_kda(
     __gm__ uint8_t *workspace, __gm__ uint8_t *O,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint64_t ffts_addr)
+    int32_t num_heads, uint64_t ffts_addr)
 {
-  chunk_o_kda_kernel<GDN_H, GDN_D, GDN_C>(
+  chunk_o_kda_kernel<GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(Q),
       reinterpret_cast<__gm__ half *>(K),
       reinterpret_cast<__gm__ half *>(V_corr),
@@ -879,7 +877,7 @@ extern "C" __global__ AICORE void launch_chunk_o_kda(
       reinterpret_cast<__gm__ half  *>(workspace),
       reinterpret_cast<__gm__ half *>(O),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, ffts_addr);
+      batch_size, seq_len, total_tokens, num_heads, ffts_addr);
 }
 
 extern "C" void call_kernel(
@@ -888,12 +886,14 @@ extern "C" void call_kernel(
     uint8_t *G, uint8_t *Mask,
     uint8_t *workspace, uint8_t *O,
     uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads)
 {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
   rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
   launch_chunk_o_kda<<<block_dim, nullptr, stream>>>(
       Q, K, V_corr, S, G, Mask, workspace, O, cu_seqlens,
-      batch_size, seq_len, total_tokens, fftsAddr);
+      batch_size, seq_len, total_tokens,
+      static_cast<int32_t>(num_heads), fftsAddr);
 }

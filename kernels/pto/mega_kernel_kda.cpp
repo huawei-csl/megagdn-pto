@@ -19,9 +19,6 @@
 // inputs (q, k, beta) are permuted to head-major in Python; only g_sum — produced inside
 // the kernel by gate_cumsum — is transposed on-device here.
 
-#ifndef GDN_H
-#define GDN_H 16
-#endif
 #ifndef GDN_D
 #define GDN_D 128
 #endif
@@ -83,9 +80,9 @@ AICORE inline void SyncAllImpl()
 // [HV,T,K].  K stays innermost-contiguous; only the (T,HV) axes swap, so this is a pure
 // gather/scatter of K-contiguous rows (no element transpose).  Layout-only — independent
 // of cu_seqlens.
-template <typename T, int32_t HV, int32_t KD>
+template <typename T, int32_t KD>
 AICORE void mega_permute_THK_to_HTK(
-    __gm__ T *src, __gm__ T *dst, int64_t T_len)
+    __gm__ T *src, __gm__ T *dst, int64_t T_len, int32_t HV)
 {
 #if defined(__DAV_C220_VEC__)
     if (get_subblockid() != 0) return;
@@ -101,8 +98,9 @@ AICORE void mega_permute_THK_to_HTK(
     using UBTileDyn = Tile<TileType::Vec, T, BLOCK, KD, BLayout::RowMajor,
                            DYNAMIC, DYNAMIC, SLayout::NoneBox, 512, PadValue::Zero>;
     using Gm2D   = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
-    using GmSrcS = Stride<1, 1, 1, HV * KD, 1>;   // row stride = HV*K (skip other heads)
+    using GmSrcS = Stride<1, 1, 1, DYNAMIC, 1>;   // row stride = HV*K (runtime; skip other heads)
     using GmDstS = Stride<1, 1, 1, KD, 1>;        // contiguous
+    GmSrcS src_stride(HV * KD);
 
     int64_t num_tok_blocks = (T_len + BLOCK - 1) / BLOCK;
     int64_t total = static_cast<int64_t>(HV) * num_tok_blocks;
@@ -119,7 +117,7 @@ AICORE void mega_permute_THK_to_HTK(
         {
             Gm2D gs; gs.shape[3] = valid; gs.shape[4] = KD;
             GlobalTensor<T, Gm2D, GmSrcS> gm(
-                src + (t0 * static_cast<int64_t>(HV) + h) * KD, gs);
+                src + (t0 * static_cast<int64_t>(HV) + h) * KD, gs, src_stride);
             UBTileDyn ld(valid, KD);
             TASSIGN(ld, UB0);
             TLOAD(ld, gm);
@@ -241,20 +239,23 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     int64_t seq_len,
     int64_t total_tokens,
     uint32_t num_matrices,
+    int32_t num_heads,
     uint64_t ffts_addr)
 {
     set_ffts_base_addr(ffts_addr);
 
-    constexpr int32_t HV = GDN_H;
+    // Head count (HV) is a runtime argument; only GDN_D (K) and GDN_C (C) stay
+    // compile-time, so the fused .so is head-count-agnostic like the staged ones.
+    const int32_t HV = num_heads;
     constexpr int32_t KD = GDN_D;
     constexpr int32_t C  = GDN_C;
 
     // ── Stage 1: gate_cumsum (BSND -> BSND) ──────────────────────────
-    mk_gc::gate_cumsum_kda_kernel<HV, KD, C>(
+    mk_gc::gate_cumsum_kda_kernel<KD, C>(
         reinterpret_cast<__gm__ half *>(g_in_ptr),
         reinterpret_cast<__gm__ half *>(g_sum_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, ffts_addr);
+        batch_size, seq_len, HV, ffts_addr);
 
 #ifdef MEGA_STOP_AFTER_CUMSUM
     pipe_barrier(PIPE_ALL);
@@ -264,10 +265,10 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     SyncAllImpl<false>();
 
     // ── Stage 2: transpose g_sum -> head-major g_cs ──────────────────
-    mega_permute_THK_to_HTK<half, HV, KD>(
+    mega_permute_THK_to_HTK<half, KD>(
         reinterpret_cast<__gm__ half *>(g_sum_ptr),
         reinterpret_cast<__gm__ half *>(g_cs_hm_ptr),
-        total_tokens);
+        total_tokens, HV);
 
 #ifdef MEGA_STOP_AFTER_TRANSPOSE
     pipe_barrier(PIPE_ALL);
@@ -277,7 +278,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     SyncAllImpl<false>();
 
     // ── Stage 3: kkt (gated K·K^T lower-tri matrix) ──────────────────
-    mk_kkt::kkt_kda_kernel<HV, KD, C>(
+    mk_kkt::kkt_kda_kernel<KD, C>(
         reinterpret_cast<__gm__ half *>(k_hm_ptr),
         reinterpret_cast<__gm__ half *>(g_cs_hm_ptr),
         reinterpret_cast<__gm__ half *>(beta_hm_ptr),
@@ -286,7 +287,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
         reinterpret_cast<__gm__ half *>(kkt_ws_out_ptr),
         reinterpret_cast<__gm__ half *>(L_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, ffts_addr);
+        batch_size, seq_len, total_tokens, HV, ffts_addr);
 
 #ifdef MEGA_STOP_AFTER_KKT
     pipe_barrier(PIPE_ALL);
@@ -311,7 +312,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     SyncAllImpl<false>();
 
     // ── Stage 5: wy (auxiliaries u, w) ───────────────────────────────
-    mk_wy::wy_kda_kernel<HV, KD, C>(
+    mk_wy::wy_kda_kernel<KD, C>(
         reinterpret_cast<__gm__ half *>(k_hm_ptr),
         reinterpret_cast<__gm__ half *>(v_ptr),
         reinterpret_cast<__gm__ half *>(beta_hm_ptr),
@@ -322,7 +323,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
         reinterpret_cast<__gm__ half *>(u_ptr),
         reinterpret_cast<__gm__ half *>(w_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, ffts_addr);
+        batch_size, seq_len, total_tokens, HV, ffts_addr);
 
 #ifdef MEGA_STOP_AFTER_WY
     pipe_barrier(PIPE_ALL);
@@ -332,7 +333,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     SyncAllImpl<false>();
 
     // ── Stage 6: chunk_h (state snapshots + v_corr) ──────────────────
-    mk_h::chunk_h_kda_kernel<HV, KD, C>(
+    mk_h::chunk_h_kda_kernel<KD, C>(
         reinterpret_cast<__gm__ half *>(k_hm_ptr),
         reinterpret_cast<__gm__ half *>(w_ptr),
         reinterpret_cast<__gm__ half *>(u_ptr),
@@ -341,7 +342,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
         reinterpret_cast<__gm__ half *>(v_corr_ptr),
         reinterpret_cast<__gm__ half *>(h_ws_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, ffts_addr);
+        batch_size, seq_len, total_tokens, HV, ffts_addr);
 
 #ifdef MEGA_STOP_AFTER_H
     pipe_barrier(PIPE_ALL);
@@ -351,7 +352,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     SyncAllImpl<false>();
 
     // ── Stage 7: chunk_o (output) ────────────────────────────────────
-    mk_o::chunk_o_kda_kernel<HV, KD, C>(
+    mk_o::chunk_o_kda_kernel<KD, C>(
         reinterpret_cast<__gm__ half *>(q_hm_ptr),
         reinterpret_cast<__gm__ half *>(k_hm_ptr),
         reinterpret_cast<__gm__ half *>(v_corr_ptr),
@@ -361,7 +362,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
         reinterpret_cast<__gm__ half *>(o_ws_ptr),
         reinterpret_cast<__gm__ half *>(o_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, total_tokens, ffts_addr);
+        batch_size, seq_len, total_tokens, HV, ffts_addr);
 }
 
 extern "C" void call_kernel(
@@ -374,7 +375,7 @@ extern "C" void call_kernel(
     uint8_t *kkt_ws_in, uint8_t *kkt_ws_out, uint8_t *wy_ws_a2, uint8_t *wy_ws_keff,
     uint8_t *h_ws, uint8_t *o_ws,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint32_t num_matrices)
+    uint32_t num_matrices, uint32_t num_heads)
 {
     uint32_t fftsLen{0};
     uint64_t fftsAddr{0};
@@ -386,5 +387,5 @@ extern "C" void call_kernel(
         g_sum, g_cs_hm, L, A_inv, u, w, s, v_corr,
         kkt_ws_in, kkt_ws_out, wy_ws_a2, wy_ws_keff, h_ws, o_ws,
         batch_size, seq_len, total_tokens, num_matrices,
-        fftsAddr);
+        static_cast<int32_t>(num_heads), fftsAddr);
 }
