@@ -59,7 +59,8 @@
 //   u_out   BSND       [B, T, HV, V] fp32
 //   w_out   BSND       [B, T, HV, K] fp32
 //
-// Template parameters: GDN_H = HV, GDN_D = K (= V_DIM here), GDN_C = C.
+// Compile-time template params: GDN_D = K (= V_DIM here), GDN_C = C.
+// Runtime argument: num_heads = HV.
 // ============================================================================
 
 #include <pto/pto-inst.hpp>
@@ -67,10 +68,6 @@
 #include <runtime/rt_ffts.h>
 #include <type_traits>
 using namespace pto;
-
-#ifndef GDN_H
-#define GDN_H 16
-#endif
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -270,7 +267,7 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
 
 #endif
 
-template <int32_t NumHeads, int32_t HiddenSize, int32_t ChunkSize>
+template <int32_t HiddenSize, int32_t ChunkSize>
 AICORE void wy_kda_kernel(
     __gm__ half *K_handle, __gm__ half *V_handle,
     __gm__ half *Beta_handle, __gm__ float *G_handle,
@@ -279,7 +276,7 @@ AICORE void wy_kda_kernel(
     __gm__ half *U_handle, __gm__ half *W_handle,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint64_t ffts_addr)
+    int32_t num_heads, uint64_t ffts_addr)
 {
   // Per-chunk math (matches ref_wy_kda):
   //   A2[r, c]    = INV[r, c] * beta[c]
@@ -293,11 +290,14 @@ AICORE void wy_kda_kernel(
   constexpr uint32_t KTail =
       (ChunkSize % 128 == 0) ? 128 : (ChunkSize % 128);
 
-  constexpr int32_t H = NumHeads;
+  // Head count (HV) is a runtime argument — it only drives loop bounds and GM
+  // strides, never a UB buffer size or tile shape.
+  const int32_t NumHeads = num_heads;
+  const int32_t H = NumHeads;
   // In KDA the keys arrive pre-expanded to HV heads (no GQA at this stage),
   // so K, V, U, W all use stride H * HiddenSize.
-  constexpr int32_t BSND_STRIDE = H * HiddenSize;
-  constexpr int32_t BSND_C_STRIDE = H * ChunkSize;
+  const int32_t BSND_STRIDE = H * HiddenSize;
+  const int32_t BSND_C_STRIDE = H * ChunkSize;
 
   // ── UB address plan ───────────────────────────────────────────────────────
   // Phase 1 (A2 = INV * beta_2d) and Phase 2 (K_eff = k * exp(g_cs)) run
@@ -1005,9 +1005,9 @@ extern "C" __global__ AICORE void launch_wy_kda(
     __gm__ uint8_t *U_handle, __gm__ uint8_t *W_handle,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint64_t ffts_addr)
+    int32_t num_heads, uint64_t ffts_addr)
 {
-  wy_kda_kernel<GDN_H, GDN_D, GDN_C>(
+  wy_kda_kernel<GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(K_handle),
       reinterpret_cast<__gm__ half *>(V_handle),
       reinterpret_cast<__gm__ half *>(Beta_handle),
@@ -1018,7 +1018,7 @@ extern "C" __global__ AICORE void launch_wy_kda(
       reinterpret_cast<__gm__ half *>(U_handle),
       reinterpret_cast<__gm__ half *>(W_handle),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, ffts_addr);
+      batch_size, seq_len, total_tokens, num_heads, ffts_addr);
 }
 
 extern "C" void call_kernel(
@@ -1027,7 +1027,8 @@ extern "C" void call_kernel(
     uint8_t *workspace_a2, uint8_t *workspace_keff,
     uint8_t *u, uint8_t *w,
     uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads)
 {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
@@ -1037,5 +1038,6 @@ extern "C" void call_kernel(
       workspace_a2, workspace_keff,
       u, w,
       cu_seqlens,
-      batch_size, seq_len, total_tokens, fftsAddr);
+      batch_size, seq_len, total_tokens,
+      static_cast<int32_t>(num_heads), fftsAddr);
 }

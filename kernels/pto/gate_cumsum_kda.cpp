@@ -29,10 +29,12 @@
 //   Number of column tiles per chunk = RowWidth / ColTile
 //   (e.g. HV=4,K=128 → 4 tiles; HV=8 → 8 tiles).
 //
-// Template parameters (injected by bisheng at compile time):
-//   GDN_H  = HV (number of value/gate heads)
+// Compile-time template parameters (injected by bisheng):
 //   GDN_D  = K  (key/gate vector dimension per head)
 //   GDN_C  = C  (chunk size in tokens)
+// Runtime argument:
+//   num_heads = HV (number of value/gate heads) — only affects loop bounds and
+//   GM strides, so it need not be a compile-time constant.
 //
 // ─── NPU / PTO recap (see chunk_cumsum.cpp for the full primer) ────────────
 //   GM  — off-chip DRAM shared by all AI cores.
@@ -46,10 +48,6 @@
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 using namespace pto;
-
-#ifndef GDN_H
-#define GDN_H 4
-#endif
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -85,7 +83,7 @@ AICORE void gate_cumsum_kda_kernel(
     __gm__ half *g_ptr, __gm__ float *g_sum_ptr,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
-    uint64_t ffts_addr)
+    int32_t num_heads, uint64_t ffts_addr)
 {
   auto cid = get_block_idx();
   auto block_num = get_block_num();
@@ -100,19 +98,22 @@ AICORE void gate_cumsum_kda_kernel(
   set_vector_mask(-1, -1);
 
   // Flat 2D view of g: [total_tokens, HV*K] (row-major, contiguous).
-  constexpr int32_t RowWidth = NumHeads * KDim;
+  // Head count is a runtime argument, so RowWidth is runtime too.
+  const int32_t RowWidth = num_heads * KDim;
 
   // ColTile: number of HV*K columns processed in one UB-resident slice.
-  // 128 is safe for ChunkSize up to 128 (per-tile UB ≈ 66 KB) and divides
-  // RowWidth = HV*KDim whenever KDim is a multiple of 128 (the typical case).
+  // It is derived from the *compile-time* per-head dim KDim (not RowWidth), so
+  // the UB tile buffers below stay statically sized regardless of head count —
+  // 128 is safe for ChunkSize up to 128 (per-tile UB ≈ 66 KB).  KDim is a
+  // multiple of 128 in practice, so ColTile=128 divides KDim and therefore
+  // divides RowWidth = num_heads*KDim for any head count.
   constexpr int32_t ColTileTarget = 128;
-  constexpr int32_t ColTile = (RowWidth < ColTileTarget) ? RowWidth : ColTileTarget;
-  constexpr int32_t CTC = ((ColTile + 7) / 8) * 8;  // 8-elem alignment
-  static_assert(RowWidth % ColTile == 0,
-                "RowWidth (HV*KDim) must be a multiple of ColTile (128). "
-                "Reduce ColTileTarget or pick HV/KDim values whose product "
-                "is divisible by it.");
-  constexpr int32_t NumColTiles = RowWidth / ColTile;
+  constexpr int32_t ColTile = (KDim < ColTileTarget) ? KDim : ColTileTarget;
+  constexpr int32_t CTC = ((ColTile + 7) / 8) * 8; // 8-elem alignment
+  static_assert(KDim % ColTile == 0,
+                "KDim must be a multiple of ColTile (128).");
+  // Number of column tiles a row spans — runtime, since RowWidth is runtime.
+  const int32_t NumColTiles = RowWidth / ColTile;
 
   // Per-tile UB layout:
   //   [0           .. HalfBlockBytes)        = g input,  fp16 staging (ChunkSize × CTC)
@@ -131,9 +132,10 @@ AICORE void gate_cumsum_kda_kernel(
   // Strided 2D loads (row_stride > col_count) are supported — same pattern as
   // chunk_h.cpp's per-head BSND loads at e.g. lines 599-604.
   using GmShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
-  using GmStride = Stride<1, 1, 1, RowWidth, 1>;
-  using GmHalf = GlobalTensor<half, GmShape, GmStride>;    // input g (fp16)
-  using GmFloat = GlobalTensor<float, GmShape, GmStride>;  // output g_sum (fp32)
+  using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
+  using GmHalf = GlobalTensor<half, GmShape, GmStride>;
+  // Runtime row stride (RowWidth) shared by every g / g_sum GM view below.
+  GmStride row_stride(RowWidth);
 
   // Row accumulator — pre-assigned, re-initialised at each column tile.
   UbND<float, 1, CTC> acc_ub;
@@ -167,7 +169,7 @@ AICORE void gate_cumsum_kda_kernel(
           GmShape gs;
           gs.shape[3] = valid;
           gs.shape[4] = ColTile;
-          GmHalf g_gm(g_ptr + chunk_start * RowWidth + col_off, gs);
+          GmHalf g_gm(g_ptr + chunk_start * RowWidth + col_off, gs, row_stride);
           UbND<half, ChunkSize, CTC, DYNAMIC, DYNAMIC, PadValue::Zero>
               g_load(valid, ColTile);
           TASSIGN(g_load, GHalfAddr);
@@ -227,8 +229,8 @@ AICORE void gate_cumsum_kda_kernel(
           GmShape ss;
           ss.shape[3] = valid;
           ss.shape[4] = ColTile;
-          GmFloat gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss);
-          UbND<float, ChunkSize, CTC, DYNAMIC, DYNAMIC>
+          GmHalf gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss, row_stride);
+          UbND<half, ChunkSize, CTC, DYNAMIC, DYNAMIC>
               s_store(valid, ColTile);
           TASSIGN(s_store, SUbAddr);
           TSTORE(gs_gm, s_store);
@@ -267,7 +269,7 @@ AICORE void gate_cumsum_kda_kernel(
               GmShape gs;
               gs.shape[3] = valid;
               gs.shape[4] = ColTile;
-              GmHalf g_gm(g_ptr + chunk_start * RowWidth + col_off, gs);
+              GmHalf g_gm(g_ptr + chunk_start * RowWidth + col_off, gs, row_stride);
               UbND<half, ChunkSize, CTC, DYNAMIC, DYNAMIC, PadValue::Zero>
                   g_load(valid, ColTile);
               TASSIGN(g_load, GHalfAddr);
@@ -319,8 +321,8 @@ AICORE void gate_cumsum_kda_kernel(
               GmShape ss;
               ss.shape[3] = valid;
               ss.shape[4] = ColTile;
-              GmFloat gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss);
-              UbND<float, ChunkSize, CTC, DYNAMIC, DYNAMIC>
+              GmHalf gs_gm(g_sum_ptr + chunk_start * RowWidth + col_off, ss, row_stride);
+              UbND<half, ChunkSize, CTC, DYNAMIC, DYNAMIC>
                   s_store(valid, ColTile);
               TASSIGN(s_store, SUbAddr);
               TSTORE(gs_gm, s_store);
@@ -341,24 +343,25 @@ extern "C" __global__ AICORE void launch_gate_cumsum_kda(
     __gm__ uint8_t *g_ptr, __gm__ uint8_t *g_sum_ptr,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
-    uint64_t ffts_addr)
+    int32_t num_heads, uint64_t ffts_addr)
 {
-  gate_cumsum_kda_kernel<GDN_H, GDN_D, GDN_C>(
+  gate_cumsum_kda_kernel<GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(g_ptr),
       reinterpret_cast<__gm__ float *>(g_sum_ptr),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, ffts_addr);
+      batch_size, seq_len, num_heads, ffts_addr);
 }
 
 // ── Host-side launcher (called from Python via ctypes) ────────────────────
 extern "C" void call_kernel(
     uint32_t block_dim, void *stream,
     uint8_t *g_ptr, uint8_t *g_sum_ptr, uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len)
+    int64_t batch_size, int64_t seq_len, uint32_t num_heads)
 {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
   rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
   launch_gate_cumsum_kda<<<block_dim, nullptr, stream>>>(
-      g_ptr, g_sum_ptr, cu_seqlens, batch_size, seq_len, fftsAddr);
+      g_ptr, g_sum_ptr, cu_seqlens, batch_size, seq_len,
+      static_cast<int32_t>(num_heads), fftsAddr);
 }

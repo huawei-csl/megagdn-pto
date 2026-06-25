@@ -40,17 +40,43 @@
 //   ws_out  [block_dim*2, C, C]    float32  — (unused; kept for ABI stability)
 //   L_out   [total_tokens, HV, C]  float16  — strictly-lower-tri L (BSND)
 //
-// Template parameters: GDN_H = HV, GDN_D = K, GDN_C = C
+// Output:
+//   L_out   [total_tokens, HV, C]  float32  — strictly-lower-tri L matrix (BSND)
+//
+// Cross-core architecture (mirrors GDN scaled_dot_kkt pattern):
+//   Both Vec sub-blocks (vid=0,1) do real work: each handles HalfChunk rows.
+//     vid=0 → rows [0, C/2),  vid=1 → rows [C/2, C)
+//   Vec pre:  load k, g_cs (my rows) → A_eff = k*exp(g), B_eff = k*exp(-g),
+//             cast fp16 → ws_in[my rows]
+//   Cube:     load full A_eff, B_eff from ws_in → GEMM A @ B^T → ws_out
+//   Vec post: load ws_out[my rows], cast fp32 → apply mask + beta row-scale → L_out
+//
+// FFTS flags (double-buffered, slot = ci & 1):
+//   0, 1 : Vec → Cube  "ws_in[slot] ready"  (both vids must sig under mode-2 reduce)
+//   2, 3 : Cube → Vec  "ws_out[slot] ready" (broadcast: each vid gets a signal)
+//   4, 5 : Vec → Cube  "ws_out[slot] free"  (Vec done reading L_full; conditional)
+//
+// UB budget (per vid, HalfChunk=C/2 rows; UB ~192 KB per Vec sub-block):
+//   mask fp32 [C/2, C] lives always at offset 0 (loaded once per launch).
+//   The rest of UB is a shared pool reused between pre-compute and post-process
+//   (they never run concurrently within a chunk).
+//   Pre-compute pool (live simultaneously):
+//     g_ub  fp32 [C/2, KTC],  k_ub fp32 [C/2, KTC],
+//     ab_ub fp32 [C/2, KTC],  half_buf fp16 [C/2, KTC]    (scratch reused A → B)
+//   Post-process pool (live simultaneously; overlaps pre-compute addresses):
+//     L_half fp16 [C/2, C],  L_ub fp32 [C/2, C],
+//     beta_2d fp32 [C/2, C], beta fp32 [1, C/2]
+//   Peak @ C=128, K=128: mask 32 + pre 112 = 144 KB ✓ (under 192 KB)
+//   Peak @ C=16,  K=128: mask 0.5 + pre 14 ≈ 15 KB ✓
+//
+// Template parameters:
+//   Compile-time: GDN_D = K, GDN_C = C.  Runtime: num_heads = HV.
 // ============================================================================
 
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 using namespace pto;
-
-#ifndef GDN_H
-#define GDN_H 4
-#endif
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -93,7 +119,7 @@ using UbDN = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::ColMajor,
                        RV, CV, pto::SLayout::NoneBox, 512>;
 #endif
 
-template <int32_t NumHeads, int32_t KDim, int32_t ChunkSize>
+template <int32_t KDim, int32_t ChunkSize>
 AICORE void kkt_kda_kernel(
     __gm__ half *k_ptr,
     __gm__ float *g_cs_ptr,
@@ -104,12 +130,17 @@ AICORE void kkt_kda_kernel(
     __gm__ half *L_out_ptr,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint64_t ffts_addr)
+    int32_t num_heads, uint64_t ffts_addr)
 {
     auto cid = get_block_idx();
     auto block_num = get_block_num();
     auto vid = get_subblockid();
     set_ffts_base_addr(ffts_addr);
+
+    // Head count is a runtime argument (HV).  Only loop bounds, the work-item
+    // decode, and GM strides depend on it — no UB buffer or tile shape does —
+    // so it never needs to be a compile-time constant.
+    const int32_t NumHeads = num_heads;
 
     constexpr int32_t HalfChunk = ChunkSize / 2;
     constexpr int32_t KTC = ((KDim + 7) / 8) * 8;
@@ -121,25 +152,14 @@ AICORE void kkt_kda_kernel(
     using GmShapeDyn = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
     using GmFloatK = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
     using GmHalfK = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
-    using GmHalf1 = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, 1, 1>>;
-    // L_out is [total_tokens, HV, C].  We store one column c of L for a strided
-    // set of global rows: a [1, store_rows] view whose "columns" step by one
-    // global row (distance NumHeads*ChunkSize in L_out), col stride below.
-    // Store one column c of L for a strided set of global rows: the row (token)
-    // dim steps by NumHeads*ChunkSize, the single column is contiguous (stride 1).
-    using GmHalfLoutCol = GlobalTensor<half, GmShapeDyn,
-                                       Stride<1, 1, 1, NumHeads * ChunkSize, 1>>;
-    // Strict-lower mask [C, C]; read one column c as a [my_rows, 1] strip where
-    // the row dim steps down by ChunkSize and the single column is contiguous
-    // (innermost stride 1 — the only pattern TLOAD honours for a gather).
-    using GmFloatMaskColRow = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
-
-#if defined(__DAV_C220_CUBE__)
-    // Cube does no compute here; it only participates in the entry/exit barriers
-    // so the Vec-side sync_all() handshakes complete.
-    sync_all();
-    sync_all();
-#endif
+    using GmHalf_1 = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, 1, 1>>;
+    // L output is BSND-interleaved [total_tokens, NumHeads, ChunkSize]; the
+    // token stride NumHeads*ChunkSize is now runtime, so the GM stride is
+    // DYNAMIC and supplied at construction (see the store site below).
+    using GmHalfOut = GlobalTensor<half, GmShapeDyn,
+                                   Stride<1, 1, 1, DYNAMIC, 1>>;
+    using GmHalfWsIn = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
+    using GmHalfWsOut = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
 
 #if defined(__DAV_C220_VEC__)
     set_mask_norm();
@@ -147,19 +167,19 @@ AICORE void kkt_kda_kernel(
     sync_all();
 
     // ── UB layout (per vid) ──────────────────────────────────────────────────
-    constexpr int32_t MYG_ADDR   = 0;                                   // [HalfChunk, K] fp32
-    constexpr int32_t MYK_ADDR   = MYG_ADDR  + HalfChunk * KTC * 4;     // [HalfChunk, K] fp32
-    constexpr int32_t DIFF_ADDR  = MYK_ADDR  + HalfChunk * KTC * 4;     // [HalfChunk, K] fp32 (diff/t)
-    constexpr int32_t TMP_ADDR   = DIFF_ADDR + HalfChunk * KTC * 4;     // [HalfChunk, K] fp32 (rowsum tmp)
-    constexpr int32_t MYKH_ADDR  = TMP_ADDR  + HalfChunk * KTC * 4;     // [HalfChunk, K] fp16 (k staging)
-    constexpr int32_t GC_ADDR    = MYKH_ADDR + HalfChunk * KTC * 2;     // [1, K] fp32 (column g_c)
-    constexpr int32_t KC_ADDR    = GC_ADDR   + KTC * 4;                 // [1, K] fp32 (column k_c)
-    constexpr int32_t KCH_ADDR   = KC_ADDR   + KTC * 4;                 // [1, K] fp16 (k_c staging)
-    constexpr int32_t COL_ADDR   = KCH_ADDR  + KTC * 2;                 // [HalfChunk, 16] fp32 (colsum, RowMajor padded)
-    constexpr int32_t COLH_ADDR  = COL_ADDR  + HalfChunk * 16 * 4;      // [HalfChunk, 16] fp16 (padded store, RowMajor)
-    constexpr int32_t BETA_ADDR  = COLH_ADDR + HalfChunk * 16 * 2;      // [1, HalfChunk] fp32 (beta)
-    constexpr int32_t BETAH_ADDR = BETA_ADDR + HalfChunk * 4;           // [1, HalfChunk] fp16 (beta staging)
-    constexpr int32_t MSKC_ADDR  = BETAH_ADDR + HalfChunk * 2;          // [1, HalfChunk] fp32 (mask col)
+    constexpr int32_t MYG_ADDR = 0;                               // [HalfChunk, K] fp32
+    constexpr int32_t MYK_ADDR = MYG_ADDR + HalfChunk * KTC * 4;  // [HalfChunk, K] fp32
+    constexpr int32_t DIFF_ADDR = MYK_ADDR + HalfChunk * KTC * 4; // [HalfChunk, K] fp32 (diff/t)
+    constexpr int32_t TMP_ADDR = DIFF_ADDR + HalfChunk * KTC * 4; // [HalfChunk, K] fp32 (rowsum tmp)
+    constexpr int32_t MYKH_ADDR = TMP_ADDR + HalfChunk * KTC * 4; // [HalfChunk, K] fp16 (k staging)
+    constexpr int32_t GC_ADDR = MYKH_ADDR + HalfChunk * KTC * 2;  // [1, K] fp32 (column g_c)
+    constexpr int32_t KC_ADDR = GC_ADDR + KTC * 4;                // [1, K] fp32 (column k_c)
+    constexpr int32_t KCH_ADDR = KC_ADDR + KTC * 4;               // [1, K] fp16 (k_c staging)
+    constexpr int32_t COL_ADDR = KCH_ADDR + KTC * 2;              // [HalfChunk, 16] fp32 (colsum, RowMajor padded)
+    constexpr int32_t COLH_ADDR = COL_ADDR + HalfChunk * 16 * 4;  // [HalfChunk, 16] fp16 (padded store, RowMajor)
+    constexpr int32_t BETA_ADDR = COLH_ADDR + HalfChunk * 16 * 2; // [1, HalfChunk] fp32 (beta)
+    constexpr int32_t BETAH_ADDR = BETA_ADDR + HalfChunk * 4;     // [1, HalfChunk] fp16 (beta staging)
+    constexpr int32_t MSKC_ADDR = BETAH_ADDR + HalfChunk * 2;     // [1, HalfChunk] fp32 (mask col)
 
     int32_t my_off = static_cast<int32_t>(vid) * HalfChunk;
 
@@ -196,20 +216,24 @@ AICORE void kkt_kda_kernel(
 
             // This vid's row range within the chunk: [my_off, my_off + my_rows).
             int32_t my_rows = valid_rows - my_off;
-            if (my_rows > HalfChunk) my_rows = HalfChunk;
-            if (my_rows <= 0) continue;  // no rows for this vid in this chunk
+            if (my_rows > HalfChunk)
+                my_rows = HalfChunk;
+            if (my_rows <= 0)
+                continue; // no rows for this vid in this chunk
 
             // Columns this vid must cover: c in [0, col_end).  A row r is kept
             // for column c only if global_row(r) > c, so the largest column any
             // of my rows touches is (my_off + my_rows - 1).
-            int32_t col_end = my_off + my_rows;  // exclusive upper bound for c
+            int32_t col_end = my_off + my_rows; // exclusive upper bound for c
 
             int64_t hbase = static_cast<int64_t>(head_idx) * total_tokens * KDim;
-            int64_t my_first = bos + chunk_start + my_off;  // global row index of my row 0
+            int64_t my_first = bos + chunk_start + my_off; // global row index of my row 0
 
             // ── Load my rows' g_cs (fp32) and k (fp16 -> fp32) ───────────────
             {
-                GmShapeDyn gs; gs.shape[3] = my_rows; gs.shape[4] = KDim;
+                GmShapeDyn gs;
+                gs.shape[3] = my_rows;
+                gs.shape[4] = KDim;
                 GmFloatK g_gm(g_cs_ptr + hbase + my_first * KDim, gs);
                 UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero>
                     g_ld(my_rows, KDim);
@@ -217,7 +241,9 @@ AICORE void kkt_kda_kernel(
                 TLOAD(g_ld, g_gm);
             }
             {
-                GmShapeDyn gs; gs.shape[3] = my_rows; gs.shape[4] = KDim;
+                GmShapeDyn gs;
+                gs.shape[3] = my_rows;
+                gs.shape[4] = KDim;
                 GmHalfK k_gm(k_ptr + hbase + my_first * KDim, gs);
                 UbND<half, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero>
                     k_ld(my_rows, KDim);
@@ -237,7 +263,9 @@ AICORE void kkt_kda_kernel(
             // ── Load my rows' beta (fp16 -> fp32) as a [1, my_rows] row, then
             //    re-view as a [my_rows, 1] column for the per-row scale. ───────
             {
-                GmShapeDyn gs; gs.shape[3] = 1; gs.shape[4] = my_rows;
+                GmShapeDyn gs;
+                gs.shape[3] = 1;
+                gs.shape[4] = my_rows;
                 GmHalf1 b_gm(beta_ptr + static_cast<int64_t>(head_idx) * total_tokens +
                                  my_first,
                              gs);
@@ -269,7 +297,9 @@ AICORE void kkt_kda_kernel(
                 // Load column c's g_cs (fp32) and k (fp16 -> fp32) — [1, K].
                 int64_t col_off = hbase + (bos + chunk_start + c) * KDim;
                 {
-                    GmShapeDyn gs; gs.shape[3] = 1; gs.shape[4] = KDim;
+                    GmShapeDyn gs;
+                    gs.shape[3] = 1;
+                    gs.shape[4] = KDim;
                     GmFloatK gc_gm(g_cs_ptr + col_off, gs);
                     UbND<float, 1, KTC, 1, KTC> gc_ld;
                     TASSIGN(gc_ld, GC_ADDR);
@@ -327,7 +357,9 @@ AICORE void kkt_kda_kernel(
                 {
                     UbND<float, HalfChunk, 16, DYNAMIC, DYNAMIC> mk(my_rows, 1);
                     TASSIGN(mk, MSKC_ADDR);
-                    GmShapeDyn gs; gs.shape[3] = my_rows; gs.shape[4] = 1;
+                    GmShapeDyn gs;
+                    gs.shape[3] = my_rows;
+                    gs.shape[4] = 1;
                     GmFloatMaskColRow mk_gm(
                         mask_ptr + static_cast<int64_t>(my_off) * ChunkSize + c, gs);
                     TLOAD(mk, mk_gm);
@@ -350,7 +382,9 @@ AICORE void kkt_kda_kernel(
                 {
                     int64_t l_off = my_first * static_cast<int64_t>(NumHeads) * ChunkSize +
                                     static_cast<int64_t>(head_idx) * ChunkSize + c;
-                    GmShapeDyn gs; gs.shape[3] = my_rows; gs.shape[4] = 1;
+                    GmShapeDyn gs;
+                    gs.shape[3] = my_rows;
+                    gs.shape[4] = 1;
                     GmHalfLoutCol l_gm(L_out_ptr + l_off, gs);
                     TSTORE(l_gm, col_h);
                 }
@@ -379,9 +413,9 @@ extern "C" __global__ AICORE void launch_kkt_kda(
     __gm__ uint8_t *L_out_ptr,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint64_t ffts_addr)
+    int32_t num_heads, uint64_t ffts_addr)
 {
-    kkt_kda_kernel<GDN_H, GDN_D, GDN_C>(
+    kkt_kda_kernel<GDN_D, GDN_C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
         reinterpret_cast<__gm__ float *>(g_cs_ptr),
         reinterpret_cast<__gm__ half *>(beta_ptr),
@@ -390,7 +424,7 @@ extern "C" __global__ AICORE void launch_kkt_kda(
         reinterpret_cast<__gm__ float *>(ws_out_ptr),
         reinterpret_cast<__gm__ half *>(L_out_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-        batch_size, seq_len, total_tokens, ffts_addr);
+        batch_size, seq_len, total_tokens, num_heads, ffts_addr);
 }
 
 // ── Host entry point (called from Python via ctypes) ─────────────────────────
@@ -404,7 +438,8 @@ extern "C" void call_kernel(
     uint8_t *ws_out_ptr,
     uint8_t *L_out_ptr,
     uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens)
+    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
+    uint32_t num_heads)
 {
     uint32_t fftsLen{0};
     uint64_t fftsAddr{0};
@@ -412,5 +447,6 @@ extern "C" void call_kernel(
     launch_kkt_kda<<<block_dim, nullptr, stream>>>(
         k_ptr, g_cs_ptr, beta_ptr, mask_ptr,
         ws_in_ptr, ws_out_ptr, L_out_ptr, cu_seqlens,
-        batch_size, seq_len, total_tokens, fftsAddr);
+        batch_size, seq_len, total_tokens,
+        static_cast<int32_t>(num_heads), fftsAddr);
 }
