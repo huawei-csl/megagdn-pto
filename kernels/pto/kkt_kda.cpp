@@ -302,74 +302,20 @@ AICORE void kkt_kda_kernel(
             int64_t b_ws_base =
                 (static_cast<int64_t>(cid) * 2 + slot) * static_cast<int64_t>(BWsSlotElems);
 
-            // ── PRE-COMPUTE ────────────────────────────────────────────────
+            // ── COMPUTE A / B / b for my HalfChunk rows (per-token max offset) ──
+            // Each vid owns rows [my_off, my_off+my_rows).  A and B are always stored
+            // as full HalfChunk blocks; absent rows (my_rows == 0) and intra-block pad
+            // rows are zero so the Cube GEMM over all C rows is unaffected.
+            UbND<float, HalfChunk, KTC> a_ub;
+            TASSIGN(a_ub, A_ADDR);
+            UbND<float, HalfChunk, KTC> b_ub;
+            TASSIGN(b_ub, B_ADDR);
+            UbDN<float, HalfChunk, 1> bcol;
+            TASSIGN(bcol, BCOL_ADDR);
+
             if (my_rows > 0)
             {
-                GmShapeDyn gs;
-                gs.shape[3] = my_rows;
-                gs.shape[4] = KDim;
-                GmFloatK g_gm(g_cs_ptr + hbase + my_first * KDim, gs);
-                UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero>
-                    g_ld(my_rows, KDim);
-                TASSIGN(g_ld, MYG_ADDR);
-                TLOAD(g_ld, g_gm);
-            }
-            {
-                GmShapeDyn gs;
-                gs.shape[3] = my_rows;
-                gs.shape[4] = KDim;
-                GmHalfK k_gm(k_ptr + hbase + my_first * KDim, gs);
-                UbND<half, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero>
-                    k_ld(my_rows, KDim);
-                TASSIGN(k_ld, MYKH_ADDR);
-                TLOAD(k_ld, k_gm);
-            }
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            {
-                UbND<half, HalfChunk, KTC, DYNAMIC, DYNAMIC> k_h(my_rows, KDim);
-                TASSIGN(k_h, MYKH_ADDR);
-                UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> k_f(my_rows, KDim);
-                TASSIGN(k_f, MYK_ADDR);
-                TCVT(k_f, k_h, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
-            }
-            // ── Load my rows' beta (fp16 -> fp32) as a [1, my_rows] row, then
-            //    re-view as a [my_rows, 1] column for the per-row scale. ───────
-            {
-                GmShapeDyn gs;
-                gs.shape[3] = 1;
-                gs.shape[4] = my_rows;
-                GmHalf_1 b_gm(beta_ptr + static_cast<int64_t>(head_idx) * total_tokens +
-                                  my_first,
-                              gs);
-                UbND<half, 1, HalfChunk, DYNAMIC, DYNAMIC> b_ld(1, my_rows);
-                TASSIGN(b_ld, BETAH_ADDR);
-                TLOAD(b_ld, b_gm);
-            }
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            {
-                UbND<half, 1, HalfChunk, DYNAMIC, DYNAMIC> b_h(1, my_rows);
-                TASSIGN(b_h, BETAH_ADDR);
-                UbND<float, 1, HalfChunk, DYNAMIC, DYNAMIC> b_f(1, my_rows);
-                TASSIGN(b_f, BETA_ADDR);
-                TCVT(b_f, b_h, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
-            }
-
-            UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> myg(my_rows, KDim);
-            TASSIGN(myg, MYG_ADDR);
-            UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> myk(my_rows, KDim);
-            TASSIGN(myk, MYK_ADDR);
-            UbDN<float, HalfChunk, 1, DYNAMIC, DYNAMIC> beta_col(my_rows, 1);
-            TASSIGN(beta_col, BETA_ADDR);
-
-            // ── Column loop ──────────────────────────────────────────────────
-            for (int32_t c = 0; c < col_end; ++c)
-            {
-                // Load column c's g_cs (fp32) and k (fp16 -> fp32) — [1, K].
-                int64_t col_off = hbase + (bos + chunk_start + c) * KDim;
+                // Load my rows' g_cs (fp32) → G_ADDR, zero-pad to HalfChunk.
                 {
                     GmShapeDyn gs;
                     gs.shape[3] = my_rows;
@@ -418,12 +364,6 @@ AICORE void kkt_kda_kernel(
                 TASSIGN(g_ub, G_ADDR);
                 UbND<float, HalfChunk, KTC> k_ub;
                 TASSIGN(k_ub, K_ADDR);
-                UbND<float, HalfChunk, KTC> a_ub;
-                TASSIGN(a_ub, A_ADDR);
-                UbND<float, HalfChunk, KTC> b_ub;
-                TASSIGN(b_ub, B_ADDR);
-                UbDN<float, HalfChunk, 1> bcol;
-                TASSIGN(bcol, BCOL_ADDR);
 
                 // b[r] = max_d g_cs[r,d]   (use B_ADDR space as the rowmax tmp).
                 {
@@ -455,53 +395,63 @@ AICORE void kkt_kda_kernel(
                 pipe_barrier(PIPE_V);
                 TMUL(b_ub, b_ub, k_ub);
                 pipe_barrier(PIPE_V);
-
-                // Store A → ws_in[slot] rows [my_off, …).
-                {
-                    GmShapeDyn gs;
-                    gs.shape[3] = HalfChunk;
-                    gs.shape[4] = KDim;
-                    int64_t off = ws_in_base + static_cast<int64_t>(my_off) * KDim;
-                    GmFloatWsIn gm_a(ws_in_ptr + off, gs);
-                    UbND<float, HalfChunk, KTC, HalfChunk, KTC> a_st;
-                    TASSIGN(a_st, A_ADDR);
-                    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                    TSTORE(gm_a, a_st);
-                }
-                // Store B → ws_in[slot] rows [C+my_off, …).
-                {
-                    GmShapeDyn gs;
-                    gs.shape[3] = HalfChunk;
-                    gs.shape[4] = KDim;
-                    int64_t off = ws_in_base +
-                                  static_cast<int64_t>(ChunkSize) * KDim +
-                                  static_cast<int64_t>(my_off) * KDim;
-                    GmFloatWsIn gm_b(ws_in_ptr + off, gs);
-                    UbND<float, HalfChunk, KTC, HalfChunk, KTC> b_st;
-                    TASSIGN(b_st, B_ADDR);
-                    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                    TSTORE(gm_b, b_st);
-                }
-                // Store b[my rows] → b_ws[slot] (contiguous [my_rows] floats).
-                // bcol is ColMajor [my_rows,1] but its bytes are my_rows contiguous
-                // floats, identical to a RowMajor [1,my_rows] — alias and store as a
-                // row so the GM (ND) store is a supported ND2ND copy.
-                {
-                    GmShapeDyn gs;
-                    gs.shape[3] = 1;
-                    gs.shape[4] = my_rows;
-                    GmFloat_1 b_gm(b_ws_ptr + b_ws_base + my_off, gs);
-                    UbND<float, 1, HalfChunk, DYNAMIC, DYNAMIC> b_st(1, my_rows);
-                    TASSIGN(b_st, BCOL_ADDR);
-                    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
-                    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
-                    TSTORE(b_gm, b_st);
-                }
-                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
             }
+            else
+            {
+                // No valid rows for this vid in this chunk: emit zeros so the GEMM
+                // reads a clean ws_in for this HalfChunk block.
+                TEXPANDS(a_ub, 0.0f);
+                pipe_barrier(PIPE_V);
+                TEXPANDS(b_ub, 0.0f);
+                pipe_barrier(PIPE_V);
+            }
+
+            // Store A → ws_in[slot] rows [my_off, …).
+            {
+                GmShapeDyn gs;
+                gs.shape[3] = HalfChunk;
+                gs.shape[4] = KDim;
+                int64_t off = ws_in_base + static_cast<int64_t>(my_off) * KDim;
+                GmFloatWsIn gm_a(ws_in_ptr + off, gs);
+                UbND<float, HalfChunk, KTC, HalfChunk, KTC> a_st;
+                TASSIGN(a_st, A_ADDR);
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                TSTORE(gm_a, a_st);
+            }
+            // Store B → ws_in[slot] rows [C+my_off, …).
+            {
+                GmShapeDyn gs;
+                gs.shape[3] = HalfChunk;
+                gs.shape[4] = KDim;
+                int64_t off = ws_in_base +
+                              static_cast<int64_t>(ChunkSize) * KDim +
+                              static_cast<int64_t>(my_off) * KDim;
+                GmFloatWsIn gm_b(ws_in_ptr + off, gs);
+                UbND<float, HalfChunk, KTC, HalfChunk, KTC> b_st;
+                TASSIGN(b_st, B_ADDR);
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                TSTORE(gm_b, b_st);
+            }
+            // Store b[my rows] → b_ws[slot] (contiguous [my_rows] floats).
+            // bcol is ColMajor [my_rows,1] but its bytes are my_rows contiguous
+            // floats, identical to a RowMajor [1,my_rows] — alias and store as a
+            // row so the GM (ND) store is a supported ND2ND copy.
+            if (my_rows > 0)
+            {
+                GmShapeDyn gs;
+                gs.shape[3] = 1;
+                gs.shape[4] = my_rows;
+                GmFloat_1 b_gm(b_ws_ptr + b_ws_base + my_off, gs);
+                UbND<float, 1, HalfChunk, DYNAMIC, DYNAMIC> b_st(1, my_rows);
+                TASSIGN(b_st, BCOL_ADDR);
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+                TSTORE(b_gm, b_st);
+            }
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
 
             // Both vids signal flag(slot) under V→C reduce mode 2.
             pipe_barrier(PIPE_ALL);
