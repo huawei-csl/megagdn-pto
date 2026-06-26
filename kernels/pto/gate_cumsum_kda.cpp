@@ -133,8 +133,8 @@ AICORE void gate_cumsum_kda_kernel(
   // chunk_h.cpp's per-head BSND loads at e.g. lines 599-604.
   using GmShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
   using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
-  using GmHalf = GlobalTensor<half, GmShape, GmStride>;    // input g (fp16)
-  using GmFloat = GlobalTensor<float, GmShape, GmStride>;  // output g_sum (fp32)
+  using GmHalf = GlobalTensor<half, GmShape, GmStride>;   // input g (fp16)
+  using GmFloat = GlobalTensor<float, GmShape, GmStride>; // output g_sum (fp32)
   // Runtime row stride (RowWidth) shared by every g / g_sum GM view below.
   GmStride row_stride(RowWidth);
 

@@ -278,8 +278,8 @@ AICORE void kkt_kda_kernel(
                 gs.shape[3] = 1;
                 gs.shape[4] = my_rows;
                 GmHalf_1 b_gm(beta_ptr + static_cast<int64_t>(head_idx) * total_tokens +
-                                 my_first,
-                             gs);
+                                  my_first,
+                              gs);
                 UbND<half, 1, HalfChunk, DYNAMIC, DYNAMIC> b_ld(1, my_rows);
                 TASSIGN(b_ld, BETAH_ADDR);
                 TLOAD(b_ld, b_gm);
