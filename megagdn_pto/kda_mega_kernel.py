@@ -50,7 +50,7 @@ def _load_mega_kernel_kda(
     lib = ctypes.CDLL(os.path.abspath(lib_path))
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
-        + [ctypes.c_void_p] * 24
+        + [ctypes.c_void_p] * 25
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
            ctypes.c_uint32, ctypes.c_uint32]  # ..., num_matrices, num_heads
     )
@@ -162,6 +162,7 @@ def run_mega_kernel_kda(
     # gated GEMMs, whose values reach ~e^64 and would overflow fp16.
     kkt_ws_in  = torch.zeros(bd * 2, 2 * C, K, device=dev, dtype=torch.float32)
     kkt_ws_out = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float32)
+    kkt_b_ws   = torch.zeros(bd * 2, C, device=dev, dtype=torch.float32)
     wy_ws_a2   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
     wy_ws_keff = torch.zeros(bd, C, K, device=dev, dtype=torch.float16)
     h_ws       = torch.zeros(bd * 5, K, K, device=dev, dtype=torch.float16)
@@ -178,7 +179,7 @@ def run_mega_kernel_kda(
         _vp(o_out),
         _vp(g_sum), _vp(g_cs_hm), _vp(L), _vp(A_inv),
         _vp(u), _vp(w), _vp(s), _vp(v_corr),
-        _vp(kkt_ws_in), _vp(kkt_ws_out), _vp(wy_ws_a2), _vp(wy_ws_keff),
+        _vp(kkt_ws_in), _vp(kkt_ws_out), _vp(kkt_b_ws), _vp(wy_ws_a2), _vp(wy_ws_keff),
         _vp(h_ws), _vp(o_ws),
         N_seq, T, T, num_matrices, HV,
     )
