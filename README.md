@@ -81,6 +81,45 @@ bash benchmarks/vllm_prefill/run_prefill_sweep.sh  # prefill speed-up
 bash benchmarks/eval_acc/run_eval_suite.sh  # lm-eval accuracy check, takes 20 min for one model
 ```
 
+## Kimi-Linear (KDA megakernel)
+
+Kimi-Linear-48B uses the KDA variant of the megakernel and runs inside the
+vllm-ascend Docker image via `docker/run_kimi_docker.sh` (TP=4 on NPUs 0–3;
+weights expected at `/scratch/model_weights/Kimi-Linear-48B-A3B-Instruct`). The
+script mounts this repo at `/sources` and pre-patches vllm-ascend for KimiLinear
+(page alignment, NoPE MLA rope, hybrid KV reshape).
+
+The image does not ship `lm-eval`, so install it inside the container first
+(`PIP_CACHE_DIR` on `/sources` is optional, it just makes repeat runs fast).
+The repo itself needs no `pip install -e .` — it is imported from `/sources`.
+
+If weights are not under /scratch, set KIMI_MODEL_DIR to the host path that
+holds model_weights/ (mounted read-only at /scratch in the container)
+
+```bash
+export KIMI_MODEL_DIR=/netscratch/hng-atlas02
+```
+
+To evaluate e2e accuracy with the KDA megakernel run:
+```bash
+bash docker/run_kimi_docker.sh bash -c "export PIP_CACHE_DIR=/sources/.pip-cache && \
+    pip install -q lm_eval && \
+    python benchmarks/eval_acc/run_lm_eval.py \
+    --preset kimi_linear_48b --backend kda_mega \
+    --output-json outputs/data/eval_kimi/kimi_linear_48b_kda.json"
+```
+
+Or:
+```bash
+# v0.19 image instead of the default v0.18:
+KIMI_IMAGE=quay.io/ascend/vllm-ascend:v0.19.1rc1 KIMI_NO_MOUNTS=1 KIMI_V19_HOOK=1 \
+    bash docker/run_kimi_docker.sh bash -c "export PIP_CACHE_DIR=/sources/.pip-cache && \
+    pip install -q lm_eval && \
+    python benchmarks/eval_acc/run_lm_eval.py \
+    --preset kimi_linear_48b --backend kda_mega \
+    --output-json outputs/data/eval_kimi/kimi_linear_48b_kda.json"
+```
+
 ## Generating figures
 
 After running the benchmarks, use `scripts/plot_results.py` to generate all figures under `outputs/figure/`.

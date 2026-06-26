@@ -58,6 +58,27 @@ def _load_mega_kernel_kda(
     return lib
 
 
+def _extract_final_states(
+    s: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    C: int,
+) -> torch.Tensor:
+    """Extract the per-sequence final recurrent state from chunk snapshots.
+
+    Args:
+        s:          ``[tc, HV, K, V]`` fp16 — one snapshot per chunk (end-of-chunk state).
+        cu_seqlens: ``[N_seq+1]`` int32.
+        C:          chunk size.
+
+    Returns:
+        ``[N_seq, HV, K, V]`` fp16.
+    """
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]          # [N_seq]
+    chunks_per_seq = (seq_lens.long() + C - 1) // C       # ceil div
+    last_chunk_idx = chunks_per_seq.cumsum(0) - 1         # 0-indexed last chunk per seq
+    return s[last_chunk_idx]                              # [N_seq, HV, K, V]
+
+
 def run_mega_kernel_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -70,7 +91,8 @@ def run_mega_kernel_kda(
     chunk_size: int = 128,
     block_dim: int | None = None,
     batch_size_override: int | None = None,
-) -> torch.Tensor:
+    return_final_state: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run all six KDA stages in a single fused NPU kernel launch.
 
     Args:
@@ -84,9 +106,11 @@ def run_mega_kernel_kda(
         chunk_size: Chunk size C (default 128).
         block_dim:  AI-Core block count (auto-detected if None).
         batch_size_override: Number of sequences ``N_seq`` (use with ``cu_seqlens``).
+        return_final_state: If True, also return ``[N_seq, HV, K, V]`` final states.
 
     Returns:
-        ``O`` of shape ``[1, T, HV, V]`` fp16.
+        ``O`` of shape ``[1, T, HV, V]`` fp16, and optionally the final
+        recurrent state ``[N_seq, HV, K, V]`` fp16.
     """
     assert q.dtype == torch.float16 and v.dtype == torch.float16
     dev = q.device
@@ -120,9 +144,11 @@ def run_mega_kernel_kda(
     v = v.contiguous()
     g = g.contiguous()
 
-    # Intermediates.
-    g_sum   = torch.empty(1, T, HV, K, device=dev, dtype=torch.float16)
-    g_cs_hm = torch.empty(1, HV, T, K, device=dev, dtype=torch.float16)
+    # Intermediates.  g_sum/g_cs_hm are fp32: the per-128-chunk cumulative gate
+    # reaches ~-64 and fp16 storage there corrupts exp(g_cs) (matches GDN's fp32
+    # gate).
+    g_sum   = torch.empty(1, T, HV, K, device=dev, dtype=torch.float32)
+    g_cs_hm = torch.empty(1, HV, T, K, device=dev, dtype=torch.float32)
     L       = torch.zeros(1, T, HV, C, device=dev, dtype=torch.float16)
     A_inv   = torch.zeros(1, T, HV, C, device=dev, dtype=torch.float16)
     u       = torch.zeros(1, T, HV, V, device=dev, dtype=torch.float16)
@@ -132,12 +158,14 @@ def run_mega_kernel_kda(
     o_out   = torch.zeros(1, T, HV, V, device=dev, dtype=torch.float16)
 
     # Per-AI-core workspaces (shapes match the staged run_*_kda allocations).
-    kkt_ws_in  = torch.zeros(bd * 2, 2 * C, K, device=dev, dtype=torch.float16)
-    kkt_ws_out = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float16)
+    # kkt_ws_in/out and o_ws are fp32: they stage exp(±g_cs) and the unmasked
+    # gated GEMMs, whose values reach ~e^64 and would overflow fp16.
+    kkt_ws_in  = torch.zeros(bd * 2, 2 * C, K, device=dev, dtype=torch.float32)
+    kkt_ws_out = torch.zeros(bd * 2, C, C, device=dev, dtype=torch.float32)
     wy_ws_a2   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
     wy_ws_keff = torch.zeros(bd, C, K, device=dev, dtype=torch.float16)
     h_ws       = torch.zeros(bd * 5, K, K, device=dev, dtype=torch.float16)
-    o_ws       = torch.zeros(bd * 7, K, K, device=dev, dtype=torch.float16)
+    o_ws       = torch.zeros(bd * 7, K, K, device=dev, dtype=torch.float32)
 
     # Cold-start FFTS handshake needs all pending work (incl. workspace zero-fill) drained.
     torch.npu.synchronize()
@@ -154,4 +182,6 @@ def run_mega_kernel_kda(
         _vp(h_ws), _vp(o_ws),
         N_seq, T, T, num_matrices, HV,
     )
+    if return_final_state:
+        return o_out, _extract_final_states(s, cu_seqlens, C)
     return o_out

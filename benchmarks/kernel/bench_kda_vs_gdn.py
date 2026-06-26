@@ -120,10 +120,11 @@ def bench_gate_cumsum(HV: int, T: int, cu_seqlens, dev, stream, bd: int):
     cu32  = cu_seqlens.to(torch.int32)
     batch = len(cu_seqlens) - 1
 
-    # KDA: [B, T, HV, D] fp16 — D-dimensional gate per head per token
+    # KDA: [B, T, HV, D] fp16 in — D-dimensional gate per head per token;
+    # cumsum output is fp32 (overflow-safe gate path).
     lib_kda  = load_gate_cumsum_kda(HV, D, C)
     g_kda    = torch.randn(1, T, HV, D, device=dev, dtype=torch.float16)
-    gs_kda   = torch.empty_like(g_kda)
+    gs_kda   = torch.empty(1, T, HV, D, device=dev, dtype=torch.float32)
 
     def run_kda():
         lib_kda.call_kernel(bd, stream, _vp(g_kda), _vp(gs_kda), _vp(cu32), batch, T)
@@ -161,14 +162,14 @@ def bench_kkt(HV: int, HG: int, T: int, cu_seqlens, dev, stream, bd: int):
     rows  = torch.arange(C, device=dev).unsqueeze(1)
     cols  = torch.arange(C, device=dev).unsqueeze(0)
 
-    # KDA: k/g in head-major [B, HV, T, D] fp16; β [B, HV, T] fp16
+    # KDA: k head-major [B, HV, T, D] fp16; g_cs head-major fp32; β [B, HV, T] fp16
     lib_kda    = load_kkt_kda(HV, D, C)
     k_kda_hm   = torch.randn(1, HV, T, D, device=dev, dtype=torch.float16)
-    g_cs_hm    = torch.randn(1, HV, T, D, device=dev, dtype=torch.float16)
+    g_cs_hm    = torch.randn(1, HV, T, D, device=dev, dtype=torch.float32)
     beta_kda_hm = torch.rand(1, HV, T,    device=dev, dtype=torch.float16)
     mask_kda   = (rows > cols).to(torch.float32)          # strictly lower tri
-    ws_in_kda  = torch.zeros(bd * 2, 2 * C, D, device=dev, dtype=torch.float16)
-    ws_out_kda = torch.zeros(bd * 2, C,      C, device=dev, dtype=torch.float16)
+    ws_in_kda  = torch.zeros(bd * 2, 2 * C, D, device=dev, dtype=torch.float32)
+    ws_out_kda = torch.zeros(bd * 2, C,      C, device=dev, dtype=torch.float32)
     L_kda      = torch.zeros(1, T, HV, C,    device=dev, dtype=torch.float16)
 
     def run_kda():
@@ -264,10 +265,10 @@ def bench_wy(HV: int, HG: int, T: int, cu_seqlens, dev, stream, bd: int):
     cu32  = cu_seqlens.to(torch.int32)
     batch = len(cu_seqlens) - 1
 
-    # KDA: k/g head-major fp16; v BSND fp16; β head-major fp16; INV BSND fp16
+    # KDA: k head-major fp16; g_cs head-major fp32; v BSND fp16; β head-major fp16; INV BSND fp16
     lib_kda    = load_wy_kda(HV, D, C)
     k_hm       = torch.randn(1, HV, T, D, device=dev, dtype=torch.float16)
-    g_cs_hm    = torch.randn(1, HV, T, D, device=dev, dtype=torch.float16)
+    g_cs_hm    = torch.randn(1, HV, T, D, device=dev, dtype=torch.float32)
     beta_hm    = torch.rand(1, HV, T,    device=dev, dtype=torch.float16)
     v_fp16     = torch.randn(1, T, HV, D, device=dev, dtype=torch.float16)
     INV_kda    = torch.randn(1, T, HV, C, device=dev, dtype=torch.float16)
@@ -324,10 +325,10 @@ def bench_chunk_h(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
     cu32  = cu_seqlens.to(torch.int32)
     batch = len(cu_seqlens) - 1
 
-    # KDA: all fp16; state [tc,HV,D,D] fp16
+    # KDA: g_cs head-major fp32, rest fp16; state [tc,HV,D,D] fp16
     lib_kda     = load_chunk_h_kda(HV, D, C)
     k_hm        = torch.randn(1, HV, T, D,    device=dev, dtype=torch.float16)
-    g_cs_hm     = torch.randn(1, HV, T, D,    device=dev, dtype=torch.float16)
+    g_cs_hm     = torch.randn(1, HV, T, D,    device=dev, dtype=torch.float32)
     w_kda       = torch.randn(1, T, HV, D,    device=dev, dtype=torch.float16)
     u_kda       = torch.randn(1, T, HV, D,    device=dev, dtype=torch.float16)
     s_kda       = torch.zeros(tc, HV, D, D,   device=dev, dtype=torch.float16)
@@ -387,7 +388,7 @@ def bench_chunk_o(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
     lib_o_kda   = load_chunk_o_kda(HV, D, C)
     k_hm        = F.normalize(torch.randn(1, HV, T, D, device=dev, dtype=torch.float16), dim=-1, p=2)
     q_hm        = F.normalize(torch.randn(1, HV, T, D, device=dev, dtype=torch.float16), dim=-1, p=2)
-    g_cs_hm     = torch.randn(1, HV, T, D, device=dev, dtype=torch.float16)
+    g_cs_hm     = torch.randn(1, HV, T, D, device=dev, dtype=torch.float32)
     w_kda       = torch.randn(1, T, HV, D, device=dev, dtype=torch.float16)
     u_kda       = torch.randn(1, T, HV, D, device=dev, dtype=torch.float16)
     s_kda       = torch.zeros(tc, HV, D, D, device=dev, dtype=torch.float16)
@@ -400,7 +401,7 @@ def bench_chunk_o(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
     torch.npu.synchronize()
 
     mask_kda    = (rows >= cols).to(torch.float32)   # inclusive diagonal
-    ws_o_kda    = torch.zeros(bd * 7, D, D, device=dev, dtype=torch.float16)
+    ws_o_kda    = torch.zeros(bd * 7, D, D, device=dev, dtype=torch.float32)
     o_kda       = torch.empty(1, T, HV, D,  device=dev, dtype=torch.float16)
 
     def run_kda():
@@ -485,9 +486,9 @@ def bench_e2e(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd: in
     q_hm     = q_bsnd.permute(0, 2, 1, 3).contiguous()
     beta_hm  = beta_bsnd.permute(0, 2, 1).contiguous()   # [B, HV, T] fp16
 
-    # Intermediates (all fp16 except tri_inverse workspace which is fp32)
-    g_sum_bsnd = torch.empty_like(g_log)                  # fp16
-    g_sum_hm   = torch.empty(1, HV, T, D, device=dev, dtype=torch.float16)
+    # Intermediates (gate cumsum + tri_inverse workspaces are fp32; rest fp16)
+    g_sum_bsnd = torch.empty(1, T, HV, D, device=dev, dtype=torch.float32)
+    g_sum_hm   = torch.empty(1, HV, T, D, device=dev, dtype=torch.float32)
     L_kkt      = torch.zeros(1, T, HV, C, device=dev, dtype=torch.float16)  # kkt output
     ws_tri     = torch.zeros(1, T, HV, C, device=dev, dtype=torch.float32)  # tri_inverse fp32
     A_inv      = torch.empty(1, T, HV, C, device=dev, dtype=torch.float16)  # fp16 result
@@ -497,13 +498,13 @@ def bench_e2e(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd: in
     v_corr     = torch.zeros(1, T, HV, D, device=dev, dtype=torch.float16)
     o_kda      = torch.zeros(1, T, HV, D, device=dev, dtype=torch.float16)
 
-    # Workspaces (pre-allocated, not timed)
-    ws_kkt_in  = torch.zeros(bd * 2, 2 * C, D, device=dev, dtype=torch.float16)
-    ws_kkt_out = torch.zeros(bd * 2, C,      C, device=dev, dtype=torch.float16)
+    # Workspaces (pre-allocated, not timed); kkt + chunk_o are fp32 (overflow-safe).
+    ws_kkt_in  = torch.zeros(bd * 2, 2 * C, D, device=dev, dtype=torch.float32)
+    ws_kkt_out = torch.zeros(bd * 2, C,      C, device=dev, dtype=torch.float32)
     ws_wy_a2   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
     ws_wy_keff = torch.zeros(bd, C, D, device=dev, dtype=torch.float16)
     ws_h       = torch.zeros(bd * 5, D, D, device=dev, dtype=torch.float16)
-    ws_o       = torch.zeros(bd * 7, D, D, device=dev, dtype=torch.float16)
+    ws_o       = torch.zeros(bd * 7, D, D, device=dev, dtype=torch.float32)
 
     mask_strict = (rows > cols).to(torch.float32)
     mask_causal = (rows >= cols).to(torch.float32)
@@ -521,7 +522,7 @@ def bench_e2e(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd: in
     def run_kda():
         # 1. gate_cumsum_kda
         lib_cumsum.call_kernel(bd, stream, _vp(g_log), _vp(g_sum_bsnd), _vp(cu32), batch, T)
-        g_sum_hm.copy_(g_sum_bsnd.permute(0, 2, 1, 3))   # BSND → head-major (fp16)
+        g_sum_hm.copy_(g_sum_bsnd.permute(0, 2, 1, 3))   # BSND → head-major (fp32)
 
         # 2. kkt_kda (all fp16)
         lib_kkt.call_kernel(bd, stream,
@@ -558,6 +559,16 @@ def bench_e2e(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd: in
     run_kda()
     torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
+
+    # Free the KDA inputs/intermediates/workspaces before allocating the GDN
+    # megakernel buffers — at the largest shapes both live sets together exceed
+    # NPU HBM and OOM the run.
+    del (q_bsnd, k_bsnd, v_bsnd, g_log, beta_bsnd, k_hm, q_hm, beta_hm,
+         g_sum_bsnd, g_sum_hm, L_kkt, ws_tri, A_inv, u_out, w_out, s_snap,
+         v_corr, o_kda, ws_kkt_in, ws_kkt_out, ws_wy_a2, ws_wy_keff, ws_h, ws_o)
+    gc.collect()
+    torch.npu.synchronize()
+    torch.npu.empty_cache()
 
     # ── GDN megakernel ───────────────────────────────────────────────────────
     q_gdn  = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)

@@ -37,36 +37,46 @@ def apply_pto_patch() -> None:
     global _PATCH_ACTIVE
     _ensure_pto_lib_path()
 
-    import vllm.model_executor.layers.fla.ops as fla_ops
-    import vllm_ascend.ops.triton.fla.chunk as _ascend_chunk_mod
-
-    triton_impl = _ascend_chunk_mod.chunk_gated_delta_rule
-
     # Ensure this directory is on sys.path so ``chunk_gated_delta_rule`` imports work
     _here = str(Path(__file__).resolve().parent)
     if _here not in sys.path:
         sys.path.insert(0, _here)
 
-    from chunk_gated_delta_rule import bind_triton  # type: ignore[import]
+    try:
+        import vllm.model_executor.layers.fla.ops as fla_ops
+        import vllm_ascend.ops.triton.fla.chunk as _ascend_chunk_mod
 
-    wrapped = bind_triton(triton_impl)
-    fla_ops.chunk_gated_delta_rule = wrapped
-    # vLLM-Ascend 0.19+ prefill uses ``vllm_ascend.ops.gdn`` which imports from this module
-    # before ``vllm.model_executor.layers.fla.ops``; patch the defining module so new imports
-    # and v0.18-style ``fla.ops`` routing both see PTO.
-    _ascend_chunk_mod.chunk_gated_delta_rule = wrapped
-    _gdn_mod = sys.modules.get("vllm_ascend.ops.gdn")
-    if _gdn_mod is not None and hasattr(_gdn_mod, "chunk_gated_delta_rule"):
-        _gdn_mod.chunk_gated_delta_rule = wrapped
-    _PATCH_ACTIVE = True
+        triton_impl = _ascend_chunk_mod.chunk_gated_delta_rule
 
-    megakernel = os.environ.get("VLLM_PTO_MEGAKERNEL", "").strip().lower() in (
-        "1", "true", "yes", "on"
-    )
-    _log.warning(
-        "PTO patch active: %s (C=128).",
-        "fused megakernel" if megakernel else "6-stage JIT kernels",
-    )
+        from chunk_gated_delta_rule import bind_triton  # type: ignore[import]
+
+        wrapped = bind_triton(triton_impl)
+        fla_ops.chunk_gated_delta_rule = wrapped
+        # vLLM-Ascend 0.19+ prefill uses ``vllm_ascend.ops.gdn`` which imports from this module
+        # before ``vllm.model_executor.layers.fla.ops``; patch the defining module so new imports
+        # and v0.18-style ``fla.ops`` routing both see PTO.
+        _ascend_chunk_mod.chunk_gated_delta_rule = wrapped
+        _gdn_mod = sys.modules.get("vllm_ascend.ops.gdn")
+        if _gdn_mod is not None and hasattr(_gdn_mod, "chunk_gated_delta_rule"):
+            _gdn_mod.chunk_gated_delta_rule = wrapped
+        _PATCH_ACTIVE = True
+
+        megakernel = os.environ.get("VLLM_PTO_MEGAKERNEL", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        _log.warning(
+            "PTO patch active: %s (C=128).",
+            "fused megakernel" if megakernel else "6-stage JIT kernels",
+        )
+    except Exception as _gdn_exc:
+        _log.warning("GDN PTO patch skipped: %s", _gdn_exc)
+
+    if os.environ.get("VLLM_PTO_KDA_MEGAKERNEL", "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            from apply_kda import apply_kda_patch  # type: ignore[import]
+            apply_kda_patch()
+        except Exception as _kda_exc:
+            _log.warning("KDA patch skipped: %s", _kda_exc)
 
 
 def is_pto_patch_active() -> bool:

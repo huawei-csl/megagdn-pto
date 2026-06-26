@@ -87,7 +87,7 @@ def run_gate_cumsum_kda(
 
     Args:
         g:       ``[B, T, HV, K]`` float16, raw per-dimension gate values.
-        g_sum:   ``[B, T, HV, K]`` float16, output (cumulative sums).
+        g_sum:   ``[B, T, HV, K]`` float32, output (cumulative sums).
         stream:  NPU stream handle (``torch.npu.current_stream()._as_parameter_``).
         chunk_size: Tokens per chunk C.  Must match the compiled kernel.
         cu_seqlens: ``int32`` cumulative sequence lengths for packed varlen input.
@@ -95,7 +95,7 @@ def run_gate_cumsum_kda(
         batch_size_override: Number of sequences (use with ``cu_seqlens``).
         block_dim: AI-Core count; auto-detected if ``None``.
     """
-    assert g.dtype == torch.float16 and g_sum.dtype == torch.float16
+    assert g.dtype == torch.float16 and g_sum.dtype == torch.float32
     assert g.shape == g_sum.shape
 
     HV = g.shape[2]
@@ -166,7 +166,7 @@ def run_kkt_kda(
 
     Args:
         k:        ``[B, T, HV, K]`` float16, key vectors.
-        g_cs:     ``[B, T, HV, K]`` float16, within-chunk cumulative gate sums.
+        g_cs:     ``[B, T, HV, K]`` float32, within-chunk cumulative gate sums.
         beta_sig: ``[B, T, HV]`` float16, per-token sigmoid beta in (0, 1).
         L_out:    ``[B, T, HV, C]`` float16, output (pre-allocated, will be overwritten).
         stream:   NPU stream handle (``torch.npu.current_stream()._as_parameter_``).
@@ -176,7 +176,7 @@ def run_kkt_kda(
         block_dim: AI-Core count; auto-detected if ``None``.
     """
     assert k.dtype == torch.float16
-    assert g_cs.dtype == torch.float16
+    assert g_cs.dtype == torch.float32
     assert beta_sig.dtype == torch.float16
     assert L_out.dtype == torch.float16
 
@@ -200,8 +200,10 @@ def run_kkt_kda(
     cols = torch.arange(chunk_size, device=dev).unsqueeze(0)
     mask = (rows > cols).to(torch.float32)
 
-    ws_in  = torch.zeros(bd * 2, 2 * chunk_size, K,          device=dev, dtype=torch.float16)
-    ws_out = torch.zeros(bd * 2, chunk_size,      chunk_size, device=dev, dtype=torch.float16)
+    # fp32: A_eff=k*exp(g_cs)/B_eff=k*exp(-g_cs) and the unmasked K·K^T reach
+    # ~e^64 (per-128-chunk |g_cs|≈64), which overflows fp16.
+    ws_in  = torch.zeros(bd * 2, 2 * chunk_size, K,          device=dev, dtype=torch.float32)
+    ws_out = torch.zeros(bd * 2, chunk_size,      chunk_size, device=dev, dtype=torch.float32)
     # Force the workspace zero-fill (and any pending stream work) to fully
     # complete before launching the kkt_kda kernel.  Without this barrier,
     # cold-start runs can race the FFTS V↔C handshake against the zero-fill,
@@ -287,7 +289,7 @@ def run_wy_kda(
     Args:
         k:        ``[B, T, HV, K]`` float16 (BSND; GQA-expanded).
         v:        ``[B, T, HV, V]`` float16.
-        g_cs:     ``[B, T, HV, K]`` float16, within-chunk cumulative gate sum (per-dim).
+        g_cs:     ``[B, T, HV, K]`` float32, within-chunk cumulative gate sum (per-dim).
         beta_sig: ``[B, T, HV]``    float16, post-sigmoid beta in (0, 1).
         INV:      ``[B, T, HV, C]`` float16, full lower-tri inverse (I+L)^{-1}.
         u_out:    ``[B, T, HV, V]`` float16 (overwritten).
@@ -300,7 +302,7 @@ def run_wy_kda(
     """
     assert k.dtype == torch.float16
     assert v.dtype == torch.float16
-    assert g_cs.dtype == torch.float16
+    assert g_cs.dtype == torch.float32
     assert beta_sig.dtype == torch.float16
     assert INV.dtype == torch.float16
     assert u_out.dtype == torch.float16
@@ -400,7 +402,7 @@ def run_chunk_h_kda(
         k:               ``[B, T, HV, K]`` float16, keys (GQA-expanded).
         w:               ``[B, T, HV, K]`` float16, from wy_kda.
         u:               ``[B, T, HV, V]`` float16, from wy_kda.
-        g_cs:            ``[B, T, HV, K]`` float16, within-chunk cumulative gate sum.
+        g_cs:            ``[B, T, HV, K]`` float32, within-chunk cumulative gate sum.
         s_snapshots_out: ``[total_chunks, HV, K, V]`` float16 (output).
         v_corr_out:      ``[B, T, HV, V]`` float16 (output).
         stream:          NPU stream handle.
@@ -412,7 +414,7 @@ def run_chunk_h_kda(
     assert k.dtype == torch.float16
     assert w.dtype == torch.float16
     assert u.dtype == torch.float16
-    assert g_cs.dtype == torch.float16
+    assert g_cs.dtype == torch.float32
     assert s_snapshots_out.dtype == torch.float16
     assert v_corr_out.dtype == torch.float16
 
@@ -513,7 +515,7 @@ def run_chunk_o_kda(
         k:            ``[B, T, HV, K]`` float16, keys.
         v_corr:       ``[B, T, HV, V]`` float16, from chunk_h_kda.
         s_snapshots:  ``[total_chunks, HV, K, V]`` float16, from chunk_h_kda.
-        g_cs:         ``[B, T, HV, K]`` float16, within-chunk cumulative gate.
+        g_cs:         ``[B, T, HV, K]`` float32, within-chunk cumulative gate.
         o_out:        ``[B, T, HV, V]`` float16 (output, overwritten).
         stream:       NPU stream handle.
         chunk_size:   Tokens per chunk C; must match the compiled kernel.
@@ -525,7 +527,7 @@ def run_chunk_o_kda(
     assert k.dtype == torch.float16
     assert v_corr.dtype == torch.float16
     assert s_snapshots.dtype == torch.float16
-    assert g_cs.dtype == torch.float16
+    assert g_cs.dtype == torch.float32
     assert o_out.dtype == torch.float16
 
     HV = q.shape[2]
@@ -547,10 +549,11 @@ def run_chunk_o_kda(
     cols = torch.arange(chunk_size, device=dev).unsqueeze(0)
     mask = (rows >= cols).to(torch.float32)
 
-    # Per-AI-core workspace: 7 slots × K*V half-elements.
+    # Per-AI-core workspace: 7 slots × K*V elements (fp32).
     #   WS_Q, WS_K [C, K], WS_V [C, V], WS_S [K, V], WS_QK [C, C],
-    #   WS_QS, WS_QKV [C, V] — all are K*V fp16 elements when K==V==C.
-    ws = torch.zeros(bd * 7, K, K, device=dev, dtype=torch.float16)
+    #   WS_QS, WS_QKV [C, V].  fp32 because k_eff=k*exp(-g_cs) and the unmasked
+    #   QK = q_eff @ k_eff^T reach ~e^64, which overflows fp16.
+    ws = torch.zeros(bd * 7, K, K, device=dev, dtype=torch.float32)
     cu32 = _ensure_int32(cu_seqlens)
 
     torch.npu.synchronize()

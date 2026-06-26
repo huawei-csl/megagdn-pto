@@ -155,10 +155,11 @@ def _make_inputs(tc: TestCase, H: int, HV: int | None = None):
     q = q / q.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     k = k / k.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     v = torch.randn(1, T, HV, V_DIM)
-    # Keep cumulative gate magnitudes within fp16 range:
-    # for CHUNK=128 the kernel computes exp(-g_cs); with values in (-0.05, 0)
-    # the worst-case cumsum is bounded by ~6.4 so exp stays within fp16 (~600).
-    g_log = -torch.rand(1, T, HV, K) * 0.05  # values in (-0.05, 0)
+    # Production-like gate magnitude: values in (-1, 0) make the per-128-chunk
+    # cumulative |g_cs| reach ~64, so exp(-g_cs) ≈ e^64.  The kernels now stage
+    # g_cs and the gated GEMMs in fp32 (max 3.4e38), so this no longer overflows
+    # — it is the regression test for that fix.
+    g_log = -torch.rand(1, T, HV, K)  # values in (-1, 0)
     beta_sig = torch.sigmoid(torch.randn(1, T, HV))
     scale = K**-0.5
     return q, k, v, g_log, beta_sig, scale
@@ -186,7 +187,7 @@ def test_gate_cumsum(tc: TestCase, H: int, dev: "torch.device | None" = None) ->
     _, _, _, g_log, _, _ = _make_inputs(tc, H)
     # g_log: [1, T, H, K]
     g_dev = g_log.half().to(dev)
-    g_sum = torch.empty_like(g_dev)
+    g_sum = torch.empty(g_dev.shape, dtype=torch.float32, device=dev)
     cu = (
         torch.tensor(tc.cu_seqlens_list, dtype=torch.int32, device=dev)
         if tc.cu_seqlens_list
@@ -232,7 +233,7 @@ def test_kkt(tc: TestCase, H: int, dev=None) -> bool:
 
     run_kkt_kda(
         k.half().to(dev),
-        g_cs.half().to(dev),
+        g_cs.float().to(dev),
         beta_sig.half().to(dev),
         L_npu,
         stream=stream,
@@ -292,7 +293,7 @@ def test_wy(tc: TestCase, H: int, dev=None) -> bool:
 
     k_d = k.half().to(dev)
     v_d = v.half().to(dev)
-    g_cs_d = g_cs.half().to(dev)
+    g_cs_d = g_cs.float().to(dev)
     beta_d = beta_sig.half().to(dev)
     INV_d = INV_ref.half().to(dev)
     u_npu = torch.zeros(1, tc.T, H, V_DIM, device=dev, dtype=torch.float16)
@@ -359,7 +360,7 @@ def test_chunk_h_kda(tc: TestCase, H: int, dev=None) -> bool:
         k.half().to(dev),
         w_ref.half().to(dev),
         u_ref.half().to(dev),
-        g_cs.half().to(dev),
+        g_cs.float().to(dev),
         s_npu,
         vcorr_npu,
         stream=stream,
@@ -425,7 +426,7 @@ def test_chunk_o_kda(tc: TestCase, H: int, dev=None) -> bool:
         kf.half().to(dev),
         vcorr_ref.half().to(dev),
         s_ref.half().to(dev),
-        g_cs.half().to(dev),
+        g_cs.float().to(dev),
         o_npu,
         stream=stream,
         chunk_size=CHUNK,

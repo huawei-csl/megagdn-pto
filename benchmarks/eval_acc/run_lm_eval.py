@@ -8,7 +8,8 @@ Wikitext is evaluated on ``--wikitext-limit`` documents (default: 256).
 Set to 0 to disable the limit (full dataset, ~40 min per run).
 
 Preset models (resolved to local weight paths):
-  qwen35_0_8b, qwen35_9b, qwen36_27b_w8a8, qwen36_35b_a3b_w8a8
+  qwen35_0_8b, qwen35_9b, qwen36_27b_w8a8, qwen36_35b_a3b_w8a8,
+  kimi_linear_48b
 
 Output: JSON results file at ``--output-json`` (or stdout summary).
 
@@ -17,6 +18,10 @@ Usage::
     export ASCEND_RT_VISIBLE_DEVICES=0
     python benchmarks/eval_acc/run_lm_eval.py --preset qwen35_0_8b \\
         --backend pto_mega --output-json outputs/data/eval/qwen35_0_8b_pto.json
+
+    # Kimi Linear with KDA megakernel
+    python benchmarks/eval_acc/run_lm_eval.py --preset kimi_linear_48b \\
+        --backend kda_mega --output-json outputs/data/eval/kimi_linear_48b_kda.json
 
     # Full wikitext (slow)
     python benchmarks/eval_acc/run_lm_eval.py --preset qwen36_35b_a3b_w8a8 \\
@@ -72,6 +77,10 @@ _PRESETS: dict[str, ModelPreset] = {
     "qwen36_35b_a3b_w8a8": ModelPreset(
         "/scratch/model_weights/Qwen3.6-35B-A3B-w8a8",
         "ascend", True,
+    ),
+    "kimi_linear_48b": ModelPreset(
+        "/scratch/model_weights/Kimi-Linear-48B-A3B-Instruct",
+        None, True,
     ),
 }
 
@@ -134,22 +143,26 @@ def _apply_pto_patch(backend: str) -> None:
     for k in list(os.environ):
         if k.startswith("VLLM_PTO"):
             del os.environ[k]
+    patch_dir = str(_VLLM_PATCH)
+    if patch_dir not in sys.path:
+        sys.path.insert(0, patch_dir)
     if backend in ("pto", "pto_mega"):
-        os.environ["VLLM_PTO_PATCH_DIR"] = str(_VLLM_PATCH)
+        os.environ["VLLM_PTO_PATCH_DIR"] = patch_dir
         if backend == "pto_mega":
             os.environ["VLLM_PTO_MEGAKERNEL"] = "1"
-    if backend in ("pto", "pto_mega"):
-        patch_dir = str(_VLLM_PATCH)
-        if patch_dir not in sys.path:
-            sys.path.insert(0, patch_dir)
         from apply import apply_pto_patch  # type: ignore[import]
         apply_pto_patch()
+    elif backend == "kda_mega":
+        os.environ["VLLM_PTO_KDA_MEGAKERNEL"] = "1"
+        os.environ["VLLM_PTO_PATCH_DIR"] = patch_dir  # triggers worker hook
+        from apply_kda import apply_kda_patch  # type: ignore[import]
+        apply_kda_patch()
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--preset", choices=list(_PRESETS), required=True)
-    ap.add_argument("--backend", choices=("triton", "pto", "pto_mega"), default="pto_mega")
+    ap.add_argument("--backend", choices=("triton", "pto", "pto_mega", "kda_mega"), default="pto_mega")
     ap.add_argument("--tasks", default=DEFAULT_TASKS)
     ap.add_argument("--output-json", default=None)
     ap.add_argument("--device", default=None, help="ASCEND_RT_VISIBLE_DEVICES (e.g. '0')")
@@ -190,7 +203,7 @@ def main() -> int:
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=True,
-        tensor_parallel_size=1,
+        tensor_parallel_size=4 if preset.expert_parallel else 1,
     )
     if preset.quantization:
         lm_kwargs["quantization"] = preset.quantization
