@@ -284,7 +284,27 @@ AICORE void chunk_o_kda_kernel(
 #endif
 
   int64_t num_seqs = batch_size;
-  int64_t total_work = num_seqs * H;
+
+  // ── Adaptive small-H parallelisation ───────────────────────────────────────
+  // Work-item = one (sequence, head) pair, chunks walked sequentially inside.
+  // chunk_o is independent per chunk, so when batch_size*H < block_num we fan
+  // the chunk axis over the otherwise-idle cores: `split` work-items per
+  // (seq,head), each covering a strided subset of chunks.  `split` == 1 once
+  // heads saturate the machine, so the large-H schedule is unchanged.  Both the
+  // Cube and Vec loops below apply the identical decode + strided-chunk walk so
+  // the two subcores stay in per-chunk FFTS lockstep.
+  // Engage only when heads leave cores idle (bh_work < block_num); then pick the
+  // split that makes bh_work*split an exact multiple of block_num, so the
+  // strided-chunk work-items fill every core in balanced waves (avoids the
+  // ragged final wave that ceil(cores/bh) produces when bh_work∤block_num).
+  int64_t bh_work = num_seqs * H;
+  int64_t split = 1;
+  if (bh_work < block_num) {
+    int64_t ga = bh_work, gb = block_num;          // gcd(bh_work, block_num)
+    while (gb) { int64_t t = ga % gb; ga = gb; gb = t; }
+    split = block_num / ga;
+  }
+  int64_t total_work = bh_work * split;
 
 #if defined(__DAV_C220_CUBE__)
   sync_all();
@@ -293,8 +313,10 @@ AICORE void chunk_o_kda_kernel(
     int64_t pid = wi * block_num + cid;
     if (pid >= total_work) break;
 
-    int64_t head = pid % H;
-    int64_t seq_idx = pid / H;
+    int64_t bh = pid / split;
+    int32_t grp = static_cast<int32_t>(pid % split);
+    int64_t head = bh % H;
+    int64_t seq_idx = bh / H;
 
     int64_t bos, slen;
     if (cu_seqlens != nullptr) {
@@ -308,7 +330,7 @@ AICORE void chunk_o_kda_kernel(
     int64_t num_chunks = (slen + C - 1) / C;
     int64_t ws_base = static_cast<int64_t>(cid) * WS_PER_CORE;
 
-    for (int32_t ci = 0; ci < num_chunks; ++ci) {
+    for (int32_t ci = grp; ci < num_chunks; ci += static_cast<int32_t>(split)) {
       // ── Wait Vec phase A: q_eff, Aqk(masked), V_corr, S all in workspace ─
       wait_flag_dev(0);
 
@@ -424,8 +446,10 @@ AICORE void chunk_o_kda_kernel(
     int64_t pid = wi * block_num + cid;
     if (pid >= total_work) break;
 
-    int64_t head = pid % H;
-    int64_t seq_idx = pid / H;
+    int64_t bh = pid / split;
+    int32_t grp = static_cast<int32_t>(pid % split);
+    int64_t head = bh % H;
+    int64_t seq_idx = bh / H;
 
     int64_t bos, slen;
     int64_t chunk_offset = 0;
@@ -446,7 +470,7 @@ AICORE void chunk_o_kda_kernel(
     int64_t num_chunks = (slen + C - 1) / C;
     int64_t ws_base = static_cast<int64_t>(cid) * WS_PER_CORE;
 
-    for (int32_t ci = 0; ci < static_cast<int32_t>(num_chunks); ++ci) {
+    for (int32_t ci = grp; ci < static_cast<int32_t>(num_chunks); ci += static_cast<int32_t>(split)) {
       int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
       int64_t valid = slen - static_cast<int64_t>(ci) * C;
       if (valid > C) valid = C;

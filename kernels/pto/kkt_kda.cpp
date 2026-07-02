@@ -146,7 +146,27 @@ AICORE void kkt_kda_kernel(
     constexpr int32_t KTC = ((KDim + 7) / 8) * 8;
 
     int64_t num_seqs = batch_size;
-    int64_t total_work = num_seqs * NumHeads;
+
+    // ── Adaptive small-H parallelisation ─────────────────────────────────────
+    // The natural work-item is one (sequence, head) pair, and each core walks
+    // that pair's chunks sequentially.  When batch_size*NumHeads < block_num
+    // (few heads, small batch) most cores would sit idle.  kkt is independent
+    // per chunk, so we fan the chunk axis over the idle cores: `split`
+    // work-items per (seq,head), each covering a strided subset of chunks.
+    // `split` collapses to 1 whenever heads already saturate the machine, so
+    // the large-H schedule is bit-identical to before.
+    // Engage only when heads leave cores idle (bh_work < block_num); then pick
+    // the split that makes bh_work*split an exact multiple of block_num, so the
+    // strided-chunk work-items fill every core in balanced waves (avoids the
+    // ragged final wave that ceil(cores/bh) produces when bh_work∤block_num).
+    int64_t bh_work = num_seqs * NumHeads;
+    int64_t split = 1;
+    if (bh_work < block_num) {
+        int64_t ga = bh_work, gb = block_num;      // gcd(bh_work, block_num)
+        while (gb) { int64_t t = ga % gb; ga = gb; gb = t; }
+        split = block_num / ga;
+    }
+    int64_t total_work = bh_work * split;
 
     // ── GM type aliases (head-major [HV, T, K]) ──────────────────────────────
     using GmShapeDyn = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
@@ -202,8 +222,10 @@ AICORE void kkt_kda_kernel(
         if (pid >= total_work)
             continue;
 
-        int32_t head_idx = static_cast<int32_t>(pid % NumHeads);
-        int64_t seq_idx = pid / NumHeads;
+        int64_t bh = pid / split;
+        int32_t grp = static_cast<int32_t>(pid % split);
+        int32_t head_idx = static_cast<int32_t>(bh % NumHeads);
+        int64_t seq_idx = bh / NumHeads;
 
         int64_t bos, slen;
         if (cu_seqlens != nullptr)
@@ -218,7 +240,7 @@ AICORE void kkt_kda_kernel(
         }
         int64_t num_chunks = (slen + ChunkSize - 1) / ChunkSize;
 
-        for (int64_t ci = 0; ci < num_chunks; ++ci)
+        for (int64_t ci = grp; ci < num_chunks; ci += split)
         {
             int64_t chunk_start = ci * ChunkSize;
             int64_t remaining = slen - chunk_start;
