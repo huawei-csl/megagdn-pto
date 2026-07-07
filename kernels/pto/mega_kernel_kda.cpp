@@ -241,8 +241,9 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     __gm__ uint8_t *s_ptr,       // [tc, HV, K, V] fp16
     __gm__ uint8_t *v_corr_ptr,  // [1, T, HV, V] fp16
     // ── per-core workspaces ─────────────────────────────────────────
-    __gm__ uint8_t *kkt_ws_in_ptr,  // [bd*2, 2C, K] fp32 (stages exp(±g_cs))
-    __gm__ uint8_t *kkt_ws_out_ptr, // [bd*2, C, C]  fp32 (unmasked gated K·K^T)
+    __gm__ uint8_t *kkt_ws_in_ptr,  // [bd*2, 2C, K] fp32 (A=k*exp(g_cs-b), B=k*exp(b-g_cs))
+    __gm__ uint8_t *kkt_ws_out_ptr, // [bd*2, C, C]  fp32 (unmasked gated K·K^T = A@B^T)
+    __gm__ uint8_t *kkt_b_ws_ptr,   // [bd*2, C]     fp32 (per-token offset b[t]=max_d g_cs)
     __gm__ uint8_t *wy_ws_a2_ptr,   // [bd, C, C]    fp16
     __gm__ uint8_t *wy_ws_keff_ptr, // [bd, C, K]    fp16
     __gm__ uint8_t *h_ws_ptr,       // [bd*5, K, K]  fp16
@@ -298,6 +299,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
         reinterpret_cast<__gm__ float *>(mask_strict_ptr),
         reinterpret_cast<__gm__ float *>(kkt_ws_in_ptr),
         reinterpret_cast<__gm__ float *>(kkt_ws_out_ptr),
+        reinterpret_cast<__gm__ float *>(kkt_b_ws_ptr),
         reinterpret_cast<__gm__ half *>(L_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
         batch_size, seq_len, total_tokens, HV, ffts_addr);
@@ -385,7 +387,8 @@ extern "C" void call_kernel(
     uint8_t *o,
     uint8_t *g_sum, uint8_t *g_cs_hm, uint8_t *L, uint8_t *A_inv,
     uint8_t *u, uint8_t *w, uint8_t *s, uint8_t *v_corr,
-    uint8_t *kkt_ws_in, uint8_t *kkt_ws_out, uint8_t *wy_ws_a2, uint8_t *wy_ws_keff,
+    uint8_t *kkt_ws_in, uint8_t *kkt_ws_out, uint8_t *kkt_b_ws,
+    uint8_t *wy_ws_a2, uint8_t *wy_ws_keff,
     uint8_t *h_ws, uint8_t *o_ws,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
     uint32_t num_matrices, uint32_t num_heads)
@@ -398,7 +401,7 @@ extern "C" void call_kernel(
         mask_strict, mask_incl, minus_id, cu_seqlens,
         o,
         g_sum, g_cs_hm, L, A_inv, u, w, s, v_corr,
-        kkt_ws_in, kkt_ws_out, wy_ws_a2, wy_ws_keff, h_ws, o_ws,
+        kkt_ws_in, kkt_ws_out, kkt_b_ws, wy_ws_a2, wy_ws_keff, h_ws, o_ws,
         batch_size, seq_len, total_tokens, num_matrices,
         static_cast<int32_t>(num_heads), fftsAddr);
 }

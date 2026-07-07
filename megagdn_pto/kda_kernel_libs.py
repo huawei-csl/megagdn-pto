@@ -128,7 +128,7 @@ def load_kkt_kda(
         void call_kernel(uint32_t block_dim, void *stream,
                          uint8_t *k, uint8_t *g_cs, uint8_t *beta,
                          uint8_t *mask, uint8_t *ws_in, uint8_t *ws_out,
-                         uint8_t *L_out, uint8_t *cu_seqlens,
+                         uint8_t *b_ws, uint8_t *L_out, uint8_t *cu_seqlens,
                          int64_t batch_size, int64_t seq_len, int64_t total_tokens,
                          uint32_t num_heads)
     """
@@ -142,7 +142,7 @@ def load_kkt_kda(
     lib = ctypes.CDLL(os.path.abspath(lib_path))
     lib.call_kernel.argtypes = (
         [ctypes.c_uint32, ctypes.c_void_p]
-        + [ctypes.c_void_p] * 8   # k, g_cs, beta, mask, ws_in, ws_out, L_out, cu_seqlens
+        + [ctypes.c_void_p] * 9   # k, g_cs, beta, mask, ws_in, ws_out, b_ws, L_out, cu_seqlens
         + [ctypes.c_int64] * 3    # batch_size, seq_len, total_tokens
         + [ctypes.c_uint32]       # num_heads (runtime)
     )
@@ -200,10 +200,12 @@ def run_kkt_kda(
     cols = torch.arange(chunk_size, device=dev).unsqueeze(0)
     mask = (rows > cols).to(torch.float32)
 
-    # fp32: A_eff=k*exp(g_cs)/B_eff=k*exp(-g_cs) and the unmasked K·K^T reach
-    # ~e^64 (per-128-chunk |g_cs|≈64), which overflows fp16.
+    # fp32 cube GEMM: A=k*exp(g_cs-b)/B=k*exp(b-g_cs) (per-token offset b) and the
+    # unmasked M=A@B^T can reach ~e^64; fp32 (max 3.4e38) holds them, fp16 would not.
     ws_in  = torch.zeros(bd * 2, 2 * chunk_size, K,          device=dev, dtype=torch.float32)
     ws_out = torch.zeros(bd * 2, chunk_size,      chunk_size, device=dev, dtype=torch.float32)
+    # Per-token exp offset b[t] = max_d g_cs[t,d], exchanged Vec(pre) → Vec(post).
+    b_ws   = torch.zeros(bd * 2, chunk_size,                 device=dev, dtype=torch.float32)
     # Force the workspace zero-fill (and any pending stream work) to fully
     # complete before launching the kkt_kda kernel.  Without this barrier,
     # cold-start runs can race the FFTS V↔C handshake against the zero-fill,
@@ -217,7 +219,7 @@ def run_kkt_kda(
     lib.call_kernel(
         bd, stream,
         _vp(k_t), _vp(g_cs_t), _vp(beta_t),
-        _vp(mask), _vp(ws_in), _vp(ws_out), _vp(L_out),
+        _vp(mask), _vp(ws_in), _vp(ws_out), _vp(b_ws), _vp(L_out),
         _vp(cu32),
         batch, T, total_tokens, HV,
     )

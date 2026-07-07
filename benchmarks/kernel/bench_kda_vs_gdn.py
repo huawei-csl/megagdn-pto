@@ -127,19 +127,19 @@ def bench_gate_cumsum(HV: int, T: int, cu_seqlens, dev, stream, bd: int):
     gs_kda   = torch.empty(1, T, HV, D, device=dev, dtype=torch.float32)
 
     def run_kda():
-        lib_kda.call_kernel(bd, stream, _vp(g_kda), _vp(gs_kda), _vp(cu32), batch, T)
+        lib_kda.call_kernel(bd, stream, _vp(g_kda), _vp(gs_kda), _vp(cu32), batch, T, HV)
 
     run_kda()
     torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: [B, T, HV] fp32 — scalar gate per head per token
-    lib_gdn  = load_chunk_cumsum(HV, D, C)
+    lib_gdn  = load_chunk_cumsum(C)
     g_gdn    = torch.randn(1, T, HV, device=dev, dtype=torch.float32)
     gs_gdn   = torch.empty_like(g_gdn)
 
     def run_gdn():
-        lib_gdn.call_kernel(bd, stream, _vp(g_gdn), _vp(gs_gdn), _vp(cu32), batch, T)
+        lib_gdn.call_kernel(bd, stream, _vp(g_gdn), _vp(gs_gdn), _vp(cu32), batch, T, HV)
 
     run_gdn()
     torch.npu.synchronize()
@@ -170,20 +170,22 @@ def bench_kkt(HV: int, HG: int, T: int, cu_seqlens, dev, stream, bd: int):
     mask_kda   = (rows > cols).to(torch.float32)          # strictly lower tri
     ws_in_kda  = torch.zeros(bd * 2, 2 * C, D, device=dev, dtype=torch.float32)
     ws_out_kda = torch.zeros(bd * 2, C,      C, device=dev, dtype=torch.float32)
+    b_ws_kda   = torch.zeros(bd * 2, C,         device=dev, dtype=torch.float32)
     L_kda      = torch.zeros(1, T, HV, C,    device=dev, dtype=torch.float16)
 
     def run_kda():
         lib_kda.call_kernel(bd, stream,
                             _vp(k_kda_hm), _vp(g_cs_hm), _vp(beta_kda_hm),
-                            _vp(mask_kda), _vp(ws_in_kda), _vp(ws_out_kda), _vp(L_kda),
-                            _vp(cu32), batch, T, T)
+                            _vp(mask_kda), _vp(ws_in_kda), _vp(ws_out_kda),
+                            _vp(b_ws_kda), _vp(L_kda),
+                            _vp(cu32), batch, T, T, HV)
 
     run_kda()
     torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: k [B,T,HG,D] fp16; β [B,HV,T] fp16 (head-major); g [B,HV,T] fp32 (head-major)
-    lib_gdn    = load_scaled_dot_kkt(HV, D, C, key_heads=HG)
+    lib_gdn    = load_scaled_dot_kkt(D, C)
     k_gdn      = torch.randn(1, T, HG, D, device=dev, dtype=torch.float16)
     beta_gdn   = torch.rand(1, T, HV,    device=dev, dtype=torch.float16)
     g_gdn      = torch.randn(1, T, HV,   device=dev, dtype=torch.float32)
@@ -197,7 +199,7 @@ def bench_kkt(HV: int, HG: int, T: int, cu_seqlens, dev, stream, bd: int):
         lib_gdn.call_kernel(bd, stream,
                             _vp(k_gdn), _vp(beta_t_gdn), _vp(g_t_gdn),
                             _vp(mask_gdn), _vp(ws_gdn), _vp(A_gdn),
-                            _vp(cu32), batch, T, T)
+                            _vp(cu32), batch, T, T, HV, HG)
 
     run_gdn()
     torch.npu.synchronize()
@@ -282,14 +284,14 @@ def bench_wy(HV: int, HG: int, T: int, cu_seqlens, dev, stream, bd: int):
                             _vp(k_hm), _vp(v_fp16), _vp(beta_hm), _vp(g_cs_hm), _vp(INV_kda),
                             _vp(ws_a2), _vp(ws_keff),
                             _vp(u_kda), _vp(w_kda),
-                            _vp(cu32), batch, T, T)
+                            _vp(cu32), batch, T, T, HV)
 
     run_kda()
     torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: k [B,T,HG,D] fp16; v/A_inv [B,T,HV,D/C] fp16; β/g head-major
-    lib_gdn    = load_wy_fast(HV, D, C, key_heads=HG)
+    lib_gdn    = load_wy_fast(D, C)
     k_gdn      = torch.randn(1, T, HG, D, device=dev, dtype=torch.float16)
     v_gdn      = torch.randn(1, T, HV, D, device=dev, dtype=torch.float16)
     beta_gdn   = torch.rand(1, T, HV,    device=dev, dtype=torch.float16)
@@ -307,7 +309,7 @@ def bench_wy(HV: int, HG: int, T: int, cu_seqlens, dev, stream, bd: int):
                             _vp(k_gdn), _vp(v_gdn), _vp(beta_t_gdn), _vp(g_t_gdn), _vp(A_inv_gdn),
                             _vp(ws1_gdn), _vp(ws2_gdn),
                             _vp(w_gdn), _vp(u_gdn),
-                            _vp(cu32), batch, T, T)
+                            _vp(cu32), batch, T, T, HV, HG)
 
     run_gdn()
     torch.npu.synchronize()
@@ -339,14 +341,14 @@ def bench_chunk_h(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
         lib_kda.call_kernel(bd, stream,
                             _vp(k_hm), _vp(w_kda), _vp(u_kda), _vp(g_cs_hm),
                             _vp(s_kda), _vp(vcorr_kda), _vp(ws_kda), _vp(cu32),
-                            batch, T, T)
+                            batch, T, T, HV)
 
     run_kda()
     torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: k [B,T,HG,D] fp16; w/u BSND fp16; g head-major fp32; state [tc*HV,D,D] fp16
-    lib_gdn     = load_chunk_h(HV, D, C, key_heads=HG)
+    lib_gdn     = load_chunk_h(D, C)
     k_gdn       = torch.randn(1, T, HG, D,    device=dev, dtype=torch.float16)
     w_gdn       = torch.randn(1, T, HV, D,    device=dev, dtype=torch.float16)
     u_gdn       = torch.randn(1, T, HV, D,    device=dev, dtype=torch.float16)
@@ -357,10 +359,12 @@ def bench_chunk_h(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
     ws_gdn      = torch.zeros(bd * 4, D, D,   device=dev, dtype=torch.float16)
 
     def run_gdn():
+        # final_state written to fs_gdn (output_final_state=1); no initial state (h0 null).
         lib_gdn.call_kernel(bd, stream,
                             _vp(k_gdn), _vp(w_gdn), _vp(u_gdn), _vp(g_t_gdn),
-                            _vp(s_gdn), _vp(vnew_gdn), _vp(fs_gdn), _vp(ws_gdn), _vp(cu32),
-                            batch, T, T)
+                            _vp(s_gdn), _vp(vnew_gdn), _vp(fs_gdn),
+                            ctypes.c_void_p(0), 0, 1, _vp(ws_gdn), _vp(cu32),
+                            batch, T, T, HV, HG)
 
     run_gdn()
     torch.npu.synchronize()
@@ -397,7 +401,7 @@ def bench_chunk_o(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
     lib_h_kda.call_kernel(bd, stream,
                           _vp(k_hm), _vp(w_kda), _vp(u_kda), _vp(g_cs_hm),
                           _vp(s_kda), _vp(vcorr_kda), _vp(ws_h_kda), _vp(cu32),
-                          batch, T, T)
+                          batch, T, T, HV)
     torch.npu.synchronize()
 
     mask_kda    = (rows >= cols).to(torch.float32)   # inclusive diagonal
@@ -409,15 +413,15 @@ def bench_chunk_o(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
                               _vp(q_hm), _vp(k_hm), _vp(vcorr_kda), _vp(s_kda),
                               _vp(g_cs_hm), _vp(mask_kda),
                               _vp(ws_o_kda), _vp(o_kda), _vp(cu32),
-                              batch, T, T)
+                              batch, T, T, HV)
 
     run_kda()
     torch.npu.synchronize()
     ms_kda = _bench_npu(run_kda)
 
     # GDN: pre-populate s and v_new via chunk_h warmup
-    lib_h_gdn   = load_chunk_h(HV, D, C, key_heads=HG)
-    lib_o_gdn   = load_chunk_o(HV, D, C, key_heads=HG)
+    lib_h_gdn   = load_chunk_h(D, C)
+    lib_o_gdn   = load_chunk_o(D, C)
     k_gdn       = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
     q_gdn       = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
     w_gdn       = torch.randn(1, T, HV, D, device=dev, dtype=torch.float16)
@@ -429,8 +433,9 @@ def bench_chunk_o(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
     ws_h_gdn    = torch.zeros(bd * 4, D, D,  device=dev, dtype=torch.float16)
     lib_h_gdn.call_kernel(bd, stream,
                           _vp(k_gdn), _vp(w_gdn), _vp(u_gdn), _vp(g_t_gdn),
-                          _vp(s_gdn), _vp(vnew_gdn), _vp(fs_gdn), _vp(ws_h_gdn), _vp(cu32),
-                          batch, T, T)
+                          _vp(s_gdn), _vp(vnew_gdn), _vp(fs_gdn),
+                          ctypes.c_void_p(0), 0, 1, _vp(ws_h_gdn), _vp(cu32),
+                          batch, T, T, HV, HG)
     torch.npu.synchronize()
 
     mask_gdn    = torch.tril(torch.ones(C, C, device=dev), diagonal=0).float()
@@ -443,7 +448,7 @@ def bench_chunk_o(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd
         lib_o_gdn.call_kernel(bd, stream,
                               _vp(q_gdn), _vp(k_gdn), _vp(vnew_gdn), _vp(s_gdn), _vp(g_t_gdn),
                               _vp(mask_gdn), _vp(ws1_gdn), _vp(ws2_gdn), _vp(ws3_gdn), _vp(o_gdn),
-                              _vp(cu32), batch, T, T)
+                              _vp(cu32), batch, T, T, HV, HG)
 
     run_gdn()
     torch.npu.synchronize()
@@ -501,6 +506,7 @@ def bench_e2e(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd: in
     # Workspaces (pre-allocated, not timed); kkt + chunk_o are fp32 (overflow-safe).
     ws_kkt_in  = torch.zeros(bd * 2, 2 * C, D, device=dev, dtype=torch.float32)
     ws_kkt_out = torch.zeros(bd * 2, C,      C, device=dev, dtype=torch.float32)
+    ws_kkt_b   = torch.zeros(bd * 2, C,         device=dev, dtype=torch.float32)
     ws_wy_a2   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
     ws_wy_keff = torch.zeros(bd, C, D, device=dev, dtype=torch.float16)
     ws_h       = torch.zeros(bd * 5, D, D, device=dev, dtype=torch.float16)
@@ -521,14 +527,15 @@ def bench_e2e(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd: in
 
     def run_kda():
         # 1. gate_cumsum_kda
-        lib_cumsum.call_kernel(bd, stream, _vp(g_log), _vp(g_sum_bsnd), _vp(cu32), batch, T)
+        lib_cumsum.call_kernel(bd, stream, _vp(g_log), _vp(g_sum_bsnd), _vp(cu32), batch, T, HV)
         g_sum_hm.copy_(g_sum_bsnd.permute(0, 2, 1, 3))   # BSND → head-major (fp32)
 
         # 2. kkt_kda (all fp16)
         lib_kkt.call_kernel(bd, stream,
                             _vp(k_hm), _vp(g_sum_hm), _vp(beta_hm),
-                            _vp(mask_strict), _vp(ws_kkt_in), _vp(ws_kkt_out), _vp(L_kkt),
-                            _vp(cu32), batch, T, T)
+                            _vp(mask_strict), _vp(ws_kkt_in), _vp(ws_kkt_out),
+                            _vp(ws_kkt_b), _vp(L_kkt),
+                            _vp(cu32), batch, T, T, HV)
 
         # 3. solve_tril (fp16 in; tri_inverse writes fp32 to ws_tri; copy → A_inv fp16)
         launch_tri_inverse_kernel(ws_tri, L_kkt, minus_I, C, n_mat, HV,
@@ -541,20 +548,20 @@ def bench_e2e(HV: int, HG: int, T: int, tc: int, cu_seqlens, dev, stream, bd: in
                            _vp(k_hm), _vp(v_bsnd), _vp(beta_hm), _vp(g_sum_hm), _vp(A_inv),
                            _vp(ws_wy_a2), _vp(ws_wy_keff),
                            _vp(u_out), _vp(w_out),
-                           _vp(cu32), batch, T, T)
+                           _vp(cu32), batch, T, T, HV)
 
         # 5. chunk_h_kda (all fp16; w_out already fp16)
         lib_h.call_kernel(bd, stream,
                           _vp(k_hm), _vp(w_out), _vp(u_out), _vp(g_sum_hm),
                           _vp(s_snap), _vp(v_corr), _vp(ws_h), _vp(cu32),
-                          batch, T, T)
+                          batch, T, T, HV)
 
         # 6. chunk_o_kda (all fp16)
         lib_o.call_kernel(bd, stream,
                           _vp(q_hm), _vp(k_hm), _vp(v_corr), _vp(s_snap),
                           _vp(g_sum_hm), _vp(mask_causal),
                           _vp(ws_o), _vp(o_kda), _vp(cu32),
-                          batch, T, T)
+                          batch, T, T, HV)
 
     run_kda()
     torch.npu.synchronize()

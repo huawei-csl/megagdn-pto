@@ -19,6 +19,14 @@
 #ifndef GDN_C
 #define GDN_C 128
 #endif
+// GDN_MAX_HEADS: compile-time ceiling on the value-head count. num_heads is a
+// RUNTIME argument (one .so serves every head count), so the transpose/cumsum UB
+// tiles are sized for this worst case; any num_heads <= GDN_MAX_HEADS works with
+// the unused columns zero-padded. Must match the host-side _MAX_HEADS guard and
+// the GDN_MAX_HEADS in chunk_cumsum.cpp.
+#ifndef GDN_MAX_HEADS
+#define GDN_MAX_HEADS 64
+#endif
 #ifndef MEMORY_BASE
 #define MEMORY_BASE
 #endif
@@ -67,9 +75,9 @@ AICORE inline void SyncAllImpl()
 #endif
 }
 
-template <typename T, int32_t H_val>
+template <typename T>
 AICORE void mega_transpose_TH_to_HT(
-    __gm__ T *src, __gm__ T *dst, int64_t T_len)
+    __gm__ T *src, __gm__ T *dst, int64_t T_len, int32_t H)
 {
 #if defined(__DAV_C220_VEC__)
     if (get_subblockid() != 0) return;
@@ -80,11 +88,13 @@ AICORE void mega_transpose_TH_to_HT(
     auto block_num = get_block_num();
 
     constexpr int32_t BLOCK = 128;
-    constexpr int32_t H = static_cast<int32_t>(H_val);
     constexpr int32_t ES = static_cast<int32_t>(sizeof(T));
     constexpr int32_t MinTransposeCols = 16;
     constexpr int32_t AlignElems = ((32 / ES) > MinTransposeCols) ? (32 / ES) : MinTransposeCols;
-    constexpr int32_t HP = ((H + AlignElems - 1) / AlignElems) * AlignElems;
+    // H is runtime; size the UB tiles for the worst-case head count. TTRANS always
+    // processes the full BLOCK×HP tile (unused cols H..HP are zero-padded), and the
+    // store loop below writes only the first H transposed rows.
+    constexpr int32_t HP = ((GDN_MAX_HEADS + AlignElems - 1) / AlignElems) * AlignElems;
     constexpr int32_t SRC_UB = 0;
     constexpr int32_t DST_UB = SRC_UB + BLOCK * HP * ES;
     constexpr int32_t TMP_UB = DST_UB + HP * BLOCK * ES;
@@ -107,8 +117,9 @@ AICORE void mega_transpose_TH_to_HT(
 
     using Gm2D      = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
     using Gm1D      = Shape<1, 1, 1, 1, DYNAMIC>;
-    using GmSrcS    = Stride<1, 1, 1, H, 1>;
+    using GmSrcS    = Stride<1, 1, 1, DYNAMIC, 1>;
     using GmS1      = Stride<1, 1, 1, 1, 1>;
+    GmSrcS src_stride(H);  // runtime row pitch = H elements (skip other heads)
 
     UBSrcFull ub_src; TASSIGN(ub_src, SRC_UB);
     UBDst     ub_dst; TASSIGN(ub_dst, DST_UB);
@@ -125,7 +136,7 @@ AICORE void mega_transpose_TH_to_HT(
 
         {
             Gm2D gs; gs.shape[3] = valid; gs.shape[4] = H;
-            GlobalTensor<T, Gm2D, GmSrcS> gm(src + t0 * H, gs);
+            GlobalTensor<T, Gm2D, GmSrcS> gm(src + t0 * H, gs, src_stride);
             UBSrcDyn ld(valid, H);
             TASSIGN(ld, SRC_UB);
             TLOAD(ld, gm);
@@ -276,7 +287,6 @@ AICORE void mega_solve_tril(
             num_bsnd_heads, cu_seqlens, is_lower);
 }
 
-template <int32_t H>
 AICORE inline void mega_kernel_impl(
     __gm__ uint8_t *q_ptr,
     __gm__ uint8_t *k_ptr,
@@ -308,6 +318,7 @@ AICORE inline void mega_kernel_impl(
     __gm__ uint8_t *o_ws_qk_ptr,
     __gm__ uint8_t *o_ws_qs_ptr,
     __gm__ uint8_t *o_ws_gated_ptr,
+    int32_t H,
     uint32_t num_key_heads,
     int64_t batch_size,
     int64_t seq_len,
@@ -324,11 +335,11 @@ AICORE inline void mega_kernel_impl(
         return;
     }
 
-    mk_cumsum::cumsum_kernel<H, C>(
+    mk_cumsum::cumsum_kernel<C>(
         reinterpret_cast<__gm__ float *>(g_in_ptr),
         reinterpret_cast<__gm__ float *>(g_sum_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens_ptr),
-        batch_size, seq_len, ffts_addr);
+        batch_size, seq_len, H, ffts_addr);
 
 #ifdef MEGA_STOP_AFTER_CUMSUM
     pipe_barrier(PIPE_ALL);
@@ -341,14 +352,14 @@ AICORE inline void mega_kernel_impl(
     return;
 #endif
 
-    mega_transpose_TH_to_HT<float, H>(
+    mega_transpose_TH_to_HT<float>(
         reinterpret_cast<__gm__ float *>(g_sum_ptr),
         reinterpret_cast<__gm__ float *>(g_t_ptr),
-        total_tokens);
-    mega_transpose_TH_to_HT<half, H>(
+        total_tokens, H);
+    mega_transpose_TH_to_HT<half>(
         reinterpret_cast<__gm__ half *>(beta_ptr),
         reinterpret_cast<__gm__ half *>(beta_t_ptr),
-        total_tokens);
+        total_tokens, H);
 
 #ifdef MEGA_STOP_AFTER_TRANSPOSE
     pipe_barrier(PIPE_ALL);
@@ -520,26 +531,17 @@ extern "C" __global__ AICORE void launch_mega_kernel(
     uint32_t num_matrices,
     uint64_t ffts_addr)
 {
-#define DISPATCH_MEGA_H(H)                                                                                         \
-    case H:                                                                                                        \
-        mega_kernel_impl<H>(q_ptr, k_ptr, v_ptr, g_in_ptr, beta_ptr, msk_lower_ptr, msk_full_ptr, minus_id_ptr,    \
-                            cu_seqlens_ptr, o_ptr, g_sum_ptr, g_t_ptr, beta_t_ptr, A_ptr, A_inv_f32_ptr, A_inv_ptr, \
-                            w_ptr, u_ptr, s_ptr, v_new_ptr, fs_ptr, h0_ptr, has_initial_state, kkt_ws_ptr,          \
-                            wy_ws_a1_ptr, wy_ws_a2_ptr, h_ws_ptr, o_ws_qk_ptr, o_ws_qs_ptr, o_ws_gated_ptr,         \
-                            num_key_heads, batch_size, seq_len, total_tokens, num_matrices, ffts_addr);            \
-        return
-
-    switch (num_heads) {
-        DISPATCH_MEGA_H(16);
-        DISPATCH_MEGA_H(24);
-        DISPATCH_MEGA_H(32);
-        DISPATCH_MEGA_H(48);
-        DISPATCH_MEGA_H(64);
-        default:
-            return;
+    // num_heads is a runtime kernel argument (one .so serves every head count).
+    // Guard the compile-time UB ceiling; the host validates before launch too.
+    if (num_heads == 0 || num_heads > GDN_MAX_HEADS) {
+        return;
     }
-
-#undef DISPATCH_MEGA_H
+    mega_kernel_impl(q_ptr, k_ptr, v_ptr, g_in_ptr, beta_ptr, msk_lower_ptr, msk_full_ptr, minus_id_ptr,
+                     cu_seqlens_ptr, o_ptr, g_sum_ptr, g_t_ptr, beta_t_ptr, A_ptr, A_inv_f32_ptr, A_inv_ptr,
+                     w_ptr, u_ptr, s_ptr, v_new_ptr, fs_ptr, h0_ptr, has_initial_state, kkt_ws_ptr,
+                     wy_ws_a1_ptr, wy_ws_a2_ptr, h_ws_ptr, o_ws_qk_ptr, o_ws_qs_ptr, o_ws_gated_ptr,
+                     static_cast<int32_t>(num_heads), num_key_heads, batch_size, seq_len, total_tokens,
+                     num_matrices, ffts_addr);
 }
 
 extern "C" void call_kernel(

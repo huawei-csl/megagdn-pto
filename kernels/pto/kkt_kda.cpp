@@ -1,73 +1,58 @@
 // ============================================================================
-// kkt_kda.cpp — Within-chunk gated attention matrix for KDA (numerically stable)
+// kkt_kda.cpp — Within-chunk gated attention matrix for KDA (Cube-accelerated,
+//               numerically stable via per-token exp offset)
 //
 // Mathematical operation (per chunk of C tokens, per head h):
 //   L[r,c] = beta[r] * sum_d k[r,d] * k[c,d] * exp(g_cs[r,d] - g_cs[c,d])
 //            for r > c (strictly lower-tri), else 0
 //
-// STABILITY: Kimi KDA gates (g = -exp(A_log)*softplus(...)) are unbounded; the
-//   within-chunk cumulative gate g_cs can reach ~-500.  The previous factorized
-//   form  A_eff=k*exp(g_cs), B_eff=k*exp(-g_cs), L=A_eff@B_eff^T  computes
-//   exp(-g_cs)=exp(+500) which overflows fp32 (max e^88) -> inf -> inf*0 = NaN.
+// THE STABILITY PROBLEM:
+//   The Cube-friendly factorization  A=k*exp(g_cs), B=k*exp(-g_cs), L=A@B^T
+//   computes exp(-g_cs)=exp(+500) on Kimi KDA gates (cumulative g_cs ~ -500),
+//   which overflows even fp32 (max e^88) -> inf -> inf*0 = NaN.
 //
-//   This kernel instead computes exp(g_cs[r]-g_cs[c]) as a DIFFERENCE, never the
-//   product of two separate exponentials.  For the kept (lower-tri) entries r>c,
-//   g_cs[r] <= g_cs[c] (g_cs monotone decreasing within a chunk) so the argument
-//   is <= 0 and exp(.) <= 1 — always finite.  We clamp the argument with
-//   min(., 0) so the masked (upper-tri) entries also stay finite (then discarded
-//   by only storing the strict-lower part).  No pivot, no saturation, exact.
+// THE FIX — per-token offset (two exponentials that *almost* cancel):
+//   Pick one scalar per token  b[t] = max_d g_cs[t,d]  and factor it out of
+//   BOTH legs of the matmul:
+//       A[t,d] = k[t,d] * exp(g_cs[t,d] - b[t])     (<= k  ⇒ never overflows)
+//       B[t,d] = k[t,d] * exp(b[t] - g_cs[t,d])     (>= k, |exp| = channel spread)
+//       M[r,c] = sum_d A[r,d]*B[c,d]                (= A @ B^T, on the Cube, fp32)
+//       L[r,c] = beta[r] * exp(min(b[r]-b[c], 0)) * M[r,c]      for r > c
+//   The b[t] inside A and B cancels exactly in the per-d product; the residual
+//   is the post-matmul correction exp(b[r]-b[c]).  Because b is monotone
+//   decreasing within a chunk (g_cs is), b[r]-b[c] <= 0 for kept entries (r>c),
+//   so the correction is <= 1; min(.,0) keeps the masked (r<c) entries finite
+//   too (they are then zeroed by the strict-lower mask, avoiding inf*0=NaN).
 //
-// IMPLEMENTATION: per (head, chunk) the work is split across the two Vec
-//   sub-blocks by row range (vid=0 -> rows [0,C/2), vid=1 -> rows [C/2, C)),
-//   mirroring the GDN scaled_dot_kkt row split.  Each vid loops over columns c
-//   and computes its rows' column-c of L via a per-column elementwise reduction:
-//
-//     diff[r,d] = g_cs[my_row r, d] - g_cs[c, d]   (TCOLEXPANDSUB, per-dim c)
-//     diff      = min(diff, 0)                       (TMINS)
-//     t[r,d]    = exp(diff) * k[c,d] * k[my_row r,d] (TEXP, TCOLEXPANDMUL, TMUL)
-//     L[my_row r, c] = beta[r] * sum_d t[r,d]        (TROWSUM, TMUL)
-//
-//   then stores the strict-lower rows (global_row > c) to L_out.  This is a
-//   Vec-only kernel; the Cube pass only participates in the entry/exit barriers.
-//   (A GEMM-accelerated off-diagonal path is a future optimization.)
+//   The cross-TOKEN cumulative blow-up (~-500) is fully absorbed into b[t]; the
+//   only magnitude left in the matmul factors is the within-token cross-CHANNEL
+//   spread  max_d g_cs[t,d] - min_d g_cs[t,d]  (carried by the B factor).  The
+//   fp32 GEMM (e^88) is safe as long as that spread stays < ~88.
 //
 // Inputs (all on GM, head-major [HV, total_tokens, K]):
 //   k       [HV, total_tokens, K]  float16  — keys
 //   g_cs    [HV, total_tokens, K]  float32  — within-chunk cumulative gate sum
 //   beta    [HV, total_tokens]     float16  — post-sigmoid beta in (0, 1)
-//   mask    [C, C]                 float32  — (unused; kept for ABI stability)
-//   ws_in   [block_dim*2, 2*C, K]  float32  — (unused; kept for ABI stability)
-//   ws_out  [block_dim*2, C, C]    float32  — (unused; kept for ABI stability)
+//   mask    [C, C]                 float32  — strict-lower-tri (1 below diag, else 0)
+//   ws_in   [block_dim*2, 2*C, K]  float32  — workspace: A (rows 0..C-1) + B (C..2C-1)
+//   ws_out  [block_dim*2, C, C]    float32  — workspace: GEMM result M
+//   b_ws    [block_dim*2, C]       float32  — workspace: per-token offset b[t]
 //   L_out   [total_tokens, HV, C]  float16  — strictly-lower-tri L (BSND)
 //
-// Output:
-//   L_out   [total_tokens, HV, C]  float32  — strictly-lower-tri L matrix (BSND)
-//
-// Cross-core architecture (mirrors GDN scaled_dot_kkt pattern):
+// Cross-core architecture (mirrors GDN scaled_dot_kkt / main kkt_kda pattern):
 //   Both Vec sub-blocks (vid=0,1) do real work: each handles HalfChunk rows.
 //     vid=0 → rows [0, C/2),  vid=1 → rows [C/2, C)
-//   Vec pre:  load k, g_cs (my rows) → A_eff = k*exp(g), B_eff = k*exp(-g),
-//             cast fp16 → ws_in[my rows]
-//   Cube:     load full A_eff, B_eff from ws_in → GEMM A @ B^T → ws_out
-//   Vec post: load ws_out[my rows], cast fp32 → apply mask + beta row-scale → L_out
+//   Vec pre:  load k, g_cs (my rows) → b=rowmax(g_cs) → A=k*exp(g-b),
+//             B=k*exp(b-g) (fp32) → ws_in[my rows];  b[my rows] → b_ws.
+//   Cube:     load full A, B from ws_in → fp32 GEMM A @ B^T → ws_out.
+//   Vec post: load M[my rows] + full b → corr=exp(min(b[r]-b[c],0)) →
+//             L = M*corr*beta*mask → cast fp16 → L_out.
 //
 // FFTS flags (double-buffered, slot = ci & 1):
 //   0, 1 : Vec → Cube  "ws_in[slot] ready"  (both vids must sig under mode-2 reduce)
 //   2, 3 : Cube → Vec  "ws_out[slot] ready" (broadcast: each vid gets a signal)
-//   4, 5 : Vec → Cube  "ws_out[slot] free"  (Vec done reading L_full; conditional)
-//
-// UB budget (per vid, HalfChunk=C/2 rows; UB ~192 KB per Vec sub-block):
-//   mask fp32 [C/2, C] lives always at offset 0 (loaded once per launch).
-//   The rest of UB is a shared pool reused between pre-compute and post-process
-//   (they never run concurrently within a chunk).
-//   Pre-compute pool (live simultaneously):
-//     g_ub  fp32 [C/2, KTC],  k_ub fp32 [C/2, KTC],
-//     ab_ub fp32 [C/2, KTC],  half_buf fp16 [C/2, KTC]    (scratch reused A → B)
-//   Post-process pool (live simultaneously; overlaps pre-compute addresses):
-//     L_half fp16 [C/2, C],  L_ub fp32 [C/2, C],
-//     beta_2d fp32 [C/2, C], beta fp32 [1, C/2]
-//   Peak @ C=128, K=128: mask 32 + pre 112 = 144 KB ✓ (under 192 KB)
-//   Peak @ C=16,  K=128: mask 0.5 + pre 14 ≈ 15 KB ✓
+//   4, 5 : Vec → Cube  "ws_out[slot] free"  (Vec done reading M; conditional)
+//   6-9  : reserved for sync_all() entry/exit barriers
 //
 // Template parameters:
 //   Compile-time: GDN_D = K, GDN_C = C.  Runtime: num_heads = HV.
@@ -117,6 +102,73 @@ using UbND = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::RowMajor,
 template <typename T, int R, int C, int RV = R, int CV = C>
 using UbDN = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::ColMajor,
                        RV, CV, pto::SLayout::NoneBox, 512>;
+
+// ── Cube tile aliases (fp32 GEMM), copied from chunk_o_kda.cpp ──────────────
+template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
+          int32_t ColValid = Cols>
+using TileMatL1 = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
+                            pto::BLayout::ColMajor, RowValid, ColValid,
+                            pto::SLayout::RowMajor, 512, pto::PadValue::Zero>;
+
+template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
+          int32_t ColValid = Cols>
+using TileMatL1ZN = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
+                              pto::BLayout::RowMajor, RowValid, ColValid,
+                              pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
+
+template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
+          int32_t ColValid = Cols>
+using TileMatL0A = pto::Tile<pto::TileType::Left, T, Rows, Cols,
+                             pto::BLayout::RowMajor, RowValid, ColValid,
+                             pto::SLayout::RowMajor, 512, pto::PadValue::Zero>;
+
+template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
+          int32_t ColValid = Cols>
+using TileMatL0B = pto::Tile<pto::TileType::Right, T, Rows, Cols,
+                             pto::BLayout::RowMajor, RowValid, ColValid,
+                             pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
+
+template <typename T, int32_t Rows, int32_t Cols>
+using DynMatL1 = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
+                           pto::BLayout::ColMajor, pto::DYNAMIC,
+                           pto::DYNAMIC, pto::SLayout::RowMajor, 512,
+                           pto::PadValue::Zero>;
+
+// Single-shot dense GEMM  C = A @ B^T  via L0A/L0B — used when the K-dim is one
+// L0 tile (inner dim KDim == 128 == L0 tile size, so no K-slicing needed).
+// transpose-B only (avoids a <type_traits> dependency, which would break the
+// mega kernel's namespaced #include ordering vs chunk_o_kda.cpp).
+template <typename T1, typename T2, int32_t M, int32_t N, int32_t K>
+AICORE PTO_INLINE void
+gemm_abt(TileMatL1<T1, M, K, M, K> &A,
+         TileMatL1<T1, N, K, N, K> &B,
+         pto::TileAcc<T2, M, N, M, N> &C)
+{
+    TileMatL0A<T1, M, K, M, K> l0a;
+    TileMatL0B<T1, K, N, K, N> l0b;
+    pto::TASSIGN(l0a, 0x0);
+    pto::TASSIGN(l0b, 0x0);
+
+    auto war_event_id = (event_t)(((int)EVENT_ID0 + 1) % 8);
+    set_flag(PIPE_MTE2, PIPE_MTE1, war_event_id);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, war_event_id);
+    set_flag(PIPE_M, PIPE_MTE1, war_event_id);
+    wait_flag(PIPE_M, PIPE_MTE1, war_event_id);
+
+    pto::TEXTRACT(l0a, A, 0, 0);
+    TileMatL1ZN<T1, K, N, K, N> B_t;
+    pto::TRESHAPE(B_t, B);
+    pto::TEXTRACT(l0b, B_t, 0, 0);
+
+    set_flag(PIPE_MTE1, PIPE_M, war_event_id);
+    wait_flag(PIPE_MTE1, PIPE_M, war_event_id);
+    pto::TMATMUL(C, l0a, l0b);
+
+    set_flag(PIPE_MTE1, PIPE_MTE2, war_event_id);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, war_event_id);
+    set_flag(PIPE_M, PIPE_FIX, war_event_id);
+    wait_flag(PIPE_M, PIPE_FIX, war_event_id);
+}
 #endif
 
 template <int32_t KDim, int32_t ChunkSize>
@@ -127,6 +179,7 @@ AICORE void kkt_kda_kernel(
     __gm__ float *mask_ptr,
     __gm__ float *ws_in_ptr,
     __gm__ float *ws_out_ptr,
+    __gm__ float *b_ws_ptr,
     __gm__ half *L_out_ptr,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
@@ -134,12 +187,8 @@ AICORE void kkt_kda_kernel(
 {
     auto cid = get_block_idx();
     auto block_num = get_block_num();
-    auto vid = get_subblockid();
     set_ffts_base_addr(ffts_addr);
 
-    // Head count is a runtime argument (HV).  Only loop bounds, the work-item
-    // decode, and GM strides depend on it — no UB buffer or tile shape does —
-    // so it never needs to be a compile-time constant.
     const int32_t NumHeads = num_heads;
 
     constexpr int32_t HalfChunk = ChunkSize / 2;
@@ -148,51 +197,65 @@ AICORE void kkt_kda_kernel(
     int64_t num_seqs = batch_size;
     int64_t total_work = num_seqs * NumHeads;
 
+    // Workspace element counts per slot (fp32 elements):
+    constexpr int32_t WsInSlotElems = 2 * ChunkSize * KDim;   // A + B
+    constexpr int32_t WsOutSlotElems = ChunkSize * ChunkSize; // M
+    constexpr int32_t BWsSlotElems = ChunkSize;               // b[t]
+
     // ── GM type aliases (head-major [HV, T, K]) ──────────────────────────────
     using GmShapeDyn = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
     using GmFloatK = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
     using GmHalfK = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
     using GmHalf_1 = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, 1, 1>>;
-    // L output is BSND-interleaved [total_tokens, NumHeads, ChunkSize]; the
-    // token stride NumHeads*ChunkSize is now runtime, so the GM stride is
-    // DYNAMIC and supplied at construction (see the store site below).
-    using GmHalfOut = GlobalTensor<half, GmShapeDyn,
-                                   Stride<1, 1, 1, DYNAMIC, 1>>;
-    using GmHalfWsIn = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
-    using GmHalfWsOut = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
-    // Strict-lower mask [C, C]; read one column c as a [my_rows, 1] strip where
-    // the row dim steps down by ChunkSize and the single column is contiguous
-    // (innermost stride 1).  Independent of head count, so a compile-time stride.
-    using GmFloatMaskColRow = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
+    using GmFloat_1 = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, 1, 1>>;
+    // L output is BSND-interleaved [total_tokens, NumHeads, ChunkSize].
+    using GmHalfOut = GlobalTensor<half, GmShapeDyn, Stride<1, 1, 1, DYNAMIC, 1>>;
+    using GmFloatWsIn = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>;
+    using GmFloatWsOut = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
 
-#if defined(__DAV_C220_CUBE__)
-    // Cube does no compute here; it only participates in the entry/exit barriers
-    // so the Vec-side sync_all() handshakes complete.
-    sync_all();
-    sync_all();
-#endif
-
+    // =========================================================================
+    // VEC PHASE
+    // =========================================================================
 #if defined(__DAV_C220_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
     sync_all();
 
-    // ── UB layout (per vid) ──────────────────────────────────────────────────
-    constexpr int32_t MYG_ADDR = 0;                               // [HalfChunk, K] fp32
-    constexpr int32_t MYK_ADDR = MYG_ADDR + HalfChunk * KTC * 4;  // [HalfChunk, K] fp32
-    constexpr int32_t DIFF_ADDR = MYK_ADDR + HalfChunk * KTC * 4; // [HalfChunk, K] fp32 (diff/t)
-    constexpr int32_t TMP_ADDR = DIFF_ADDR + HalfChunk * KTC * 4; // [HalfChunk, K] fp32 (rowsum tmp)
-    constexpr int32_t MYKH_ADDR = TMP_ADDR + HalfChunk * KTC * 4; // [HalfChunk, K] fp16 (k staging)
-    constexpr int32_t GC_ADDR = MYKH_ADDR + HalfChunk * KTC * 2;  // [1, K] fp32 (column g_c)
-    constexpr int32_t KC_ADDR = GC_ADDR + KTC * 4;                // [1, K] fp32 (column k_c)
-    constexpr int32_t KCH_ADDR = KC_ADDR + KTC * 4;               // [1, K] fp16 (k_c staging)
-    constexpr int32_t COL_ADDR = KCH_ADDR + KTC * 2;              // [HalfChunk, 16] fp32 (colsum, RowMajor padded)
-    constexpr int32_t COLH_ADDR = COL_ADDR + HalfChunk * 16 * 4;  // [HalfChunk, 16] fp16 (padded store, RowMajor)
-    constexpr int32_t BETA_ADDR = COLH_ADDR + HalfChunk * 16 * 2; // [1, HalfChunk] fp32 (beta)
-    constexpr int32_t BETAH_ADDR = BETA_ADDR + HalfChunk * 4;     // [1, HalfChunk] fp16 (beta staging)
-    constexpr int32_t MSKC_ADDR = BETAH_ADDR + HalfChunk * 2;     // [1, HalfChunk] fp32 (mask col)
-
+    auto vid = get_subblockid();
     int32_t my_off = static_cast<int32_t>(vid) * HalfChunk;
+
+    // ── UB layout (per vid) ──────────────────────────────────────────────────
+    // Mask persists at offset 0; the rest is a pool reused between pre-compute
+    // and post-process (they never run concurrently within a chunk).
+    constexpr int32_t MSK_ADDR = 0; // [HalfChunk, C] fp32
+    constexpr int32_t POOL = MSK_ADDR + HalfChunk * ChunkSize * 4;
+    // Pre-compute tiles (live simultaneously: g, k, A, B):
+    constexpr int32_t G_ADDR = POOL;                            // [HalfChunk, KTC] fp32
+    constexpr int32_t K_ADDR = G_ADDR + HalfChunk * KTC * 4;    // [HalfChunk, KTC] fp32
+    constexpr int32_t A_ADDR = K_ADDR + HalfChunk * KTC * 4;    // [HalfChunk, KTC] fp32
+    constexpr int32_t B_ADDR = A_ADDR + HalfChunk * KTC * 4;    // [HalfChunk, KTC] fp32
+    constexpr int32_t BCOL_ADDR = B_ADDR + HalfChunk * KTC * 4; // [HalfChunk, 1] fp32 (b, ColMajor)
+    // Post-process tiles (overlap pre-compute addresses):
+    constexpr int32_t M_ADDR = POOL;                                   // [HalfChunk, C] fp32
+    constexpr int32_t CORR_ADDR = M_ADDR + HalfChunk * ChunkSize * 4;  // [HalfChunk, C] fp32
+    constexpr int32_t LH_ADDR = CORR_ADDR + HalfChunk * ChunkSize * 4; // [HalfChunk, C] fp16
+    constexpr int32_t BROW_ADDR = LH_ADDR + HalfChunk * ChunkSize * 2; // [1, C] fp32 (b cols)
+    constexpr int32_t BETA_ADDR = BROW_ADDR + ChunkSize * 4;           // [HalfChunk, 1] fp32 (beta, ColMajor)
+    constexpr int32_t BETAH_ADDR = BETA_ADDR + HalfChunk * 4;          // [1, HalfChunk] fp16 (beta staging)
+
+    // ── Load this vid's HalfChunk rows of the strict-lower mask (once) ──────
+    {
+        UbND<float, HalfChunk, ChunkSize> msk_ub;
+        TASSIGN(msk_ub, MSK_ADDR);
+        GmShapeDyn gs;
+        gs.shape[3] = HalfChunk;
+        gs.shape[4] = ChunkSize;
+        GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>
+            msk_gm(mask_ptr + static_cast<int64_t>(my_off) * ChunkSize, gs);
+        TLOAD(msk_ub, msk_gm);
+    }
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
     for (int64_t work_idx = 0;
          work_idx < (total_work + block_num - 1) / block_num; ++work_idx)
@@ -220,200 +283,408 @@ AICORE void kkt_kda_kernel(
 
         for (int64_t ci = 0; ci < num_chunks; ++ci)
         {
+            int32_t slot = static_cast<int32_t>(ci & 1);
+
             int64_t chunk_start = ci * ChunkSize;
             int64_t remaining = slen - chunk_start;
             int32_t valid_rows = static_cast<int32_t>(
                 remaining < ChunkSize ? remaining : ChunkSize);
-
-            // This vid's row range within the chunk: [my_off, my_off + my_rows).
             int32_t my_rows = valid_rows - my_off;
             if (my_rows > HalfChunk)
                 my_rows = HalfChunk;
-            if (my_rows <= 0)
-                continue; // no rows for this vid in this chunk
-
-            // Columns this vid must cover: c in [0, col_end).  A row r is kept
-            // for column c only if global_row(r) > c, so the largest column any
-            // of my rows touches is (my_off + my_rows - 1).
-            int32_t col_end = my_off + my_rows; // exclusive upper bound for c
+            if (my_rows < 0)
+                my_rows = 0;
 
             int64_t hbase = static_cast<int64_t>(head_idx) * total_tokens * KDim;
-            int64_t my_first = bos + chunk_start + my_off; // global row index of my row 0
+            int64_t my_first = bos + chunk_start + my_off;
+            int64_t ws_in_base =
+                (static_cast<int64_t>(cid) * 2 + slot) * static_cast<int64_t>(WsInSlotElems);
+            int64_t b_ws_base =
+                (static_cast<int64_t>(cid) * 2 + slot) * static_cast<int64_t>(BWsSlotElems);
 
-            // ── Load my rows' g_cs (fp32) and k (fp16 -> fp32) ───────────────
-            {
-                GmShapeDyn gs;
-                gs.shape[3] = my_rows;
-                gs.shape[4] = KDim;
-                GmFloatK g_gm(g_cs_ptr + hbase + my_first * KDim, gs);
-                UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero>
-                    g_ld(my_rows, KDim);
-                TASSIGN(g_ld, MYG_ADDR);
-                TLOAD(g_ld, g_gm);
-            }
-            {
-                GmShapeDyn gs;
-                gs.shape[3] = my_rows;
-                gs.shape[4] = KDim;
-                GmHalfK k_gm(k_ptr + hbase + my_first * KDim, gs);
-                UbND<half, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero>
-                    k_ld(my_rows, KDim);
-                TASSIGN(k_ld, MYKH_ADDR);
-                TLOAD(k_ld, k_gm);
-            }
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            {
-                UbND<half, HalfChunk, KTC, DYNAMIC, DYNAMIC> k_h(my_rows, KDim);
-                TASSIGN(k_h, MYKH_ADDR);
-                UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> k_f(my_rows, KDim);
-                TASSIGN(k_f, MYK_ADDR);
-                TCVT(k_f, k_h, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
-            }
-            // ── Load my rows' beta (fp16 -> fp32) as a [1, my_rows] row, then
-            //    re-view as a [my_rows, 1] column for the per-row scale. ───────
-            {
-                GmShapeDyn gs;
-                gs.shape[3] = 1;
-                gs.shape[4] = my_rows;
-                GmHalf_1 b_gm(beta_ptr + static_cast<int64_t>(head_idx) * total_tokens +
-                                  my_first,
-                              gs);
-                UbND<half, 1, HalfChunk, DYNAMIC, DYNAMIC> b_ld(1, my_rows);
-                TASSIGN(b_ld, BETAH_ADDR);
-                TLOAD(b_ld, b_gm);
-            }
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            {
-                UbND<half, 1, HalfChunk, DYNAMIC, DYNAMIC> b_h(1, my_rows);
-                TASSIGN(b_h, BETAH_ADDR);
-                UbND<float, 1, HalfChunk, DYNAMIC, DYNAMIC> b_f(1, my_rows);
-                TASSIGN(b_f, BETA_ADDR);
-                TCVT(b_f, b_h, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
-            }
+            // ── COMPUTE A / B / b for my HalfChunk rows (per-token max offset) ──
+            // Each vid owns rows [my_off, my_off+my_rows).  A and B are always stored
+            // as full HalfChunk blocks; absent rows (my_rows == 0) and intra-block pad
+            // rows are zero so the Cube GEMM over all C rows is unaffected.
+            UbND<float, HalfChunk, KTC> a_ub;
+            TASSIGN(a_ub, A_ADDR);
+            UbND<float, HalfChunk, KTC> b_ub;
+            TASSIGN(b_ub, B_ADDR);
+            UbDN<float, HalfChunk, 1> bcol;
+            TASSIGN(bcol, BCOL_ADDR);
 
-            UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> myg(my_rows, KDim);
-            TASSIGN(myg, MYG_ADDR);
-            UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> myk(my_rows, KDim);
-            TASSIGN(myk, MYK_ADDR);
-            UbDN<float, HalfChunk, 1, DYNAMIC, DYNAMIC> beta_col(my_rows, 1);
-            TASSIGN(beta_col, BETA_ADDR);
-
-            // ── Column loop ──────────────────────────────────────────────────
-            for (int32_t c = 0; c < col_end; ++c)
+            if (my_rows > 0)
             {
-                // Load column c's g_cs (fp32) and k (fp16 -> fp32) — [1, K].
-                int64_t col_off = hbase + (bos + chunk_start + c) * KDim;
+                // Load my rows' g_cs (fp32) → G_ADDR, zero-pad to HalfChunk.
                 {
                     GmShapeDyn gs;
-                    gs.shape[3] = 1;
+                    gs.shape[3] = my_rows;
                     gs.shape[4] = KDim;
-                    GmFloatK gc_gm(g_cs_ptr + col_off, gs);
-                    UbND<float, 1, KTC, 1, KTC> gc_ld;
-                    TASSIGN(gc_ld, GC_ADDR);
-                    TLOAD(gc_ld, gc_gm);
-                    GmHalfK kc_gm(k_ptr + col_off, gs);
-                    UbND<half, 1, KTC, 1, KTC> kc_ld;
-                    TASSIGN(kc_ld, KCH_ADDR);
-                    TLOAD(kc_ld, kc_gm);
+                    GmFloatK g_gm(g_cs_ptr + hbase + my_first * KDim, gs);
+                    UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero>
+                        g_ld(my_rows, KDim);
+                    TASSIGN(g_ld, G_ADDR);
+                    TLOAD(g_ld, g_gm);
+                    if (my_rows != HalfChunk || KDim != KTC)
+                    {
+                        UbND<float, HalfChunk, KTC, HalfChunk, KTC, PadValue::Zero> g_pad;
+                        TASSIGN(g_pad, G_ADDR);
+                        TFILLPAD_INPLACE(g_pad, g_ld);
+                    }
+                }
+                // Load k (fp16) → A_ADDR (fp16 staging), cvt → K_ADDR (fp32).
+                {
+                    GmShapeDyn gs;
+                    gs.shape[3] = my_rows;
+                    gs.shape[4] = KDim;
+                    GmHalfK k_gm(k_ptr + hbase + my_first * KDim, gs);
+                    UbND<half, HalfChunk, KTC, DYNAMIC, DYNAMIC, PadValue::Zero>
+                        k_ld(my_rows, KDim);
+                    TASSIGN(k_ld, A_ADDR);
+                    TLOAD(k_ld, k_gm);
+                    if (my_rows != HalfChunk || KDim != KTC)
+                    {
+                        UbND<half, HalfChunk, KTC, HalfChunk, KTC, PadValue::Zero> k_pad;
+                        TASSIGN(k_pad, A_ADDR);
+                        TFILLPAD_INPLACE(k_pad, k_ld);
+                    }
                 }
                 set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                 {
-                    UbND<half, 1, KTC, 1, KTC> kc_h;
-                    TASSIGN(kc_h, KCH_ADDR);
-                    UbND<float, 1, KTC, 1, KTC> kc_f;
-                    TASSIGN(kc_f, KC_ADDR);
-                    TCVT(kc_f, kc_h, pto::RoundMode::CAST_NONE);
+                    UbND<half, HalfChunk, KTC> k_h;
+                    TASSIGN(k_h, A_ADDR);
+                    UbND<float, HalfChunk, KTC> k_f;
+                    TASSIGN(k_f, K_ADDR);
+                    TCVT(k_f, k_h, pto::RoundMode::CAST_NONE);
                     pipe_barrier(PIPE_V);
                 }
 
-                UbND<float, 1, KTC, 1, KTC> gc;
-                TASSIGN(gc, GC_ADDR);
-                UbND<float, 1, KTC, 1, KTC> kc;
-                TASSIGN(kc, KC_ADDR);
-                UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> diff(my_rows, KDim);
-                TASSIGN(diff, DIFF_ADDR);
-                UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> tmp(my_rows, KDim);
-                TASSIGN(tmp, TMP_ADDR);
-                UbND<float, HalfChunk, 16, DYNAMIC, DYNAMIC> colsum(my_rows, 1);
-                TASSIGN(colsum, COL_ADDR);
+                UbND<float, HalfChunk, KTC> g_ub;
+                TASSIGN(g_ub, G_ADDR);
+                UbND<float, HalfChunk, KTC> k_ub;
+                TASSIGN(k_ub, K_ADDR);
 
-                // diff[r,d] = g_cs[my r, d] - g_cs[c, d]
-                TCOLEXPANDSUB(diff, myg, gc);
-                pipe_barrier(PIPE_V);
-                // clamp to <= 0 so exp(.) is finite for masked (r<c) entries too
-                TMINS(diff, diff, 0.0f);
-                pipe_barrier(PIPE_V);
-                TEXP(diff, diff);
-                pipe_barrier(PIPE_V);
-                // *= k[c,d]  (per-dim broadcast), then *= k[my r, d]
-                TCOLEXPANDMUL(diff, diff, kc);
-                pipe_barrier(PIPE_V);
-                TMUL(diff, diff, myk);
-                pipe_barrier(PIPE_V);
-                // per-row beta scale (TMUL can't take a [R,1] column directly)
-                TROWEXPANDMUL(diff, diff, beta_col);
-                pipe_barrier(PIPE_V);
-                // colsum[r] = beta[r] * sum_d diff[r,d]   (unmasked)
-                TROWSUM(colsum, diff, tmp);
-                pipe_barrier(PIPE_V);
-
-                // Strict-lower mask: load mask[my_off+r, c] as a padded [my_rows,1]
-                // strip (row-strided gather, innermost contiguous) and zero the
-                // upper-tri rows (my_off+r <= c) via elementwise TMUL.
+                // b[r] = max_d g_cs[r,d]   (use B_ADDR space as the rowmax tmp).
                 {
-                    UbND<float, HalfChunk, 16, DYNAMIC, DYNAMIC> mk(my_rows, 1);
-                    TASSIGN(mk, MSKC_ADDR);
-                    GmShapeDyn gs;
-                    gs.shape[3] = my_rows;
-                    gs.shape[4] = 1;
-                    GmFloatMaskColRow mk_gm(
-                        mask_ptr + static_cast<int64_t>(my_off) * ChunkSize + c, gs);
-                    TLOAD(mk, mk_gm);
-                    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-                    TMUL(colsum, colsum, mk);
+                    UbND<float, HalfChunk, KTC> rmax_tmp;
+                    TASSIGN(rmax_tmp, B_ADDR);
+                    TROWMAX(bcol, g_ub, rmax_tmp);
                     pipe_barrier(PIPE_V);
                 }
-
-                // cvt colsum -> fp16 into a padded RowMajor [my_rows, 1] tile and
-                // store column c of L for the strided set of tokens (row dim steps
-                // by NumHeads*ChunkSize, the single column is contiguous).
-                UbND<half, HalfChunk, 16, DYNAMIC, DYNAMIC> col_h(my_rows, 1);
-                TASSIGN(col_h, COLH_ADDR);
-                TCVT(col_h, colsum, pto::RoundMode::CAST_NONE);
+                // A = k * exp(g_cs - b)        (exp(g-b) <= 1, never overflows)
+                TROWEXPANDEXPDIF(a_ub, g_ub, bcol);
                 pipe_barrier(PIPE_V);
+                TMUL(a_ub, a_ub, k_ub);
+                pipe_barrier(PIPE_V);
+                // B = k * exp(b - g_cs) = k * exp(-(g_cs - b))
+                // The exponent (b - g_cs) >= 0 equals the within-token cross-channel
+                // spread; for heavily-decayed channels (Kimi per-channel gate spikes
+                // ~-160) it exceeds the fp32 exp limit.  Saturate it at 80 so B stays
+                // finite (exp(80)~5.5e34; 128-term sum stays < fp32 max 3.4e38).  This
+                // keeps the result exact wherever the spread < 80 and merely
+                // under-counts the rare heavily-decayed channel (whose A factor has
+                // already underflowed to 0) instead of producing inf -> 0*inf = NaN.
+                TROWEXPANDSUB(b_ub, g_ub, bcol); // g - b   (<= 0)
+                pipe_barrier(PIPE_V);
+                TNEG(b_ub, b_ub); // b - g   (>= 0)
+                pipe_barrier(PIPE_V);
+                TMINS(b_ub, b_ub, 80.0f); // saturating exp
+                pipe_barrier(PIPE_V);
+                TEXP(b_ub, b_ub);
+                pipe_barrier(PIPE_V);
+                TMUL(b_ub, b_ub, k_ub);
+                pipe_barrier(PIPE_V);
+            }
+            else
+            {
+                // No valid rows for this vid in this chunk: emit zeros so the GEMM
+                // reads a clean ws_in for this HalfChunk block.
+                TEXPANDS(a_ub, 0.0f);
+                pipe_barrier(PIPE_V);
+                TEXPANDS(b_ub, 0.0f);
+                pipe_barrier(PIPE_V);
+            }
 
+            // Store A → ws_in[slot] rows [my_off, …).
+            {
+                GmShapeDyn gs;
+                gs.shape[3] = HalfChunk;
+                gs.shape[4] = KDim;
+                int64_t off = ws_in_base + static_cast<int64_t>(my_off) * KDim;
+                GmFloatWsIn gm_a(ws_in_ptr + off, gs);
+                UbND<float, HalfChunk, KTC, HalfChunk, KTC> a_st;
+                TASSIGN(a_st, A_ADDR);
                 set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                 wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                TSTORE(gm_a, a_st);
+            }
+            // Store B → ws_in[slot] rows [C+my_off, …).
+            {
+                GmShapeDyn gs;
+                gs.shape[3] = HalfChunk;
+                gs.shape[4] = KDim;
+                int64_t off = ws_in_base +
+                              static_cast<int64_t>(ChunkSize) * KDim +
+                              static_cast<int64_t>(my_off) * KDim;
+                GmFloatWsIn gm_b(ws_in_ptr + off, gs);
+                UbND<float, HalfChunk, KTC, HalfChunk, KTC> b_st;
+                TASSIGN(b_st, B_ADDR);
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+                TSTORE(gm_b, b_st);
+            }
+            // Store b[my rows] → b_ws[slot] (contiguous [my_rows] floats).
+            // bcol is ColMajor [my_rows,1] but its bytes are my_rows contiguous
+            // floats, identical to a RowMajor [1,my_rows] — alias and store as a
+            // row so the GM (ND) store is a supported ND2ND copy.
+            if (my_rows > 0)
+            {
+                GmShapeDyn gs;
+                gs.shape[3] = 1;
+                gs.shape[4] = my_rows;
+                GmFloat_1 b_gm(b_ws_ptr + b_ws_base + my_off, gs);
+                UbND<float, 1, HalfChunk, DYNAMIC, DYNAMIC> b_st(1, my_rows);
+                TASSIGN(b_st, BCOL_ADDR);
+                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+                TSTORE(b_gm, b_st);
+            }
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+
+            // Both vids signal flag(slot) under V→C reduce mode 2.
+            pipe_barrier(PIPE_ALL);
+            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (slot << 8));
+            wait_flag_dev(2 + slot); // Cube: ws_out[slot] ready
+            pipe_barrier(PIPE_ALL);
+
+            // ── POST-PROCESS ───────────────────────────────────────────────
+            if (my_rows > 0)
+            {
+                // Load M[my rows, :] (fp32) from ws_out[slot].
                 {
-                    int64_t l_off = my_first * static_cast<int64_t>(NumHeads) * ChunkSize +
-                                    static_cast<int64_t>(head_idx) * ChunkSize + c;
+                    int64_t wo_base = (static_cast<int64_t>(cid) * 2 + slot) *
+                                      static_cast<int64_t>(WsOutSlotElems);
+                    int64_t off = wo_base + static_cast<int64_t>(my_off) * ChunkSize;
                     GmShapeDyn gs;
                     gs.shape[3] = my_rows;
-                    gs.shape[4] = 1;
-                    // Row (token) dim steps by NumHeads*ChunkSize — runtime now,
-                    // so supply the stride at construction (see GmHalfOut above).
+                    gs.shape[4] = ChunkSize;
+                    GmFloatWsOut gm(ws_out_ptr + off, gs);
+                    UbND<float, HalfChunk, ChunkSize, DYNAMIC, DYNAMIC, PadValue::Zero>
+                        m_ld(my_rows, ChunkSize);
+                    TASSIGN(m_ld, M_ADDR);
+                    TLOAD(m_ld, gm);
+                }
+                // Load full b[0..C-1] → BROW_ADDR ([1,C], RowMajor, ND2ND).  The
+                // per-row offsets b[my_off + r] are the contiguous sub-range starting
+                // at BROW_ADDR + my_off floats; alias it below as a ColMajor [my_rows,1]
+                // (same bytes) for the per-row broadcast — no separate load needed.
+                {
+                    GmShapeDyn gs;
+                    gs.shape[3] = 1;
+                    gs.shape[4] = ChunkSize;
+                    GmFloat_1 brow_gm(b_ws_ptr + b_ws_base, gs);
+                    UbND<float, 1, ChunkSize> brow_ld;
+                    TASSIGN(brow_ld, BROW_ADDR);
+                    TLOAD(brow_ld, brow_gm);
+                }
+                // Load beta[my rows] (fp16) → BETAH_ADDR.
+                {
+                    GmShapeDyn gs;
+                    gs.shape[3] = 1;
+                    gs.shape[4] = my_rows;
+                    GmHalf_1 b_gm(beta_ptr +
+                                      static_cast<int64_t>(head_idx) * total_tokens +
+                                      my_first,
+                                  gs);
+                    UbND<half, 1, HalfChunk, DYNAMIC, DYNAMIC> b_ld(1, my_rows);
+                    TASSIGN(b_ld, BETAH_ADDR);
+                    TLOAD(b_ld, b_gm);
+                }
+                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+                {
+                    UbND<half, 1, HalfChunk, DYNAMIC, DYNAMIC> b_h(1, my_rows);
+                    TASSIGN(b_h, BETAH_ADDR);
+                    UbND<float, 1, HalfChunk, DYNAMIC, DYNAMIC> b_f(1, my_rows);
+                    TASSIGN(b_f, BETA_ADDR);
+                    TCVT(b_f, b_h, pto::RoundMode::CAST_NONE);
+                    pipe_barrier(PIPE_V);
+                }
+
+                UbND<float, HalfChunk, ChunkSize, DYNAMIC, DYNAMIC> m_ub(my_rows, ChunkSize);
+                TASSIGN(m_ub, M_ADDR);
+                UbND<float, HalfChunk, ChunkSize, DYNAMIC, DYNAMIC> corr(my_rows, ChunkSize);
+                TASSIGN(corr, CORR_ADDR);
+                UbND<float, 1, ChunkSize> brow;
+                TASSIGN(brow, BROW_ADDR);
+                // b[my_off + r] sub-range of brow, viewed as a ColMajor [my_rows,1].
+                UbDN<float, HalfChunk, 1, DYNAMIC, DYNAMIC> bcol(my_rows, 1);
+                TASSIGN(bcol, BROW_ADDR + my_off * 4);
+                UbDN<float, HalfChunk, 1, DYNAMIC, DYNAMIC> beta_col(my_rows, 1);
+                TASSIGN(beta_col, BETA_ADDR);
+                UbND<float, HalfChunk, ChunkSize, DYNAMIC, DYNAMIC> msk_ub(my_rows, ChunkSize);
+                TASSIGN(msk_ub, MSK_ADDR);
+
+                // corr[r,c] = exp(min(b[r] - b[c], 0))
+                //   fill with b[r] per row, subtract b[c] per col, clamp, exp.
+                TEXPANDS(corr, 0.0f);
+                pipe_barrier(PIPE_V);
+                TROWEXPANDADD(corr, corr, bcol); // corr[r,c] = b[r]
+                pipe_barrier(PIPE_V);
+                TCOLEXPANDSUB(corr, corr, brow); // corr[r,c] = b[r] - b[c]
+                pipe_barrier(PIPE_V);
+                TMINS(corr, corr, 0.0f);
+                pipe_barrier(PIPE_V);
+                TEXP(corr, corr);
+                pipe_barrier(PIPE_V);
+
+                // L = M * corr * beta[r] * mask
+                TMUL(m_ub, m_ub, corr);
+                pipe_barrier(PIPE_V);
+                TROWEXPANDMUL(m_ub, m_ub, beta_col);
+                pipe_barrier(PIPE_V);
+                TMUL(m_ub, m_ub, msk_ub);
+                pipe_barrier(PIPE_V);
+
+                // Cast fp32 → fp16 and store to L_out (BSND).
+                {
+                    UbND<half, HalfChunk, ChunkSize> l_h;
+                    TASSIGN(l_h, LH_ADDR);
+                    TCVT(l_h, m_ub, pto::RoundMode::CAST_NONE);
+                    pipe_barrier(PIPE_V);
+                    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+                    int64_t l_off = my_first * static_cast<int64_t>(NumHeads) * ChunkSize +
+                                    static_cast<int64_t>(head_idx) * ChunkSize;
+                    GmShapeDyn gs;
+                    gs.shape[3] = my_rows;
+                    gs.shape[4] = ChunkSize;
                     Stride<1, 1, 1, DYNAMIC, 1> l_stride(NumHeads * ChunkSize);
                     GmHalfOut l_gm(L_out_ptr + l_off, gs, l_stride);
-                    TSTORE(l_gm, col_h);
+                    UbND<half, HalfChunk, ChunkSize, DYNAMIC, DYNAMIC> l_st(my_rows, ChunkSize);
+                    TASSIGN(l_st, LH_ADDR);
+                    TSTORE(l_gm, l_st);
                 }
                 set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
                 wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-                // Drain all pipes before the next column iteration so its gc/kc/
-                // mask loads (MTE2) cannot race the current column's still-draining
-                // Vec reads of the same UB slots.
-                pipe_barrier(PIPE_ALL);
+            }
+
+            // Drain Vec pipes before next chunk, then free ws_out[slot].
+            pipe_barrier(PIPE_ALL);
+            if (ci < num_chunks - 2)
+            {
+                ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | ((4 + slot) << 8));
             }
         }
     }
 
     sync_all();
 #endif // __DAV_C220_VEC__
+
+    // =========================================================================
+    // CUBE PHASE: fp32 GEMM  A @ B^T → M
+    // =========================================================================
+#if defined(__DAV_C220_CUBE__)
+    constexpr int32_t L1BAddr = ChunkSize * KDim * static_cast<int32_t>(sizeof(float));
+
+    sync_all();
+
+    for (int64_t work_idx = 0;
+         work_idx < (total_work + block_num - 1) / block_num; ++work_idx)
+    {
+        int64_t pid = work_idx * static_cast<int64_t>(block_num) +
+                      static_cast<int64_t>(cid);
+        if (pid >= total_work)
+            continue;
+
+        int64_t seq_idx = pid / NumHeads;
+
+        int64_t bos, slen;
+        if (cu_seqlens != nullptr)
+        {
+            bos = static_cast<int64_t>(cu_seqlens[seq_idx]);
+            slen = static_cast<int64_t>(cu_seqlens[seq_idx + 1]) - bos;
+        }
+        else
+        {
+            bos = seq_idx * seq_len;
+            slen = seq_len;
+        }
+        int64_t num_chunks = (slen + ChunkSize - 1) / ChunkSize;
+
+        for (int64_t ci = 0; ci < num_chunks; ++ci)
+        {
+            int32_t slot = static_cast<int32_t>(ci & 1);
+
+            if (ci >= 2)
+            {
+                wait_flag_dev(4 + slot); // ws_out[slot] free
+                pipe_barrier(PIPE_ALL);
+            }
+            wait_flag_dev(slot); // ws_in[slot] ready (both vids sig'd)
+            pipe_barrier(PIPE_ALL);
+
+            int64_t ws_in_base =
+                (static_cast<int64_t>(cid) * 2 + slot) * static_cast<int64_t>(WsInSlotElems);
+
+            TileMatL1<float, ChunkSize, KDim, ChunkSize, KDim> a_l1;
+            TASSIGN(a_l1, 0);
+            TileMatL1<float, ChunkSize, KDim, ChunkSize, KDim> b_l1;
+            TASSIGN(b_l1, L1BAddr);
+            TileAcc<float, ChunkSize, ChunkSize, ChunkSize, ChunkSize> m_l0;
+            TASSIGN(m_l0, 0);
+
+            // Load A [C,K] from ws_in[slot, 0:C, :].
+            {
+                DynMatL1<float, ChunkSize, KDim> _l1(ChunkSize, KDim);
+                TASSIGN(_l1, 0);
+                GmShapeDyn _gs;
+                _gs.shape[3] = ChunkSize;
+                _gs.shape[4] = KDim;
+                GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>
+                    _gm(ws_in_ptr + ws_in_base, _gs);
+                TLOAD(_l1, _gm);
+            }
+            // Load B [C,K] from ws_in[slot, C:2C, :].
+            {
+                DynMatL1<float, ChunkSize, KDim> _l1(ChunkSize, KDim);
+                TASSIGN(_l1, L1BAddr);
+                GmShapeDyn _gs;
+                _gs.shape[3] = ChunkSize;
+                _gs.shape[4] = KDim;
+                GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, KDim, 1>>
+                    _gm(ws_in_ptr + ws_in_base + static_cast<int64_t>(ChunkSize) * KDim, _gs);
+                TLOAD(_l1, _gm);
+            }
+
+            set_flag(PIPE_MTE2, PIPE_M, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_M, EVENT_ID0);
+
+            // M = A @ B^T  (fp32).
+            gemm_abt<float, float, ChunkSize, ChunkSize, KDim>(a_l1, b_l1, m_l0);
+
+            // Store M [C,C] (fp32) → ws_out[slot].
+            {
+                int64_t wo_base = (static_cast<int64_t>(cid) * 2 + slot) *
+                                  static_cast<int64_t>(WsOutSlotElems);
+                GmShapeDyn _gs;
+                _gs.shape[3] = ChunkSize;
+                _gs.shape[4] = ChunkSize;
+                GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>
+                    _gm(ws_out_ptr + wo_base, _gs);
+                TSTORE(_gm, m_l0);
+            }
+
+            pipe_barrier(PIPE_ALL);
+            // Signal Vec: ws_out[slot] ready (GEMM done; ws_in[slot] also free).
+            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | ((2 + slot) << 8));
+        }
+    }
+
+    sync_all();
+#endif // __DAV_C220_CUBE__
 }
 
 // ── Device entry point ────────────────────────────────────────────────────────
@@ -424,6 +695,7 @@ extern "C" __global__ AICORE void launch_kkt_kda(
     __gm__ uint8_t *mask_ptr,
     __gm__ uint8_t *ws_in_ptr,
     __gm__ uint8_t *ws_out_ptr,
+    __gm__ uint8_t *b_ws_ptr,
     __gm__ uint8_t *L_out_ptr,
     __gm__ uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
@@ -436,6 +708,7 @@ extern "C" __global__ AICORE void launch_kkt_kda(
         reinterpret_cast<__gm__ float *>(mask_ptr),
         reinterpret_cast<__gm__ float *>(ws_in_ptr),
         reinterpret_cast<__gm__ float *>(ws_out_ptr),
+        reinterpret_cast<__gm__ float *>(b_ws_ptr),
         reinterpret_cast<__gm__ half *>(L_out_ptr),
         reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
         batch_size, seq_len, total_tokens, num_heads, ffts_addr);
@@ -450,6 +723,7 @@ extern "C" void call_kernel(
     uint8_t *mask_ptr,
     uint8_t *ws_in_ptr,
     uint8_t *ws_out_ptr,
+    uint8_t *b_ws_ptr,
     uint8_t *L_out_ptr,
     uint8_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
@@ -460,7 +734,7 @@ extern "C" void call_kernel(
     rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
     launch_kkt_kda<<<block_dim, nullptr, stream>>>(
         k_ptr, g_cs_ptr, beta_ptr, mask_ptr,
-        ws_in_ptr, ws_out_ptr, L_out_ptr, cu_seqlens,
+        ws_in_ptr, ws_out_ptr, b_ws_ptr, L_out_ptr, cu_seqlens,
         batch_size, seq_len, total_tokens,
         static_cast<int32_t>(num_heads), fftsAddr);
 }
