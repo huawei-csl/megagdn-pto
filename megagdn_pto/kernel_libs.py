@@ -43,14 +43,17 @@ def _ensure_int32(cu: torch.Tensor | None) -> torch.Tensor | None:
     return cu if cu.dtype == torch.int32 else cu.to(torch.int32)
 
 
-_SUPPORTED_HEADS = frozenset({16, 24, 32, 48, 64})
+# The head count is a runtime kernel argument, so any value up to the compile-time
+# UB ceiling works (one .so serves all head counts). _MAX_HEADS must match
+# GDN_MAX_HEADS in kernels/pto/{mega_kernel,chunk_cumsum}.cpp.
+_MAX_HEADS = 64
 
 
 def _check_supported_heads(value_heads: int, key_heads: int | None = None) -> None:
-    if value_heads not in _SUPPORTED_HEADS:
+    if value_heads < 1 or value_heads > _MAX_HEADS:
         raise ValueError(
-            f"H={value_heads} is not supported by the compiled dispatch binary; "
-            f"choose one of {_SUPPORTED_HEADS}"
+            f"H={value_heads} is out of range; the kernels support "
+            f"1..{_MAX_HEADS} value heads (compile-time UB ceiling)."
         )
     if key_heads is not None and value_heads % key_heads != 0:
         raise ValueError(f"H={value_heads} must be divisible by key_heads={key_heads}")

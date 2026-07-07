@@ -60,6 +60,55 @@ using namespace pto;
 #define GDN_C 128
 #endif
 
+// GDN_MAX_HEADS: compile-time ceiling on the value-head count. NumHeads is now a
+// RUNTIME argument (one .so serves every head count), but the UB tiles must still
+// be sized at compile time, so they are sized for the worst case HTC=align(MAX,8).
+// Any NumHeads <= GDN_MAX_HEADS works; the unused columns are zero-padded and ride
+// along the SIMD lanes harmlessly. Must match the host-side _MAX_HEADS guard.
+#ifndef GDN_MAX_HEADS
+#define GDN_MAX_HEADS 64
+#endif
+
+// ── Recurrent prefix-sum chain synchronization ──────────────────────────────
+// The recurrent chain alternates TADD(acc,acc,g_i) (Vec) and TMOV(s_i,acc) (Vec)
+// with TASSIGN address/descriptor setup on each row. TADD/TMOV lower to PIPE_V,
+// but TASSIGN is a SCALAR op (PIPE_S, see opPipeList in pto/common/event.hpp), and
+// on this core the scalar unit ISSUES the vec instructions. So the ordering edge
+// that actually matters is Vec→Scalar: without it, the scalar issuer launches the
+// next TADD/TMOV before the previous vec write to acc_ub has committed → a RAW race
+// on acc_ub.
+//
+// pipe_barrier(PIPE_V) only fences Vec-vs-Vec and never enforces this V↔S edge, so
+// it is insufficient under the fused kernel — the recurrence races and corrupts the
+// last rows of each chunk non-deterministically (surfaced at H=64, whose wider tile
+// lengthens the race window). It happens to be harmless standalone because the
+// scheduler there doesn't reorder across the boundary the same way.
+//
+// The fix is an explicit Vec→Scalar sync: set_flag(PIPE_V, PIPE_S) + wait_flag,
+// here via PtoSetWaitFlag<PIPE_V, PIPE_S>(). This stalls the scalar issuer until the
+// vec pipe drains, serializing the recurrence correctly. EVENT_ID2 is used to avoid
+// colliding with the EVENT_ID0 V↔MTE3 flags already live in this stage.
+//
+// MINIMAL placement (per-site bisection, H=64, 50-run determinism + e2e + partial
+// chunks): the V↔S sync is needed at EXACTLY ONE site — immediately after the
+// per-row TADD(acc,acc,g_i) write inside the main loop (in both the fixed-length
+// and varlen paths). That single sync serializes the whole recurrence; every other
+// site (the row-0 prologue, the per-row TMOV(s_i,acc) read, and the partial-chunk
+// tail zero-fill) is fine as a plain pipe_barrier(PIPE_V). Verified: bit2-only is
+// correct AND deterministic for full and partial chunks; all-PIPE_V or
+// prologue-only-V↔S races. (The post-read TMOV site is an equally-valid single
+// choice; we sync after the write because it orders acc before every consumer.)
+//
+// Two things that do NOT work, for the record:
+//   • pipe_barrier(PIPE_ALL) also fixes it, but only incidentally — it is a superset
+//     fence that happens to include the V↔S edge. It is heavier and obscures the
+//     real cause, so we use the targeted V↔S sync instead.
+//   • set_flag(PIPE_V, PIPE_MTE3) does NOT help: it targets the wrong pipe pair
+//     (store-DMA, not the scalar issuer), leaving the real edge unenforced and
+//     producing deterministic-but-WRONG output (~20% frob error) that the run-to-run
+//     determinism test cannot detect — always run the cumsum *correctness* test.
+
+
 // ── PTO type aliases (device-only, guarded by __CCE_AICORE__) ───────────────
 // UB tile in row-major (ND) layout, used by Vec engine.
 // T=dtype, R×C=static shape, RV×CV=valid region, P=pad value for TLOAD.
@@ -77,11 +126,12 @@ using UbND = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::RowMajor,
                        RV, CV, pto::SLayout::NoneBox, 512, P>;
 #endif
 
-template <int32_t NumHeads, int32_t ChunkSize>
+template <int32_t ChunkSize>
 AICORE void cumsum_kernel(
     __gm__ float *g_ptr, __gm__ float *g_sum_ptr,
     __gm__ int32_t *cu_seqlens,
     int64_t batch_size, int64_t seq_len,
+    int32_t NumHeads,
     uint64_t ffts_addr)
 {
   // get_block_idx(): Returns this AI core's index (0..block_num-1).
@@ -113,14 +163,14 @@ AICORE void cumsum_kernel(
   set_mask_norm();
   set_vector_mask(-1, -1);
 
-  // HeadTileCols: NumHeads rounded up to 8-element alignment (32B for float)
-  // HTC = NumHeads rounded up to nearest multiple of 8.
-  // Why? The Vec engine processes data in 32-byte granularity.
-  // For float (4 bytes), that's 8 elements per SIMD "word".
-  // Rounding up ensures every row is a whole number of SIMD words,
-  // avoiding partial-lane issues. The extra columns are zero-padded.
-  // Example: NumHeads=16 → HTC=16 (already aligned), NumHeads=13 → HTC=16.
-  constexpr int32_t HTC = ((NumHeads + 7) / 8) * 8;
+  // HeadTileCols: worst-case head count rounded up to 8-element alignment (32B
+  // for float). NumHeads is a runtime value, so the UB tiles are sized for the
+  // compile-time ceiling GDN_MAX_HEADS; the actual NumHeads columns are used and
+  // the padding columns (NumHeads..HTC) are zero-filled, so the prefix sum over
+  // them stays zero and only rides the SIMD lanes at no correctness cost.
+  // Why 8-alignment? The Vec engine processes data in 32-byte granularity;
+  // for float (4 bytes) that's 8 elements per SIMD "word".
+  constexpr int32_t HTC = ((GDN_MAX_HEADS + 7) / 8) * 8;
   constexpr int32_t BlockBytes = ChunkSize * HTC *
                                  static_cast<int32_t>(sizeof(float));
   constexpr int32_t RowBytes = HTC * static_cast<int32_t>(sizeof(float));
@@ -146,8 +196,10 @@ AICORE void cumsum_kernel(
   // This is equivalent to:
   //   g_gm = torch.as_strided(g_ptr, size=[valid, NumHeads], stride=[NumHeads, 1])
   using GmShape  = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
-  using GmStride = Stride<1, 1, 1, NumHeads, 1>;
+  using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
   using GmFloat  = GlobalTensor<float, GmShape, GmStride>;
+  // Runtime row pitch = NumHeads elements (BSND: token t at offset t*NumHeads).
+  GmStride g_stride(NumHeads);
 
   // Pre-assign row accumulator at fixed UB address
   // TASSIGN(tile, address): Binds a tile descriptor to a fixed byte address in UB.
@@ -184,7 +236,7 @@ AICORE void cumsum_kernel(
       // NumHeads up to the 8-aligned HTC) so downstream Vec ops see zeros.
       {
         GmShape gs; gs.shape[3] = valid; gs.shape[4] = NumHeads;
-        GmFloat g_gm(g_ptr + chunk_start * NumHeads, gs);
+        GmFloat g_gm(g_ptr + chunk_start * NumHeads, gs, g_stride);
         UbND<float, ChunkSize, HTC, DYNAMIC, DYNAMIC, PadValue::Zero>
             g_load(valid, NumHeads);
         TASSIGN(g_load, GUbAddr);
@@ -223,11 +275,6 @@ AICORE void cumsum_kernel(
       TASSIGN(g_row_0, GUbAddr);
       // TMOV(dst, src): Element-wise copy, like dst = src.clone() in UB.
       TMOV(acc_ub, g_row_0);
-      // pipe_barrier(PIPE_V): Ensures all pending Vec (SIMD) operations complete
-      // before the next Vec instruction begins. Needed because Vec ops are pipelined
-      // and may not finish in order. Think of it as a local __syncthreads() for the
-      // Vec engine only. Much lighter than set_flag/wait_flag (which sync across
-      // different hardware units).
       pipe_barrier(PIPE_V);
 
       UbND<float, 1, HTC> s_row_0;
@@ -241,8 +288,11 @@ AICORE void cumsum_kernel(
         TASSIGN(g_row_i, GUbAddr + i * RowBytes);
         // TADD(dst, a, b): Element-wise add, like dst = a + b. All in UB.
         // Operates on all HTC elements in parallel (SIMD).
+        // *** The one load-bearing sync (see chain-sync note above): Vec→Scalar
+        // after this per-row write to acc_ub, ordering it before the scalar issuer
+        // launches the next row. Every other barrier in this chain is plain PIPE_V.
         TADD(acc_ub, acc_ub, g_row_i);
-        pipe_barrier(PIPE_V);
+        PtoSetWaitFlag<PIPE_V, PIPE_S>(EVENT_ID2, EVENT_ID2);
 
         UbND<float, 1, HTC> s_row_i;
         TASSIGN(s_row_i, SUbAddr + i * RowBytes);
@@ -273,7 +323,7 @@ AICORE void cumsum_kernel(
 
       {
         GmShape ss; ss.shape[3] = valid; ss.shape[4] = NumHeads;
-        GmFloat gs_gm(g_sum_ptr + chunk_start * NumHeads, ss);
+        GmFloat gs_gm(g_sum_ptr + chunk_start * NumHeads, ss, g_stride);
         UbND<float, ChunkSize, HTC, DYNAMIC, DYNAMIC>
             s_store(valid, NumHeads);
         TASSIGN(s_store, SUbAddr);
@@ -312,7 +362,7 @@ AICORE void cumsum_kernel(
           // Load g chunk from GM → UB, zero-padded
           {
             GmShape gs; gs.shape[3] = valid; gs.shape[4] = NumHeads;
-            GmFloat g_gm(g_ptr + chunk_start * NumHeads, gs);
+            GmFloat g_gm(g_ptr + chunk_start * NumHeads, gs, g_stride);
             UbND<float, ChunkSize, HTC, DYNAMIC, DYNAMIC, PadValue::Zero>
                 g_load(valid, NumHeads);
             TASSIGN(g_load, GUbAddr);
@@ -342,8 +392,10 @@ AICORE void cumsum_kernel(
           for (int32_t i = 1; i < valid; ++i) {
             UbND<float, 1, HTC> g_row_i;
             TASSIGN(g_row_i, GUbAddr + i * RowBytes);
+            // The one load-bearing sync (see chain-sync note above): Vec→Scalar
+            // after this per-row write to acc_ub. All other barriers here are PIPE_V.
             TADD(acc_ub, acc_ub, g_row_i);
-            pipe_barrier(PIPE_V);
+            PtoSetWaitFlag<PIPE_V, PIPE_S>(EVENT_ID2, EVENT_ID2);
 
             UbND<float, 1, HTC> s_row_i;
             TASSIGN(s_row_i, SUbAddr + i * RowBytes);
@@ -367,7 +419,7 @@ AICORE void cumsum_kernel(
 
           {
             GmShape ss; ss.shape[3] = valid; ss.shape[4] = NumHeads;
-            GmFloat gs_gm(g_sum_ptr + chunk_start * NumHeads, ss);
+            GmFloat gs_gm(g_sum_ptr + chunk_start * NumHeads, ss, g_stride);
             UbND<float, ChunkSize, HTC, DYNAMIC, DYNAMIC>
                 s_store(valid, NumHeads);
             TASSIGN(s_store, SUbAddr);
@@ -395,26 +447,16 @@ extern "C" __global__ AICORE void launch_cumsum(
     uint32_t num_heads,
     uint64_t ffts_addr)
 {
-#define DISPATCH_CUMSUM_H(H)                                      \
-  case H:                                                         \
-    cumsum_kernel<H, GDN_C>(                                      \
-        reinterpret_cast<__gm__ float *>(g_ptr),                  \
-        reinterpret_cast<__gm__ float *>(g_sum_ptr),              \
-        reinterpret_cast<__gm__ int32_t *>(cu_seqlens),           \
-        batch_size, seq_len, ffts_addr);                          \
-    return
-
-  switch (num_heads) {
-    DISPATCH_CUMSUM_H(16);
-    DISPATCH_CUMSUM_H(24);
-    DISPATCH_CUMSUM_H(32);
-    DISPATCH_CUMSUM_H(48);
-    DISPATCH_CUMSUM_H(64);
-    default:
-      return;
+  // NumHeads is a runtime kernel argument (one .so serves every head count).
+  // Guard the compile-time UB ceiling; host also validates before launch.
+  if (num_heads == 0 || num_heads > GDN_MAX_HEADS) {
+    return;
   }
-
-#undef DISPATCH_CUMSUM_H
+  cumsum_kernel<GDN_C>(
+      reinterpret_cast<__gm__ float *>(g_ptr),
+      reinterpret_cast<__gm__ float *>(g_sum_ptr),
+      reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
+      batch_size, seq_len, static_cast<int32_t>(num_heads), ffts_addr);
 }
 
 // ── Host-side launcher (called from Python via ctypes) ────────────
