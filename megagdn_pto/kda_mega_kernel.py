@@ -166,7 +166,7 @@ def run_mega_kernel_kda(
     wy_ws_a2   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
     wy_ws_keff = torch.zeros(bd, C, K, device=dev, dtype=torch.float16)
     h_ws       = torch.zeros(bd * 5, K, K, device=dev, dtype=torch.float16)
-    o_ws       = torch.zeros(bd * 7, K, K, device=dev, dtype=torch.float32)
+    o_ws       = torch.zeros(bd * 9, K, K, device=dev, dtype=torch.float32)
 
     # Cold-start FFTS handshake needs all pending work (incl. workspace zero-fill) drained.
     torch.npu.synchronize()
