@@ -551,11 +551,12 @@ def run_chunk_o_kda(
     cols = torch.arange(chunk_size, device=dev).unsqueeze(0)
     mask = (rows >= cols).to(torch.float32)
 
-    # Per-AI-core workspace: 7 slots × K*V elements (fp32).
-    #   WS_Q, WS_K [C, K], WS_V [C, V], WS_S [K, V], WS_QK [C, C],
-    #   WS_QS, WS_QKV [C, V].  fp32 because k_eff=k*exp(-g_cs) and the unmasked
-    #   QK = q_eff @ k_eff^T reach ~e^64, which overflows fp16.
-    ws = torch.zeros(bd * 7, K, K, device=dev, dtype=torch.float32)
+    # Per-AI-core workspace: 9 slots × K*V elements (fp32).
+    #   WS_Q [C, K] (q_eff), WS_A [C, K] (A=q*exp(g-b)), WS_B [C, K] (B=k*exp(b-g)),
+    #   WS_V [C, V], WS_S [K, V], WS_QK [C, C], WS_QS, WS_QKV [C, V],
+    #   WS_BOFF [C] (per-token offset b[t]).  fp32 because B=k*exp(b-g_cs) reaches
+    #   ~e^64 (within-token cross-channel spread), which overflows fp16.
+    ws = torch.zeros(bd * 9, K, K, device=dev, dtype=torch.float32)
     cu32 = _ensure_int32(cu_seqlens)
 
     torch.npu.synchronize()

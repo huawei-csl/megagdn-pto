@@ -42,21 +42,41 @@
 //   workspace [per-core scratch]     float32 — 7 slots × K*V floats
 //   O       [B, T, HV, V]            fp32  — output (BSND)
 //
-// NOTE: the workspace (and all three GEMMs) are fp32, not fp16: k_eff =
-//   k*exp(-g_cs) and the unmasked QK = q_eff @ k_eff^T blow up to ~e^64 (per-128
-//   chunk |g_cs|≈64) which overflows fp16 (max 6.5e4) -> inf -> inf*mask=NaN.
-//   fp32 (max 3.4e38) holds them, and the inclusive mask zeroes the upper-tri
-//   cleanly.  q/k/v/S inputs arrive as fp16 from GM and are cast up; O is cast
-//   back to fp16 on write.
+// Aqk on the Cube — per-token exp offset (mirrors kkt_kda.cpp):
+//   The gate is per-DIMENSION, so exp(g_cs[r,d]-g_cs[c,d]) lives inside the sum
+//   over d and cannot be pulled out of a plain matmul.  The naive Cube form
+//   A=q*exp(g_cs), B=k*exp(-g_cs), M=A@B^T computes exp(-g_cs)=exp(+500) on Kimi
+//   gates → inf → 0*inf = NaN.  Fix: pick one scalar per token b[t]=max_d g_cs[t,d]
+//   and factor it out of BOTH legs:
+//       A[r,d] = q[r,d]*exp(g_cs[r,d]-b[r])   (<= q, never overflows)
+//       B[c,d] = k[c,d]*exp(b[c]-g_cs[c,d])   (clamped at exp(80) for safety)
+//       M[r,c] = sum_d A[r,d]*B[c,d]          (= A @ B^T, on the Cube, fp32)
+//       Aqk[r,c] = exp(min(b[r]-b[c],0)) * M[r,c]   for r >= c (inclusive mask)
+//   b cancels exactly in the per-d product; the residual is the post-matmul
+//   scalar correction exp(b[r]-b[c]) (<=1 for kept r>=c, min(.,0) keeps the
+//   masked r<c entries finite before the mask zeroes them → no 0*inf=NaN).
 //
-// Workspace per AI core (7 slots, float32; assumes K == V == HiddenSize):
-//   WS_Q   [C, K]   Vec writes q*exp(g_cs)  → Cube reads (GEMM1 A, GEMM2 A)
-//   WS_K   [C, K]   Vec writes k*exp(-g_cs) → Cube reads (GEMM1 B, transposed)
-//   WS_V   [C, V]   Vec writes V_corr fp16  → Cube reads (GEMM3 B)
-//   WS_S   [K, V]   Vec writes S fp16       → Cube reads (GEMM2 B)
-//   WS_QK  [C, C]   Cube writes QK fp16     → Vec masks → Cube reads (GEMM3 A)
-//   WS_QS  [C, V]   Cube writes QS fp16     → Vec reads (final combine)
-//   WS_QKV [C, V]   Cube writes QKV fp16    → Vec reads (final combine)
+// NOTE: the workspace (and all three GEMMs) are fp32, not fp16: B=k*exp(b-g_cs)
+//   reaches ~e^64 (within-token cross-channel spread) which overflows fp16
+//   (max 6.5e4).  fp32 (max 3.4e38) holds it; q/k/v/S arrive fp16 and are cast
+//   up; O is cast back to fp16 on write.
+//
+// Workspace per AI core (9 slots, float32; assumes K == V == HiddenSize):
+//   WS_Q   [C, K]   Vec writes q_eff=q*exp(g_cs)     → Cube reads (GEMM2 A)
+//   WS_A   [C, K]   Vec writes A=q*exp(g_cs-b)        → Cube reads (GEMM1 A)
+//   WS_B   [C, K]   Vec writes B=k*exp(b-g_cs)        → Cube reads (GEMM1 B, transposed)
+//   WS_V   [C, V]   Vec writes V_corr fp32            → Cube reads (GEMM3 B)
+//   WS_S   [K, V]   Vec writes S fp32                 → Cube reads (GEMM2 B)
+//   WS_QK  [C, C]   Cube writes M → Vec corrects+masks → Aqk → Cube reads (GEMM3 A)
+//   WS_QS  [C, V]   Cube writes QS fp32               → Vec reads (final combine)
+//   WS_QKV [C, V]   Cube writes QKV fp32              → Vec reads (final combine)
+//   WS_BOFF [C]     Vec writes b[t] (phase A)         → Vec reads (phase B)
+//
+// Cross-core FFTS flags (Cube↔Vec, 4-flag round trip; mirrors chunk_o.cpp):
+//   flag 0: Vec→Cube — phase-A workspace ready (A, B, q_eff, S, V, b)
+//   flag 1: Cube→Vec — M (GEMM1) and QS (GEMM2) written back
+//   flag 2: Vec→Cube — Aqk (masked+corrected) ready for GEMM3
+//   flag 3: Cube→Vec — QKV (GEMM3) written back
 // ============================================================================
 
 #include <pto/pto-inst.hpp>
@@ -148,6 +168,15 @@ using TileUbDataND = pto::Tile<pto::TileType::Vec, T, Rows, Cols,
                                pto::BLayout::RowMajor, RowValid, ColValid,
                                pto::SLayout::NoneBox, 512, PadVal>;
 
+// Column-vector ([R,1]) UB tiles must be ColMajor: RowMajor NoneBox needs the
+// column byte-width 32-byte aligned, which width-1 tiles fail.  Used as the
+// per-row offset b[r] source of TROWEXPAND* and the dest of TROWMAX.
+template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
+          int32_t ColValid = Cols>
+using TileUbDataDN = pto::Tile<pto::TileType::Vec, T, Rows, Cols,
+                               pto::BLayout::ColMajor, RowValid, ColValid,
+                               pto::SLayout::NoneBox, 512>;
+
 // Single-shot dense GEMM via L0A/L0B — used when the K-dim is one L0 tile.
 // All three of our GEMMs have inner-dim == 128 == L0 tile size, so a one-shot
 // matmul is sufficient (no K-slicing needed, unlike chunk_h_kda's gemm_v0).
@@ -221,40 +250,59 @@ AICORE void chunk_o_kda_kernel(
   constexpr int32_t KV = K_DIM * V_DIM;
 
   // ── Workspace slots (fp32 elements, per AI core) ─────────────────────────
-  constexpr int32_t WS_Q   = 0;
-  constexpr int32_t WS_K   = WS_Q   + C * K_DIM;
-  constexpr int32_t WS_V   = WS_K   + C * K_DIM;
-  constexpr int32_t WS_S   = WS_V   + C * V_DIM;
-  constexpr int32_t WS_QK  = WS_S   + KV;
-  constexpr int32_t WS_QS  = WS_QK  + C * C;
-  constexpr int32_t WS_QKV = WS_QS  + C * V_DIM;
-  constexpr int32_t WS_PER_CORE = WS_QKV + C * V_DIM;
+  // WS_A / WS_B are the per-token-offset factors of the intra-chunk attention
+  // matrix:  A[r,d] = q[r,d]*exp(g_cs[r,d]-b[r]),  B[c,d] = k[c,d]*exp(b[c]-g_cs[c,d])
+  // with b[t] = max_d g_cs[t,d].  Cube computes M = A @ B^T; Vec then applies
+  // exp(min(b[r]-b[c],0))*mask to recover Aqk.  WS_BOFF ferries b[t] from Vec
+  // phase A to Vec phase B (each vid computes half the rows; exchanged via GM).
+  constexpr int32_t WS_Q    = 0;
+  constexpr int32_t WS_A    = WS_Q    + C * K_DIM;
+  constexpr int32_t WS_B    = WS_A    + C * K_DIM;
+  constexpr int32_t WS_V    = WS_B    + C * K_DIM;
+  constexpr int32_t WS_S    = WS_V    + C * V_DIM;
+  constexpr int32_t WS_QK   = WS_S    + KV;
+  constexpr int32_t WS_QS   = WS_QK   + C * C;
+  constexpr int32_t WS_QKV  = WS_QS   + C * V_DIM;
+  constexpr int32_t WS_BOFF = WS_QKV  + C * V_DIM;   // b[t], only [C] used
+  constexpr int32_t WS_PER_CORE = WS_BOFF + C * V_DIM;
 
 #if defined(__DAV_C220_CUBE__)
-  // ── Cube L1 tiles ────────────────────────────────────────────────────────
-  // L1 layout (fp16, ~160 KB out of 1 MB budget):
-  //   q_l1   @       0  : [C, K]     — input to GEMM1, GEMM2
-  //   k_l1   @  32*1024 : [C, K]     — input to GEMM1 (transposed via TRESHAPE)
-  //   s_l1   @  64*1024 : [K, V]     — input to GEMM2
-  //   qkm_l1 @  96*1024 : [C, C]     — masked Aqk, input to GEMM3
-  //   v_l1   @ 128*1024 : [C, V]     — V_corr, input to GEMM3
+  // ── Cube L1 tiles (fp32, 256 KB high-water) ──────────────────────────────
+  // Step 1 (GEMM1+GEMM2) holds A, B, q_eff, S (4×[C,K] = 256 KB).  Step 2
+  // (GEMM3) runs after the flag1→phaseB→flag2 round trip, so A/B are consumed —
+  // qkm_l1 and v_l1 REUSE the A/B L1 bytes rather than growing the footprint.
+  //   a_l1   @ L1_A   : [C, K]  — GEMM1 A factor  (A = q*exp(g_cs-b))
+  //   b_l1   @ L1_B   : [C, K]  — GEMM1 B factor  (B = k*exp(b-g_cs), transposed)
+  //   q_l1   @ L1_Q   : [C, K]  — GEMM2 A         (q_eff)
+  //   s_l1   @ L1_S   : [K, V]  — GEMM2 B         (S)
+  //   qkm_l1 @ L1_A   : [C, C]  — GEMM3 A         (masked/corrected Aqk)
+  //   v_l1   @ L1_B   : [C, V]  — GEMM3 B         (V_corr)
+  constexpr int32_t L1_A   = 0;
+  constexpr int32_t L1_B   = L1_A + C * K_DIM * static_cast<int32_t>(sizeof(float));
+  constexpr int32_t L1_Q   = L1_B + C * K_DIM * static_cast<int32_t>(sizeof(float));
+  constexpr int32_t L1_S   = L1_Q + C * K_DIM * static_cast<int32_t>(sizeof(float));
+  constexpr int32_t L1_QKM = L1_A;   // step-2 reuse of A's L1
+  constexpr int32_t L1_V   = L1_B;   // step-2 reuse of B's L1
+
+  TileMatL1<float, C, K_DIM, C, K_DIM> a_l1;
+  TASSIGN(a_l1, L1_A);
+  TileMatL1<float, C, K_DIM, C, K_DIM> b_l1;
+  TASSIGN(b_l1, L1_B);
   TileMatL1<float, C, K_DIM, C, K_DIM> q_l1;
-  TASSIGN(q_l1, 0);
-  TileMatL1<float, C, K_DIM, C, K_DIM> k_l1;
-  TASSIGN(k_l1, C * K_DIM * sizeof(float));
+  TASSIGN(q_l1, L1_Q);
   TileMatL1<float, K_DIM, V_DIM, K_DIM, V_DIM> s_l1;
-  TASSIGN(s_l1, (C * K_DIM + C * K_DIM) * sizeof(float));
+  TASSIGN(s_l1, L1_S);
   TileMatL1<float, C, C, C, C> qkm_l1;
-  TASSIGN(qkm_l1, (C * K_DIM + C * K_DIM + KV) * sizeof(float));
+  TASSIGN(qkm_l1, L1_QKM);
   TileMatL1<float, C, V_DIM, C, V_DIM> v_l1;
-  TASSIGN(v_l1, (C * K_DIM + C * K_DIM + KV + C * C) * sizeof(float));
+  TASSIGN(v_l1, L1_V);
 
   // L0C accumulators (separate physical L0C, not L1).
-  //   qk_l0  @ 0 : [C, C]   — GEMM1 result; stored to GM, then space reused
-  //   qs_l0  @ C*C*4 : [C, V] — GEMM2 result; stored to GM before GEMM3 starts
-  //   qkv_l0 @ 0 : [C, V]   — GEMM3 result (reuses qk_l0's L0C bytes)
-  TileAcc<float, C, C, C, C> qk_l0;
-  TASSIGN(qk_l0, 0);
+  //   m_l0   @ 0     : [C, C]  — GEMM1 result; stored to WS_QK, then space reused
+  //   qs_l0  @ C*C*4 : [C, V]  — GEMM2 result; stored to WS_QS
+  //   qkv_l0 @ 0     : [C, V]  — GEMM3 result (reuses m_l0's L0C bytes)
+  TileAcc<float, C, C, C, C> m_l0;
+  TASSIGN(m_l0, 0);
   TileAcc<float, C, V_DIM, C, V_DIM> qs_l0;
   TASSIGN(qs_l0, C * C * sizeof(float));
   TileAcc<float, C, V_DIM, C, V_DIM> qkv_l0;
@@ -265,22 +313,18 @@ AICORE void chunk_o_kda_kernel(
   // ── Vec UB plan (192 KB budget) ──────────────────────────────────────────
   // Persistent (across entire kernel run):
   //   MASK_UB [HalfC, C] fp32 — loaded once, used in every chunk's Phase B.
-  // Phase A (input load + scale + cast):
-  //   Buffers Q_UB, K_UB, G_UB, EXP_UB, V_UB, S_UB, *H_UB (fp16) live with
-  //   careful reuse so peak ≤ ~144 KB.
-  // Phase B (mask): QK_UB fp32 + QKH_UB fp16 reuse Phase A addresses.
-  // Phase C (combine): QSH/QKVH fp16 + QS/QKV fp32 + final O fp32, all reuse.
+  // Four 32 KB slots (A/B/C/D) reused across phases; BCOL is a tiny tail tile.
+  //   Phase A: SLOT_A=g_cs, SLOT_B=q→A factor, SLOT_C=exp/q_eff→k→B factor,
+  //            SLOT_D=fp16 staging + exp temp, BCOL=b[r] (ColMajor).
+  //   Phase B: SLOT_A=M→Aqk, SLOT_B=corr, SLOT_C=full b[0..C-1] row (+ b[r] view).
+  //   Phase C: SLOT_A=QS, SLOT_B=QKV, SLOT_D=fp16 O.
   constexpr int32_t MASK_UB_ADDR = 0;
   constexpr int32_t SLOT_A_ADDR  = MASK_UB_ADDR + HalfC * C * sizeof(float);
   constexpr int32_t SLOT_B_ADDR  = SLOT_A_ADDR  + HalfC * K_DIM * sizeof(float);
   constexpr int32_t SLOT_C_ADDR  = SLOT_B_ADDR  + HalfC * K_DIM * sizeof(float);
   constexpr int32_t SLOT_D_ADDR  = SLOT_C_ADDR  + HalfC * K_DIM * sizeof(float);
-  // Aliases for clarity (all addresses overlap by phase; lifetimes never collide):
-  // Phase A:
-  //   SLOT_A: G_UB → V_UB → QSH_UB(fp16, lower-half) / QS_UB(fp32)
-  //   SLOT_B: Q_UB / K_UB → QKVH_UB(fp16) / QKV_UB(fp32)
-  //   SLOT_C: EXP_UB (scratch for exp(g) and exp(-g)) → QK_UB(fp32 mask) → O_UB
-  //   SLOT_D: *H_UB (fp16 cast destination) → QKH_UB(fp16)
+  constexpr int32_t BCOL_ADDR    = SLOT_D_ADDR  + HalfC * K_DIM * sizeof(float);  // [HalfC,1] fp32
+  constexpr int32_t BROW_ADDR    = SLOT_C_ADDR;  // Phase B: full b[0..C-1] ([1,C] fp32)
 #endif
 
   int64_t num_seqs = batch_size;
@@ -309,50 +353,66 @@ AICORE void chunk_o_kda_kernel(
     int64_t ws_base = static_cast<int64_t>(cid) * WS_PER_CORE;
 
     for (int32_t ci = 0; ci < num_chunks; ++ci) {
-      // ── Wait Vec phase A: q_eff, Aqk(masked), V_corr, S all in workspace ─
+      // ── STEP 1: wait Vec phase A (A, B, q_eff, S in workspace) ──────────
       wait_flag_dev(0);
 
-      // Load q_eff [C, K] from WS_Q.
+      // Load A [C, K] from WS_A → a_l1  (GEMM1 A factor).
+      {
+        GmShape2D a_shape(C, K_DIM);
+        GmStride2D a_stride(K_DIM);
+        GmTensor2D<float> a_global(workspace_handle + ws_base + WS_A,
+                                   a_shape, a_stride);
+        DynMatL1<float, C, K_DIM> a_l1_load(C, K_DIM);
+        TASSIGN(a_l1_load, L1_A);
+        TLOAD(a_l1_load, a_global);
+      }
+      // Load B [C, K] from WS_B → b_l1  (GEMM1 B factor, transposed in GEMM1).
+      {
+        GmShape2D b_shape(C, K_DIM);
+        GmStride2D b_stride(K_DIM);
+        GmTensor2D<float> b_global(workspace_handle + ws_base + WS_B,
+                                   b_shape, b_stride);
+        DynMatL1<float, C, K_DIM> b_l1_load(C, K_DIM);
+        TASSIGN(b_l1_load, L1_B);
+        TLOAD(b_l1_load, b_global);
+      }
+      // Load q_eff [C, K] from WS_Q → q_l1  (GEMM2 A).
       {
         GmShape2D q_shape(C, K_DIM);
         GmStride2D q_stride(K_DIM);
         GmTensor2D<float> q_global(workspace_handle + ws_base + WS_Q,
                                   q_shape, q_stride);
         DynMatL1<float, C, K_DIM> q_l1_load(C, K_DIM);
-        TASSIGN(q_l1_load, 0);
+        TASSIGN(q_l1_load, L1_Q);
         TLOAD(q_l1_load, q_global);
       }
-      // Load S [K, V] from WS_S.
+      // Load S [K, V] from WS_S → s_l1  (GEMM2 B).
       {
         GmShape2D s_shape(K_DIM, V_DIM);
         GmStride2D s_stride(V_DIM);
         GmTensor2D<float> s_global(workspace_handle + ws_base + WS_S,
                                   s_shape, s_stride);
         DynMatL1<float, K_DIM, V_DIM> s_l1_load(K_DIM, V_DIM);
-        TASSIGN(s_l1_load, (C * K_DIM + C * K_DIM) * sizeof(float));
+        TASSIGN(s_l1_load, L1_S);
         TLOAD(s_l1_load, s_global);
       }
-      // Load V_corr [C, V] from WS_V.
+
+      set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+      wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+
+      // GEMM1: M = A @ B^T — [C, K] @ [K, C] → [C, C]  (intra-chunk attn, raw).
+      gemm_oneshot<float, float, C, C, K_DIM, /*transpose_B=*/true>(
+          a_l1, b_l1, m_l0);
+
+      // Store M fp32 → WS_QK (Vec phase B corrects + masks it into Aqk).
       {
-        GmShape2D v_shape(C, V_DIM);
-        GmStride2D v_stride(V_DIM);
-        GmTensor2D<float> v_global(workspace_handle + ws_base + WS_V,
-                                  v_shape, v_stride);
-        DynMatL1<float, C, V_DIM> v_l1_load(C, V_DIM);
-        TASSIGN(v_l1_load,
-                (C * K_DIM + C * K_DIM + KV + C * C) * sizeof(float));
-        TLOAD(v_l1_load, v_global);
-      }
-      // Load Aqk (already masked, inclusive lower) [C, C] from WS_QK.
-      {
-        GmShape2D qkm_shape(C, C);
-        GmStride2D qkm_stride(C);
-        GmTensor2D<float> qkm_global(workspace_handle + ws_base + WS_QK,
-                                    qkm_shape, qkm_stride);
-        DynMatL1<float, C, C> qkm_l1_load(C, C);
-        TASSIGN(qkm_l1_load,
-                (C * K_DIM + C * K_DIM + KV) * sizeof(float));
-        TLOAD(qkm_l1_load, qkm_global);
+        GmShape2D m_shape(C, C);
+        GmStride2D m_stride(C);
+        GmTensor2D<float> m_global(workspace_handle + ws_base + WS_QK,
+                                   m_shape, m_stride);
+        TileAcc<float, C, C, C, C> m_store;
+        TASSIGN(m_store, 0);
+        TSTORE(m_global, m_store);
       }
 
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
@@ -373,10 +433,38 @@ AICORE void chunk_o_kda_kernel(
         TSTORE(qs_global, qs_store);
       }
 
+      // Signal Vec: M (GEMM1) and QS (GEMM2) written back (flag 1).
+      pipe_barrier(PIPE_ALL);
+      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (1 << 8));
+
+      // ── STEP 2: wait Vec phase B (Aqk masked+corrected in WS_QK) ────────
+      wait_flag_dev(2);
+
+      // Load Aqk [C, C] from WS_QK → qkm_l1  (GEMM3 A).
+      {
+        GmShape2D qkm_shape(C, C);
+        GmStride2D qkm_stride(C);
+        GmTensor2D<float> qkm_global(workspace_handle + ws_base + WS_QK,
+                                    qkm_shape, qkm_stride);
+        DynMatL1<float, C, C> qkm_l1_load(C, C);
+        TASSIGN(qkm_l1_load, L1_QKM);
+        TLOAD(qkm_l1_load, qkm_global);
+      }
+      // Load V_corr [C, V] from WS_V → v_l1  (GEMM3 B).
+      {
+        GmShape2D v_shape(C, V_DIM);
+        GmStride2D v_stride(V_DIM);
+        GmTensor2D<float> v_global(workspace_handle + ws_base + WS_V,
+                                  v_shape, v_stride);
+        DynMatL1<float, C, V_DIM> v_l1_load(C, V_DIM);
+        TASSIGN(v_l1_load, L1_V);
+        TLOAD(v_l1_load, v_global);
+      }
+
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
 
-      // GEMM3: QKV = Aqk_masked @ V_corr — [C, C] @ [C, V] → [C, V].
+      // GEMM3: QKV = Aqk @ V_corr — [C, C] @ [C, V] → [C, V].
       gemm_oneshot<float, float, C, V_DIM, C, /*transpose_B=*/false>(
           qkm_l1, v_l1, qkv_l0);
 
@@ -390,7 +478,10 @@ AICORE void chunk_o_kda_kernel(
         TASSIGN(qkv_store, 0);
         TSTORE(qkv_global, qkv_store);
       }
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (1 << 8));
+
+      // Signal Vec: QKV (GEMM3) written back (flag 3).
+      pipe_barrier(PIPE_ALL);
+      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (3 << 8));
     }
   }
 
@@ -524,7 +615,7 @@ AICORE void chunk_o_kda_kernel(
       TEXP(exp_ub, g_ub);
       pipe_barrier(PIPE_V);
       // q_eff into exp_ub (SLOT_C) so q_ub (SLOT_B) keeps the raw scaled Q,
-      // which the Aqk element-wise pass below needs as its row factor.
+      // which the A = q*exp(g_cs-b) factor below needs as its row factor.
       TMUL(exp_ub, q_ub, exp_ub);
       pipe_barrier(PIPE_V);
 
@@ -543,102 +634,131 @@ AICORE void chunk_o_kda_kernel(
         TSTORE(q_global, q_store);
       }
 
-      // ── (A.3) Aqk matrix (stable, element-wise) → WS_QK (masked) ─────
-      // Aqk[my_off+r, c] = mask * sum_d q[r,d]*k[c,d]*exp(min(g_cs[r,d]-g_cs[c,d],0))
-      // with inclusive mask (my_off+r >= c).  exp(min(.,0)) <= 1 — never the
-      // overflowing exp(g_cs)*exp(-g_cs).  q_ub still holds the raw scaled Q.
+      // ── (A.3) Per-token offset factors A, B, b for the Cube GEMM1 ────
+      // b[r] = max_d g_cs[r,d];  A = q*exp(g_cs-b) (<=q);  B = k*exp(b-g_cs)
+      // (exponent clamped at 80).  Cube forms M = A@B^T; Vec phase B applies
+      // exp(min(b_r-b_c,0))*mask to recover Aqk.  q_ub (SLOT_B) still holds the
+      // raw scaled Q → becomes A in place; k_ub (SLOT_C) → becomes B in place.
       pipe_barrier(PIPE_ALL);  // drain the q_eff store (read SLOT_C) before reuse
       {
-        constexpr int32_t AQK_GC  = SLOT_D_ADDR + HalfC * K_DIM * 4;  // [1,K] fp32
-        constexpr int32_t AQK_KC  = AQK_GC + K_DIM * 4;               // [1,K] fp32
-        constexpr int32_t AQK_KCH = AQK_KC + K_DIM * 4;               // [1,K] fp16
-        constexpr int32_t AQK_COL = AQK_KCH + K_DIM * 2;              // [HalfC,16] fp32
-        constexpr int32_t AQK_MSK = AQK_COL + HalfC * 16 * 4;         // [HalfC,16] fp32
+        TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> k_ub;
+        TASSIGN(k_ub, SLOT_C_ADDR);
 
-        // Zero my rows of WS_QK first so columns [valid, C) (multiplied by the
-        // zero-padded v_corr in GEMM3) are finite, not stale garbage.
-        {
-          TileUbDataND<float, HalfC, C, HalfC, C> zero_ub;
-          TASSIGN(zero_ub, SLOT_C_ADDR);
-          TEXPANDS(zero_ub, 0.0f);
-          pipe_barrier(PIPE_V);
-          set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-          wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-          GmShape2D z_shape(HalfC, C);
-          GmStride2D z_stride(C);
-          GmTensor2D<float> z_global(
-              workspace_handle + ws_base + WS_QK +
-                  static_cast<int64_t>(my_row_offset) * C,
-              z_shape, z_stride);
-          DynVecTile<float, HalfC, C> z_store(HalfC, C);
-          TASSIGN(z_store, SLOT_C_ADDR);
-          TSTORE(z_global, z_store);
-          set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-          wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-        }
-
-        for (int32_t c = 0; c < static_cast<int32_t>(valid); ++c) {
-          int64_t col_base = static_cast<int64_t>(head) * total_tokens * K_DIM +
-                             (chunk_start + static_cast<int64_t>(c)) * K_DIM;
+        // Load K (head-major fp16) → SLOT_D staging → cvt fp32 → k_ub (SLOT_C).
+        if (valid_rows > 0) {
           {
-            GmShape2D cs(1, K_DIM); GmStride2D cst(K_DIM);
-            GmTensor2D<float> gc_gm(G_handle + col_base, cs, cst);
-            TileUbDataND<float, 1, K_DIM, 1, K_DIM> gc_ld; TASSIGN(gc_ld, AQK_GC);
-            TLOAD(gc_ld, gc_gm);
-            GmTensor2D<half> kc_gm(K_handle + col_base, cs, cst);
-            TileUbDataND<half, 1, K_DIM, 1, K_DIM> kc_ld; TASSIGN(kc_ld, AQK_KCH);
-            TLOAD(kc_ld, kc_gm);
+            GmShape2D k_shape(valid_rows, K_DIM);
+            GmStride2D k_stride(HM_STRIDE);
+            GmTensor2D<half> k_global(K_handle + hk_base, k_shape, k_stride);
+            TileUbDataND<half, HalfC, K_DIM, HalfC, K_DIM,
+                         pto::PadValue::Zero> k_stg_full;
+            TASSIGN(k_stg_full, SLOT_D_ADDR);
+            DynVecTile<half, HalfC, K_DIM, pto::PadValue::Zero> k_load(
+                valid_rows, K_DIM);
+            TASSIGN(k_load, SLOT_D_ADDR);
+            TLOAD(k_load, k_global);
+            if (valid_rows != HalfC) {
+              TFILLPAD_INPLACE(k_stg_full, k_load);
+            }
           }
           set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
           wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
           {
-            TileUbDataND<half, 1, K_DIM, 1, K_DIM> kc_h; TASSIGN(kc_h, AQK_KCH);
-            TileUbDataND<float, 1, K_DIM, 1, K_DIM> kc_f; TASSIGN(kc_f, AQK_KC);
-            TCVT(kc_f, kc_h, pto::RoundMode::CAST_NONE);
+            TileUbDataND<half, HalfC, K_DIM, HalfC, K_DIM> k_stg_cvt;
+            TASSIGN(k_stg_cvt, SLOT_D_ADDR);
+            TCVT(k_ub, k_stg_cvt, pto::RoundMode::CAST_NONE);
             pipe_barrier(PIPE_V);
           }
-          TileUbDataND<float, 1, K_DIM, 1, K_DIM> gc; TASSIGN(gc, AQK_GC);
-          TileUbDataND<float, 1, K_DIM, 1, K_DIM> kc; TASSIGN(kc, AQK_KC);
-          TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> diff; TASSIGN(diff, SLOT_C_ADDR);
-          TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> tmp;  TASSIGN(tmp, SLOT_D_ADDR);
-          TileUbDataND<float, HalfC, 16, HalfC, 1> colsum; TASSIGN(colsum, AQK_COL);
-
-          TCOLEXPANDSUB(diff, g_ub, gc);  pipe_barrier(PIPE_V);   // g_cs[r]-g_cs[c]
-          TMINS(diff, diff, 0.0f);        pipe_barrier(PIPE_V);   // <= 0
-          TEXP(diff, diff);               pipe_barrier(PIPE_V);
-          TCOLEXPANDMUL(diff, diff, kc);  pipe_barrier(PIPE_V);   // * k[c]
-          TMUL(diff, diff, q_ub);         pipe_barrier(PIPE_V);   // * q[r] (raw scaled Q)
-          TROWSUM(colsum, diff, tmp);     pipe_barrier(PIPE_V);
-          {  // inclusive mask: zero rows (my_off+r) < c
-            TileUbDataND<float, HalfC, 16, HalfC, 1> mk; TASSIGN(mk, AQK_MSK);
-            GmShape2D ms(HalfC, 1); GmStride2D mst(C);
-            GmTensor2D<float> mk_gm(
-                Mask_handle + static_cast<int64_t>(my_row_offset) * C + c, ms, mst);
-            TLOAD(mk, mk_gm);
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            TMUL(colsum, colsum, mk);  pipe_barrier(PIPE_V);
-          }
-          set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-          wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-          {  // store column c of Aqk (fp32) → WS_QK[my_off.., c], row stride C
-            GmShape2D qs2(HalfC, 1); GmStride2D qst2(C);
-            GmTensor2D<float> qk_col(
-                workspace_handle + ws_base + WS_QK +
-                    static_cast<int64_t>(my_row_offset) * C + c, qs2, qst2);
-            TileUbDataND<float, HalfC, 16, HalfC, 1> col_st; TASSIGN(col_st, AQK_COL);
-            TSTORE(qk_col, col_st);
-          }
-          set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-          wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-          pipe_barrier(PIPE_ALL);
+        } else {
+          TEXPANDS(k_ub, 0.0f);  // pad rows: g/q already zero (A.1 else branch)
+          pipe_barrier(PIPE_V);
         }
+
+        // b[r] = rowmax_d g_cs   (ColMajor [HalfC,1]; SLOT_D as the reduce tmp).
+        TileUbDataDN<float, HalfC, 1> bcol;
+        TASSIGN(bcol, BCOL_ADDR);
+        {
+          TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> rmax_tmp;
+          TASSIGN(rmax_tmp, SLOT_D_ADDR);
+          TROWMAX(bcol, g_ub, rmax_tmp);
+          pipe_barrier(PIPE_V);
+        }
+
+        // A = q * exp(g_cs - b)   (exp(g-b) <= 1, bounded) → q_ub (SLOT_B).
+        {
+          TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> ex;
+          TASSIGN(ex, SLOT_D_ADDR);
+          TROWEXPANDEXPDIF(ex, g_ub, bcol);  // exp(g_cs - b)
+          pipe_barrier(PIPE_V);
+          TMUL(q_ub, q_ub, ex);              // A = q * exp(g_cs - b)
+          pipe_barrier(PIPE_V);
+        }
+
+        // B = k * exp(b - g_cs), exponent saturated at 80 → k_ub (SLOT_C).
+        {
+          TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> ex;
+          TASSIGN(ex, SLOT_D_ADDR);
+          TROWEXPANDSUB(ex, g_ub, bcol);  // g_cs - b   (<= 0)
+          pipe_barrier(PIPE_V);
+          TNEG(ex, ex);                   // b - g_cs   (>= 0)
+          pipe_barrier(PIPE_V);
+          TMINS(ex, ex, 80.0f);           // saturating exp
+          pipe_barrier(PIPE_V);
+          TEXP(ex, ex);
+          pipe_barrier(PIPE_V);
+          TMUL(k_ub, k_ub, ex);           // B = k * exp(b - g_cs)
+          pipe_barrier(PIPE_V);
+        }
+
+        // Store A (SLOT_B) → WS_A[my rows], B (SLOT_C) → WS_B[my rows].
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        {
+          GmShape2D a_shape(HalfC, K_DIM);
+          GmStride2D a_stride(K_DIM);
+          GmTensor2D<float> a_global(
+              workspace_handle + ws_base + WS_A +
+                  static_cast<int64_t>(vid) * HalfC * K_DIM,
+              a_shape, a_stride);
+          DynVecTile<float, HalfC, K_DIM> a_store(HalfC, K_DIM);
+          TASSIGN(a_store, SLOT_B_ADDR);
+          TSTORE(a_global, a_store);
+        }
+        {
+          GmShape2D b_shape(HalfC, K_DIM);
+          GmStride2D b_stride(K_DIM);
+          GmTensor2D<float> b_global(
+              workspace_handle + ws_base + WS_B +
+                  static_cast<int64_t>(vid) * HalfC * K_DIM,
+              b_shape, b_stride);
+          DynVecTile<float, HalfC, K_DIM> b_store(HalfC, K_DIM);
+          TASSIGN(b_store, SLOT_C_ADDR);
+          TSTORE(b_global, b_store);
+        }
+        // Store b[my rows] → WS_BOFF.  bcol is ColMajor [my_rows,1] but its bytes
+        // are my_rows contiguous floats == RowMajor [1,my_rows]; alias & store as
+        // a row (ND2ND).  Invalid (pad) tokens' b is left stale but harmless: their
+        // A,B are zero so M's columns are zero, and corr is bounded (<=1).
+        if (valid_rows > 0) {
+          GmShape2D bo_shape(1, valid_rows);
+          GmStride2D bo_stride(valid_rows);
+          GmTensor2D<float> bo_global(
+              workspace_handle + ws_base + WS_BOFF +
+                  static_cast<int64_t>(my_row_offset),
+              bo_shape, bo_stride);
+          DynVecTile<float, 1, HalfC> bo_store(1, valid_rows);
+          TASSIGN(bo_store, BCOL_ADDR);
+          TSTORE(bo_global, bo_store);
+        }
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        pipe_barrier(PIPE_ALL);
       }
 
       // ── (A.4) Load V_corr fp16 (BSND), store to WS_V ────────────────
-      // WAR on SLOT_D: the V staging TLOAD (MTE2) must wait for the WS_K
-      // store (MTE3) that just read SLOT_D.  MTE3→V also covers the
-      // valid_rows==0 branch, which writes SLOT_D via the V pipe.
+      // WAR on SLOT_D: the V staging TLOAD (MTE2) must wait for the phase-A.3
+      // stores (MTE3) that read SLOT_B/C and the SLOT_D exp temp.  MTE3→V also
+      // covers the valid_rows==0 branch, which writes SLOT_D via the V pipe.
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
@@ -726,15 +846,101 @@ AICORE void chunk_o_kda_kernel(
         TSTORE(sw_global, s_store);
       }
 
-      // ── (A.6) Signal Cube: phase A workspace ready ───────────────────
+      // ── (A.6) Signal Cube: phase A workspace ready (flag 0) ──────────
       pipe_barrier(PIPE_ALL);
       ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (0 << 8));
 
       // ====================================================================
-      // PHASE C — wait QS + QKV from Cube; combine O = QS + QKV; write to GM.
-      // (No separate mask phase: Aqk was masked element-wise in phase A.)
+      // PHASE B — wait M (GEMM1) from Cube; correct + mask M → Aqk → WS_QK.
+      //   Aqk[r,c] = exp(min(b[r]-b[c],0)) * M[r,c] * mask[r,c]  (r >= c).
       // ====================================================================
       wait_flag_dev(1);
+      pipe_barrier(PIPE_ALL);
+
+      if (valid_rows > 0) {
+        // Load M[my rows, :] fp32 from WS_QK → SLOT_A.
+        {
+          GmShape2D m_shape(HalfC, C);
+          GmStride2D m_stride(C);
+          GmTensor2D<float> m_global(
+              workspace_handle + ws_base + WS_QK +
+                  static_cast<int64_t>(my_row_offset) * C,
+              m_shape, m_stride);
+          DynVecTile<float, HalfC, C> m_load(HalfC, C);
+          TASSIGN(m_load, SLOT_A_ADDR);
+          TLOAD(m_load, m_global);
+        }
+        // Load full b[0..C-1] fp32 from WS_BOFF → BROW_ADDR ([1,C], ND2ND).
+        {
+          GmShape2D bo_shape(1, C);
+          GmStride2D bo_stride(C);
+          GmTensor2D<float> bo_global(workspace_handle + ws_base + WS_BOFF,
+                                      bo_shape, bo_stride);
+          TileUbDataND<float, 1, C, 1, C> brow_load;
+          TASSIGN(brow_load, BROW_ADDR);
+          TLOAD(brow_load, bo_global);
+        }
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+        TileUbDataND<float, HalfC, C, HalfC, C> m_ub;
+        TASSIGN(m_ub, SLOT_A_ADDR);
+        TileUbDataND<float, HalfC, C, HalfC, C> corr;
+        TASSIGN(corr, SLOT_B_ADDR);
+        TileUbDataND<float, 1, C, 1, C> brow;
+        TASSIGN(brow, BROW_ADDR);
+        // b[my_off + r] sub-range of brow, viewed as a ColMajor [HalfC,1].
+        TileUbDataDN<float, HalfC, 1> bcol;
+        TASSIGN(bcol, BROW_ADDR + static_cast<int32_t>(my_row_offset) * 4);
+        TileUbDataND<float, HalfC, C, HalfC, C> mask_ub;
+        TASSIGN(mask_ub, MASK_UB_ADDR);
+
+        // corr[r,c] = exp(min(b[r] - b[c], 0)).
+        TEXPANDS(corr, 0.0f);
+        pipe_barrier(PIPE_V);
+        TROWEXPANDADD(corr, corr, bcol);  // corr[r,c] = b[r]
+        pipe_barrier(PIPE_V);
+        TCOLEXPANDSUB(corr, corr, brow);  // corr[r,c] = b[r] - b[c]
+        pipe_barrier(PIPE_V);
+        TMINS(corr, corr, 0.0f);
+        pipe_barrier(PIPE_V);
+        TEXP(corr, corr);
+        pipe_barrier(PIPE_V);
+
+        // Aqk = M * corr * mask.
+        TMUL(m_ub, m_ub, corr);
+        pipe_barrier(PIPE_V);
+        TMUL(m_ub, m_ub, mask_ub);
+        pipe_barrier(PIPE_V);
+
+        // Store Aqk fp32 → WS_QK[my rows].
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        {
+          GmShape2D aqk_shape(HalfC, C);
+          GmStride2D aqk_stride(C);
+          GmTensor2D<float> aqk_global(
+              workspace_handle + ws_base + WS_QK +
+                  static_cast<int64_t>(my_row_offset) * C,
+              aqk_shape, aqk_stride);
+          DynVecTile<float, HalfC, C> aqk_store(HalfC, C);
+          TASSIGN(aqk_store, SLOT_A_ADDR);
+          TSTORE(aqk_global, aqk_store);
+        }
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+      }
+
+      // Signal Cube: Aqk ready for GEMM3 (flag 2).  Both vids signal (mode-2
+      // reduce) so the Cube waits for the full [C,C] Aqk.
+      pipe_barrier(PIPE_ALL);
+      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
+
+      // ====================================================================
+      // PHASE C — wait QKV (GEMM3, flag 3); O = QS + QKV → GM.
+      //   QS was produced by the Cube alongside GEMM1 (step 1) and sits in WS_QS.
+      // ====================================================================
+      wait_flag_dev(3);
       pipe_barrier(PIPE_ALL);
 
       if (valid_rows > 0) {
