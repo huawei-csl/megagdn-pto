@@ -82,8 +82,6 @@ def run_kdn_decode(
         out.zero_()
     if scale is None:
         scale = kdim ** -0.5
-    if stream is None:
-        stream = torch.npu.current_stream(q.device)._as_parameter_
     tasks = b * h * ((vdim + v_tile - 1) // v_tile)
     if block_dim is None:
         block_dim = min(BLOCK_DIM, max(1, (tasks + 1) // 2))
@@ -96,6 +94,7 @@ def run_kdn_decode(
     if work_out is not out:
         work_out.zero_()
     lib = load_kdn_decode(kdim, vdim, v_tile)
+    stream = torch.npu.current_stream(q.device)._as_parameter_
     lib.call_kernel(
         ctypes.c_uint32(block_dim), stream, *(_vp(x) for x in work_inputs),
         _vp(initial_state), _vp(work_out), _vp(state_indices),
