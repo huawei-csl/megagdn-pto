@@ -82,9 +82,17 @@ def main():
     ap.add_argument("--tol", type=float, default=1e-5)
     a = ap.parse_args()
 
+    # Build the kernel via megagdn's compile.py if the default .so is absent
+    # (compiled_lib/ is git-ignored, so a fresh checkout has no prebuilt .so).
+    so_path = a.kernel_so
+    if so_path == _DEFAULT_SO and not os.path.exists(so_path):
+        sys.path.insert(0, _REPO)
+        from megagdn_pto.compile import compile_kdn_decode
+        so_path = compile_kdn_decode()
+
     torch.npu.set_device(0)
     stream = ctypes.c_void_p(torch_npu.npu.current_stream().npu_stream)
-    fn = load(a.kernel_so)
+    fn = load(so_path)
 
     HV, K = a.hv, a.k
     V = K

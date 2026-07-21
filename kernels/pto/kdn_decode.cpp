@@ -45,7 +45,22 @@
 //   tile size) and clamped at runtime; all GM extents use the runtime dims.
 // ============================================================================
 
-#include "kernel_common.h"
+// megagdn build convention (mirrors chunk_o_kda.cpp / chunk_cumsum.cpp):
+// direct PTO + ACL + runtime includes, compiled device-side via bisheng -xcce
+// (megagdn_pto/compile.py -> compile_kdn_decode). `runtime/rt_ffts.h` resolves
+// through the toolkit's pkg_inc/runtime include dir.
+#include <pto/pto-inst.hpp>
+#include "acl/acl.h"
+#include <runtime/rt_ffts.h>
+#include <cmath>
+#include <cstdint>
+using namespace pto;
+
+// Under `-xcce` the PTO headers define AICORE = [aicore]; keep a guarded
+// fallback so the translation unit is self-contained.
+#ifndef AICORE
+#define AICORE [aicore]
+#endif
 
 #if defined(__CCE_AICORE__)
 
