@@ -16,7 +16,7 @@ def _vp(tensor: torch.Tensor | None) -> ctypes.c_void_p:
 
 
 @lru_cache(maxsize=None)
-def load_kdn_decode(k_dim: int = 128, v_dim: int = 128, v_tile: int = 32) -> ctypes.CDLL:
+def load_kdn_decode(k_dim: int = 128, v_dim: int = 128, v_tile: int = 64) -> ctypes.CDLL:
     cpp_path = os.path.join(_KERNELS_PTO, "kdn_decode.cpp")
     lib_path = compile_kdn_decode(
         k_dim=k_dim, v_dim=v_dim, v_tile=v_tile,
@@ -35,7 +35,7 @@ def run_kdn_decode(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor,
     beta: torch.Tensor, initial_state: torch.Tensor | None = None, *,
     state_indices: torch.Tensor | None = None, scale: float | None = None,
-    out: torch.Tensor | None = None, stream=None, v_tile: int = 32,
+    out: torch.Tensor | None = None, stream=None, v_tile: int = 64,
     block_dim: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the default ``fused_recurrent_kda`` recurrence.

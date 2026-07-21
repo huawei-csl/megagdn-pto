@@ -197,6 +197,23 @@ def compile_kdn_decode(
 
 
 @lru_cache(maxsize=None)
+def compile_kdn_memcpy_bound(
+    *, k_dim: int = 128, v_dim: int = 128, v_tile: int = 32,
+    cpp_mtime_ns: int = 0,
+) -> str:
+    """Compile the state-sized GM/UB copy bandwidth ceiling kernel."""
+    os.makedirs(_COMPILED_DIR, exist_ok=True)
+    cpp_path = os.path.join(_KERNELS_PTO, "kdn_memcpy_bound.cpp")
+    lib_path = os.path.join(
+        _COMPILED_DIR, f"kdn_memcpy_bound_K{k_dim}_V{v_dim}_BV{v_tile}.so"
+    )
+    flags = _common_flags(hidden_size=k_dim, chunk_size=1)
+    flags.extend((f"-DKDN_V={v_dim}", f"-DKDN_BV={v_tile}"))
+    _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=300)
+    return lib_path
+
+
+@lru_cache(maxsize=None)
 def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
     """Compile the triangular-inverse CubeCore kernel and return the ``.so`` path."""
     os.makedirs(_COMPILED_DIR, exist_ok=True)

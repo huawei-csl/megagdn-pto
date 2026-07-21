@@ -24,17 +24,27 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from megagdn_pto.kdn_decode import run_kdn_decode
+from megagdn_pto.kdn_memcpy_bound import run_kdn_memcpy_bound
 from tests.ref_kda_decode import fused_recurrent_kda
 
 
-def _time_npu(fn, *, warmup: int, iterations: int) -> float:
+def _time_npu(fn, *, warmup: int, iterations: int, cache_flush_mb: int = 0) -> float:
     """Return mean kernel time in milliseconds using device-side events."""
+    flush = None
+    if cache_flush_mb:
+        flush = torch.empty(
+            cache_flush_mb * 1024 * 1024, dtype=torch.int8,
+            device=torch.npu.current_device(),
+        )
     for _ in range(warmup):
         fn()
     torch.npu.synchronize()
     starts = [torch.npu.Event(enable_timing=True) for _ in range(iterations)]
     ends = [torch.npu.Event(enable_timing=True) for _ in range(iterations)]
     for start, end in zip(starts, ends):
+        if flush is not None:
+            flush.zero_()
+            torch.npu.synchronize()
         start.record()
         fn()
         end.record()
@@ -54,7 +64,7 @@ def _plot(results: list[dict], path: Path) -> None:
     fig, ax = plt.subplots(figsize=(9.2, 5.5), constrained_layout=True)
     colors = plt.get_cmap("viridis")
     for index, dim in enumerate(dims):
-        rows = sorted((row for row in results if int(row["dim"]) == dim), key=lambda r: r["work_items"])
+        rows = sorted((row for row in results if int(row["dim"]) == dim), key=lambda r: (r["v_tile"], r["work_items"]))
         color = colors(0.2 + 0.7 * index / max(1, len(dims) - 1))
         ax.plot(
             [row["work_items"] for row in rows],
@@ -75,6 +85,12 @@ def _plot(results: list[dict], path: Path) -> None:
             color=color,
             alpha=0.8,
             label=f"Reference K=V={dim}",
+        )
+        ax.plot(
+            [row["work_items"] for row in rows],
+            [row["gb_per_s_upper"] for row in rows],
+            marker="s", linewidth=1.7, linestyle=":", markersize=5,
+            color=color, alpha=0.9, label=f"GM↔UB ceiling K=V={dim}",
         )
     best = max(results, key=lambda row: row["gb_per_s_pto"])
     ax.scatter(
@@ -100,8 +116,13 @@ def main() -> None:
     parser.add_argument("--batch-list", default="1,8,64,200", help="Comma-separated batch sizes")
     parser.add_argument("--heads-list", default="1,2,4,8,16,32,64", help="Comma-separated head counts")
     parser.add_argument("--dim-list", default="128", help="Comma-separated K=V dimensions")
+    parser.add_argument("--v-tile-list", default="32", help="Comma-separated state tile heights")
     parser.add_argument("--warm", type=int, dest="warmup", default=5)
     parser.add_argument("--its", type=int, dest="iterations", default=20)
+    parser.add_argument(
+        "--cache-flush-mb", type=int, default=256,
+        help="GM scratch written before each timed trial to reduce cache reuse (0 disables)",
+    )
     parser.add_argument("--output-json", type=Path, default=Path("outputs/data/kda_decode_bandwidth.json"))
     parser.add_argument("--plot", type=Path, default=Path("outputs/figure/kda_decode_bandwidth.png"))
     parser.add_argument("--no-plot", action="store_true")
@@ -113,56 +134,77 @@ def main() -> None:
     batches = [int(value) for value in args.batch_list.split(",") if value]
     heads = [int(value) for value in args.heads_list.split(",") if value]
     dims = [int(value) for value in args.dim_list.split(",") if value]
+    v_tiles = [int(value) for value in args.v_tile_list.split(",") if value]
     results: list[dict] = []
 
     print("PTO KDA decode bandwidth benchmark")
-    print(f"device={args.device}  warmup={args.warmup}  iterations={args.iterations}")
+    print(f"device={args.device}  warmup={args.warmup}  iterations={args.iterations} cache_flush={args.cache_flush_mb} MiB")
     print("model: 2 × fp32 state bytes (read + write); vectors/output excluded")
-    print(f"{'B':>4} {'H':>4} {'K=V':>5} {'PTO ms':>10} {'PTO GB/s':>12} {'Ref ms':>10} {'Ref GB/s':>12}")
-    print("-" * 72)
+    print(f"{'B':>4} {'H':>4} {'K=V':>5} {'BV':>4} {'PTO ms':>10} {'PTO GB/s':>12} {'Copy ms':>10} {'Copy GB/s':>12} {'Ref ms':>10} {'Ref GB/s':>12}")
+    print("-" * 102)
 
     for dim in dims:
-        for batch in batches:
-            for head in heads:
-                shape = (batch, 1, head, dim)
-                q = torch.randn(shape, dtype=torch.bfloat16, device=device)
-                k = torch.randn_like(q)
-                v = torch.randn(shape, dtype=torch.bfloat16, device=device)
-                g = torch.randn_like(q)
-                beta = torch.randn((batch, 1, head), dtype=torch.bfloat16, device=device)
-                state = torch.randn((batch, head, dim, dim), dtype=torch.float32, device=device)
+        for v_tile in v_tiles:
+            for batch in batches:
+                for head in heads:
+                    if dim % v_tile:
+                        raise ValueError(f"dim={dim} must be divisible by v_tile={v_tile}")
+                    shape = (batch, 1, head, dim)
+                    q = torch.randn(shape, dtype=torch.bfloat16, device=device)
+                    k = torch.randn_like(q)
+                    v = torch.randn(shape, dtype=torch.bfloat16, device=device)
+                    g = torch.randn_like(q)
+                    beta = torch.randn((batch, 1, head), dtype=torch.bfloat16, device=device)
+                    state = torch.randn((batch, head, dim, dim), dtype=torch.float32, device=device)
 
-                def run() -> None:
-                    run_kdn_decode(q, k, v, g, beta, state, block_dim=None)
+                    def run() -> None:
+                        run_kdn_decode(q, k, v, g, beta, state, v_tile=v_tile, block_dim=None)
 
-                elapsed_pto_ms = _time_npu(run, warmup=args.warmup, iterations=args.iterations)
-
-                def run_reference() -> None:
-                    fused_recurrent_kda(
-                        q, k, v, g, beta, initial_state=state,
-                        output_final_state=True, state_v_first=True,
+                    elapsed_pto_ms = _time_npu(
+                        run, warmup=args.warmup, iterations=args.iterations,
+                        cache_flush_mb=args.cache_flush_mb,
                     )
 
-                elapsed_ref_ms = _time_npu(
-                    run_reference, warmup=args.warmup, iterations=args.iterations
-                )
-                state_bytes = 2 * batch * head * dim * dim * 4
-                pto_gb_per_s = state_bytes / (elapsed_pto_ms * 1.0e6)
-                ref_gb_per_s = state_bytes / (elapsed_ref_ms * 1.0e6)
-                row = {
-                    "batch": batch, "heads": head, "dim": dim,
-                    "work_items": batch * head, "state_bytes": state_bytes,
-                    "elapsed_ms_pto": elapsed_pto_ms, "gb_per_s_pto": pto_gb_per_s,
-                    "elapsed_ms_ref": elapsed_ref_ms, "gb_per_s_ref": ref_gb_per_s,
-                }
-                results.append(row)
-                print(
-                    f"{batch:4d} {head:4d} {dim:5d} {elapsed_pto_ms:10.4f}"
-                    f" {pto_gb_per_s:12.2f} {elapsed_ref_ms:10.4f} {ref_gb_per_s:12.2f}"
-                )
-                del q, k, v, g, beta, state
-                gc.collect()
-                torch.npu.empty_cache()
+                    def run_upper_bound() -> None:
+                        run_kdn_memcpy_bound(state, v_tile=v_tile, block_dim=None)
+                        pass
+
+                    elapsed_upper_ms = _time_npu(
+                        run_upper_bound, warmup=args.warmup, iterations=args.iterations,
+                        cache_flush_mb=args.cache_flush_mb,
+                    )
+
+                    def run_reference() -> None:
+                        fused_recurrent_kda(
+                            q, k, v, g, beta, initial_state=state,
+                            output_final_state=True, state_v_first=True,
+                        )
+
+                    elapsed_ref_ms = 1000
+                    #  _time_npu(
+                    #     run_reference, warmup=args.warmup, iterations=args.iterations,
+                    #     cache_flush_mb=args.cache_flush_mb,
+                    # )
+                    state_bytes = 2 * batch * head * dim * dim * 4
+                    pto_gb_per_s = state_bytes / (elapsed_pto_ms * 1.0e6)
+                    upper_gb_per_s = state_bytes / (elapsed_upper_ms * 1.0e6)
+                    ref_gb_per_s = state_bytes / (elapsed_ref_ms * 1.0e6)
+                    row = {
+                        "batch": batch, "heads": head, "dim": dim, "v_tile": v_tile,
+                        "work_items": batch * head, "state_bytes": state_bytes,
+                        "elapsed_ms_pto": elapsed_pto_ms, "gb_per_s_pto": pto_gb_per_s,
+                        "elapsed_ms_upper": elapsed_upper_ms, "gb_per_s_upper": upper_gb_per_s,
+                        "elapsed_ms_ref": elapsed_ref_ms, "gb_per_s_ref": ref_gb_per_s,
+                    }
+                    results.append(row)
+                    print(
+                        f"{batch:4d} {head:4d} {dim:5d} {v_tile:4d} {elapsed_pto_ms:10.4f}"
+                        f" {pto_gb_per_s:12.2f} {elapsed_upper_ms:10.4f} {upper_gb_per_s:12.2f}"
+                        f" {elapsed_ref_ms:10.4f} {ref_gb_per_s:12.2f}"
+                    )
+                    del q, k, v, g, beta, state
+                    gc.collect()
+                    torch.npu.empty_cache()
 
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps({
@@ -170,6 +212,8 @@ def main() -> None:
         "device": args.device,
         "state_dtype": "fp32",
         "traffic_model": "2 * B * H * V * K * sizeof(fp32)",
+        "cache_flush_mb": args.cache_flush_mb,
+        "cache_flush_note": "scratch GM write before each timed trial; reduces cache reuse but is not a hardware cache invalidation",
         "results": results,
     }, indent=2) + "\n")
     print(f"Saved results: {args.output_json}")
