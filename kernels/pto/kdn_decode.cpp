@@ -60,12 +60,23 @@ AICORE void kdn_decode_kernel(
   const int64_t total = batch_size * static_cast<int64_t>(num_heads) * NumVTiles;
   const bool use_l2norm = l2norm != 0;
 
+  // TROWSUM's scratch is a half-width binary-tree buffer, not a second copy of
+  // the source tile.  For fp32 one repeat spans REPEAT_BYTE/4 == 64 columns and
+  // TRowSumOp::FillTmp writes only floor(srcRptPerRow / 2) repeats per row,
+  // where srcRptPerRow == KDim / 64; TmpProc then halves in place and never
+  // reaches past that.  At KDim == 128 that is a single repeat, so 64 columns
+  // is exact and a full [VTile, KDim] tile wastes half of UB -- which is
+  // precisely what pushes VTile == 128 past the 184 KiB usable window.
+  constexpr int RptCols = 64;  // REPEAT_BYTE(256) / sizeof(float)
+  constexpr int FillRpts = (KDim / RptCols) / 2;
+  constexpr int TmpCols = FillRpts > 1 ? FillRpts * RptCols : RptCols;
+
   // [state, work, reduction scratch, q, k, g, fp16 staging, v, rows, output,
   //  l2norm scratch]
   constexpr int StateAddr = 0;
   constexpr int WorkAddr = StateAddr + VTile * KDim * 4;
   constexpr int TmpAddr = WorkAddr + VTile * KDim * 4;
-  constexpr int QAddr = TmpAddr + VTile * KDim * 4;
+  constexpr int QAddr = TmpAddr + VTile * TmpCols * 4;
   constexpr int KAddr = QAddr + KDim * 4;
   constexpr int GAddr = KAddr + KDim * 4;
   constexpr int QBfAddr = GAddr + KDim * 4;
@@ -174,7 +185,8 @@ AICORE void kdn_decode_kernel(
       UbND<float, 1, VTile, DYNAMIC, DYNAMIC> delta_flat(1, rows);
       UbND<float, 1, VTile, DYNAMIC, DYNAMIC> row_flat(1, rows);
       TRESHAPE(delta_flat, delta);
-      UbND<float, VTile, KDim, DYNAMIC, DYNAMIC> work(rows, KDim), tmp(rows, KDim);
+      UbND<float, VTile, KDim, DYNAMIC, DYNAMIC> work(rows, KDim);
+      UbND<float, VTile, TmpCols, DYNAMIC, DYNAMIC> tmp(rows, TmpCols);
       TASSIGN(work, WorkAddr); TASSIGN(tmp, TmpAddr);
       UbDN<float, VTile, 1, DYNAMIC, DYNAMIC> row(rows, 1);
       TASSIGN(row, RowAddr);
