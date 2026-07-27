@@ -435,6 +435,74 @@ def test_kdn_decode_qk_l2norm() -> None:
         assert (plain_out.float() - actual_out.float()).abs().max().item() > 1e-2
 
 
+def test_kdn_decode_state_indices_dense() -> None:
+    """Shuffled non-contiguous slots over an oversized pool: the real decode path.
+
+    Production callers always gather, so this covers the case at head/batch
+    counts big enough to spread work over all 48 vector workers, with a slot
+    permutation that gives no worker a sequential run of slots.
+    """
+    for batch, heads in ((17, 32), (33, 16)):
+        q, k, v, g, beta = _inputs(batch, 1, heads, 128, seed=1000 + batch)
+        slots = 2 * batch + 3
+        state = torch.randn(slots, heads, 128, 128, device=DEVICE)
+        state_before = state.clone()
+        indices = torch.randperm(slots)[:batch].to(torch.int32).to(DEVICE)
+
+        expected_out, expected_state = _reference(
+            q, k, v, g, beta, state_before, state_indices=indices
+        )
+        actual_out, actual_state = run_kdn_decode(
+            q, k, v, g, beta, state, state_indices=indices
+        )
+        torch.npu.synchronize()
+
+        torch.testing.assert_close(
+            actual_out.float().cpu(), expected_out.float().cpu(),
+            atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL,
+        )
+        # Covers both the visited slots and the pool entries that must not move.
+        torch.testing.assert_close(
+            actual_state.cpu(), expected_state.cpu(),
+            atol=STATE_ATOL, rtol=STATE_RTOL,
+        )
+
+
+def test_kdn_decode_state_out_rejects_indices() -> None:
+    """Out-of-place plus gather would silently leave most slots undefined."""
+    q, k, v, g, beta = _inputs(batch=2, tokens=1, heads=2)
+    state = torch.randn(4, 2, 128, 128, device=DEVICE)
+    indices = torch.tensor([3, 1], dtype=torch.int32, device=DEVICE)
+    try:
+        run_kdn_decode(
+            q, k, v, g, beta, state,
+            state_indices=indices, state_out=torch.empty_like(state),
+        )
+    except ValueError:
+        return
+    raise AssertionError("state_out combined with state_indices must raise")
+
+
+def test_kdn_decode_state_out_of_place() -> None:
+    """``state_out`` reproduces the in-place update and leaves the input alone."""
+    batch, tokens, heads, dim = 3, 2, 4, 128
+    q, k, v, g, beta = _inputs(batch, tokens, heads, dim, seed=11, model_like=True)
+    state = (0.1 * torch.randn(batch, heads, dim, dim)).to(DEVICE)
+
+    inplace_out, inplace_state = run_kdn_decode(q, k, v, g, beta, state.clone())
+    source = state.clone()
+    # Deliberately uninitialized: every slot is visited here, so the kernel owns
+    # all of it and nothing may leak through from the destination buffer.
+    dest = torch.empty_like(source)
+    oop_out, oop_state = run_kdn_decode(q, k, v, g, beta, source, state_out=dest)
+    torch.npu.synchronize()
+
+    assert oop_state.data_ptr() == dest.data_ptr()
+    _assert_exact(oop_out, inplace_out)
+    _assert_exact(oop_state, inplace_state)
+    _assert_exact(source, state)  # the read-only input state is untouched
+
+
 def test_kdn_decode_varlen() -> None:
     """``cu_seqlens`` packs unequal sequences (including empty) onto one axis."""
     lengths = [1, 3, 0, 5, 2]
@@ -507,22 +575,35 @@ def test_kdn_decode() -> None:
             _assert_matches_reference(B, 1, H)
     test_kdn_decode_state_gather_and_skip()
     test_kdn_decode_qk_l2norm()
+    test_kdn_decode_state_indices_dense()
+    test_kdn_decode_state_out_rejects_indices()
+    test_kdn_decode_state_out_of_place()
     test_kdn_decode_varlen()
     test_kdn_decode_varlen_matches_dense()
 
 
 def profile_kdn_decode_once(
-    batch: int, tokens: int, heads: int, dim: int, l2norm: bool = False
+    batch: int, tokens: int, heads: int, dim: int, l2norm: bool = False,
+    indices: bool = False, v_tile: int = 128,
 ) -> None:
     q, k, v, g, beta = _inputs(
         batch, tokens, heads, dim, model_like=True, normalize_qk=not l2norm
     )
+    # Production always gathers, so profile that shape by default: an oversized
+    # pool addressed through a shuffled index vector.
+    slots = 2 * batch + 3 if indices else batch
     initial_state = (
-        0.1 * torch.randn(batch, heads, dim, dim)
+        0.1 * torch.randn(slots, heads, dim, dim)
     ).to(DEVICE)
-    load_kdn_decode(k_dim=dim, v_dim=dim)
+    state_indices = None
+    if indices:
+        state_indices = torch.randperm(slots)[:batch].to(torch.int32).to(DEVICE)
+    load_kdn_decode(k_dim=dim, v_dim=dim, v_tile=v_tile)
     torch.npu.synchronize()
-    run_kdn_decode(q, k, v, g, beta, initial_state, use_qk_l2norm=l2norm)
+    run_kdn_decode(
+        q, k, v, g, beta, initial_state, use_qk_l2norm=l2norm,
+        state_indices=state_indices, v_tile=v_tile,
+    )
     torch.npu.synchronize()
 
 
@@ -542,15 +623,22 @@ if __name__ == "__main__":
         action="store_true",
         help="enable the in-kernel q/k L2 normalization while profiling",
     )
+    parser.add_argument(
+        "--indices",
+        action="store_true",
+        help="gather state through a shuffled state_indices vector (production shape)",
+    )
+    parser.add_argument("--v-tile", type=int, default=128, metavar="BV")
     args = parser.parse_args()
     if args.profile:
         profile_kdn_decode_once(
-            args.batch_size, args.tokens, args.heads, args.dim, args.l2norm
+            args.batch_size, args.tokens, args.heads, args.dim, args.l2norm,
+            args.indices, args.v_tile,
         )
         print(
             "Profile decode complete: "
             f"B={args.batch_size}, T={args.tokens}, H={args.heads}, D={args.dim}, "
-            f"l2norm={args.l2norm}"
+            f"l2norm={args.l2norm}, indices={args.indices}, v_tile={args.v_tile}"
         )
     else:
         test_kdn_decode()

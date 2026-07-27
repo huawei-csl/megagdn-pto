@@ -39,6 +39,7 @@ AICORE void kdn_decode_kernel(
     __gm__ half *q_ptr, __gm__ half *k_ptr,
     __gm__ half *v_ptr, __gm__ half *g_ptr,
     __gm__ half *beta_ptr, __gm__ float *state_ptr,
+    __gm__ float *state_out_ptr,
     __gm__ half *out_ptr, __gm__ int32_t *state_indices,
     __gm__ int32_t *cu_seqlens, int64_t batch_size, int64_t seq_len,
     int32_t num_heads, int32_t num_state_slots, float scale, int32_t l2norm,
@@ -85,10 +86,14 @@ AICORE void kdn_decode_kernel(
   constexpr int VBfAddr = GBfAddr + KDim * 2;
   constexpr int VAddr = VBfAddr + VTile * 2;
   constexpr int RowAddr = VAddr + VTile * 4;
+  // Two out staging halves.  MTE3 is still draining token t-1's store while the
+  // vector pipe casts token t, so a single buffer would need a blocking
+  // MTE3->V fence on every token purely to protect the reuse.
   constexpr int OutBfAddr = RowAddr + VTile * 4;
+  constexpr int OutBfAddr1 = OutBfAddr + VTile * 2;
   // q and k are adjacent fp32 rows, so one [2, KDim] view normalizes both with
   // a single instruction chain instead of two.
-  constexpr int SqAddr = OutBfAddr + VTile * 2;
+  constexpr int SqAddr = OutBfAddr1 + VTile * 2;
   constexpr int NrmTmpAddr = SqAddr + 2 * KDim * 4;
   constexpr int NrmAddr = NrmTmpAddr + 2 * KDim * 4;
   static_assert(KAddr == QAddr + KDim * 4, "q/k must be adjacent for the [2, KDim] l2norm view");
@@ -100,6 +105,14 @@ AICORE void kdn_decode_kernel(
   using BfK = GlobalTensor<half, DynShape, KStride>;
   using BfV = GlobalTensor<half, DynShape, VStride>;
   using F32K = GlobalTensor<float, DynShape, KStride>;
+
+  // `state_out_ptr == nullptr` keeps the historical in-place update; otherwise
+  // the recurrence reads `state_ptr` and writes the caller's buffer.  Only the
+  // slots this kernel actually visits are written, so out-of-place callers own
+  // whatever the untouched slots contain.
+  __gm__ float *state_dst = state_out_ptr == nullptr ? state_ptr : state_out_ptr;
+  // True while an item's state TSTORE is still in flight on EVENT_ID4.
+  bool state_pending = false;
 
   for (int64_t work_id = worker; work_id < total; work_id += workers) {
     const int vt = static_cast<int>(work_id % NumVTiles);
@@ -128,8 +141,17 @@ AICORE void kdn_decode_kernel(
     state_shape.shape[3] = rows;
     state_shape.shape[4] = KDim;
     F32K state_gm(state_ptr + state_off, state_shape);
+    F32K state_out_gm(state_dst + state_off, state_shape);
     UbND<float, VTile, KDim, DYNAMIC, DYNAMIC> state(rows, KDim);
     TASSIGN(state, StateAddr);
+    // The previous item's state store only *reads* this UB tile, so nothing but
+    // the reload has to wait for it.  Fencing MTE3->MTE2 here instead of
+    // draining MTE3->S at the end of the item lets that 32 KiB store overlap
+    // the rest of the work loop.
+    if (state_pending) {
+      wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
+      state_pending = false;
+    }
     TLOAD(state, state_gm);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -153,11 +175,16 @@ AICORE void kdn_decode_kernel(
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
+      // v's cast is independent of q/k/g, so it rides along under the same
+      // barrier instead of paying its own.
       UbND<float, 1, KDim> q, k, decay;
       TASSIGN(q, QAddr); TASSIGN(k, KAddr); TASSIGN(decay, GAddr);
+      UbND<float, 1, VTile, DYNAMIC, DYNAMIC> v_row(1, rows);
+      TASSIGN(v_row, VAddr);
       TCVT(q, q_bf, pto::RoundMode::CAST_NONE);
       TCVT(k, k_bf, pto::RoundMode::CAST_NONE);
       TCVT(decay, g_bf, pto::RoundMode::CAST_NONE);
+      TCVT(v_row, v_bf, pto::RoundMode::CAST_NONE);
       pipe_barrier(PIPE_V);
       if (use_l2norm) {
         UbND<float, 2, KDim> qk, sq, nrm_tmp;
@@ -177,9 +204,6 @@ AICORE void kdn_decode_kernel(
       }
       TMULS(q, q, scale); TEXP(decay, decay); pipe_barrier(PIPE_V);
 
-      UbND<float, 1, VTile, DYNAMIC, DYNAMIC> v_row(1, rows);
-      TASSIGN(v_row, VAddr); TCVT(v_row, v_bf, pto::RoundMode::CAST_NONE);
-      pipe_barrier(PIPE_V);
       UbDN<float, VTile, 1, DYNAMIC, DYNAMIC> delta(rows, 1);
       TRESHAPE(delta, v_row);
       UbND<float, 1, VTile, DYNAMIC, DYNAMIC> delta_flat(1, rows);
@@ -204,27 +228,49 @@ AICORE void kdn_decode_kernel(
       TCOLEXPANDMUL(work, state, q); pipe_barrier(PIPE_V);
       TROWSUM(row, work, tmp); pipe_barrier(PIPE_V);
 
+      // Alternate the staging half so the only thing that must wait for a store
+      // is the token that reuses that half, two tokens later.  The cast itself
+      // needs no barrier ahead of the store: set_flag(V, MTE3) already orders
+      // all prior vector work against MTE3.
       UbND<half, 1, VTile, DYNAMIC, DYNAMIC> out_flat(1, rows);
-      TASSIGN(out_flat, OutBfAddr);
+      if ((t & 1) == 0) {
+        TASSIGN(out_flat, OutBfAddr);
+        if (t >= 2) wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+      } else {
+        TASSIGN(out_flat, OutBfAddr1);
+        if (t >= 2) wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+      }
       TCVT(out_flat, row_flat, pto::RoundMode::CAST_NONE);
-      pipe_barrier(PIPE_V);
       UbND<half, 1, VTile, DYNAMIC, DYNAMIC> out_row(1, rows);
       TRESHAPE(out_row, out_flat);
       BfV out_gm(out_ptr + v_off, vs);
-      set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0); wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+      set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1); wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
       TSTORE(out_gm, out_row);
-      set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0); wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+      if ((t & 1) == 0) set_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+      else              set_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
     }
+    // The last two tokens set a flag nobody waited on; consume them so the
+    // event state is clean for the next work item.
+    if (tokens >= 2) {
+      if (((tokens - 2) & 1) == 0) wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+      else                         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+    }
+    if (((tokens - 1) & 1) == 0) wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+    else                         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0); wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    TSTORE(state_gm, state);
-    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0); wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    TSTORE(state_out_gm, state);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
+    state_pending = true;
   }
+  if (state_pending) wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
 #endif
 }
 
 extern "C" __global__ AICORE void launch_kdn_decode(
     __gm__ uint8_t *q, __gm__ uint8_t *k, __gm__ uint8_t *v,
     __gm__ uint8_t *g, __gm__ uint8_t *beta, __gm__ uint8_t *state,
+    __gm__ uint8_t *state_out,
     __gm__ uint8_t *out, __gm__ uint8_t *indices, __gm__ uint8_t *cu_seqlens,
     int64_t batch, int64_t seq, int32_t heads, int32_t slots, float scale,
     int32_t l2norm, uint64_t ffts) {
@@ -232,6 +278,7 @@ extern "C" __global__ AICORE void launch_kdn_decode(
       reinterpret_cast<__gm__ half *>(q), reinterpret_cast<__gm__ half *>(k),
       reinterpret_cast<__gm__ half *>(v), reinterpret_cast<__gm__ half *>(g),
       reinterpret_cast<__gm__ half *>(beta), reinterpret_cast<__gm__ float *>(state),
+      reinterpret_cast<__gm__ float *>(state_out),
       reinterpret_cast<__gm__ half *>(out), reinterpret_cast<__gm__ int32_t *>(indices),
       reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
       batch, seq, heads, slots, scale, l2norm, ffts);
@@ -239,12 +286,14 @@ extern "C" __global__ AICORE void launch_kdn_decode(
 
 extern "C" void call_kernel(
     uint32_t block_dim, void *stream, uint8_t *q, uint8_t *k, uint8_t *v,
-    uint8_t *g, uint8_t *beta, uint8_t *state, uint8_t *out, uint8_t *indices,
+    uint8_t *g, uint8_t *beta, uint8_t *state, uint8_t *state_out,
+    uint8_t *out, uint8_t *indices,
     uint8_t *cu_seqlens, int64_t batch, int64_t seq, int32_t heads,
     int32_t slots, float scale, int32_t l2norm) {
   uint32_t len{0}; uint64_t addr{0};
   rtGetC2cCtrlAddr(&addr, &len);
   launch_kdn_decode<<<block_dim, nullptr, stream>>>(q, k, v, g, beta, state,
+                                                    state_out,
                                                     out, indices, cu_seqlens,
                                                     batch, seq, heads, slots,
                                                     scale, l2norm, addr);

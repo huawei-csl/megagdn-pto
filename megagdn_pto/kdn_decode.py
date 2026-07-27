@@ -16,7 +16,7 @@ def _vp(tensor: torch.Tensor | None) -> ctypes.c_void_p:
 
 
 @lru_cache(maxsize=None)
-def load_kdn_decode(k_dim: int = 128, v_dim: int = 128, v_tile: int = 64) -> ctypes.CDLL:
+def load_kdn_decode(k_dim: int = 128, v_dim: int = 128, v_tile: int = 128) -> ctypes.CDLL:
     cpp_path = os.path.join(_KERNELS_PTO, "kdn_decode.cpp")
     lib_path = compile_kdn_decode(
         k_dim=k_dim, v_dim=v_dim, v_tile=v_tile,
@@ -24,7 +24,7 @@ def load_kdn_decode(k_dim: int = 128, v_dim: int = 128, v_tile: int = 64) -> cty
     )
     lib = ctypes.CDLL(os.path.abspath(lib_path))
     lib.call_kernel.argtypes = (
-        [ctypes.c_uint32, ctypes.c_void_p] + [ctypes.c_void_p] * 9
+        [ctypes.c_uint32, ctypes.c_void_p] + [ctypes.c_void_p] * 10
         + [ctypes.c_int64, ctypes.c_int64, ctypes.c_int32, ctypes.c_int32,
            ctypes.c_float, ctypes.c_int32]
     )
@@ -36,9 +36,9 @@ def run_kdn_decode(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor,
     beta: torch.Tensor, initial_state: torch.Tensor | None = None, *,
     state_indices: torch.Tensor | None = None, scale: float | None = None,
-    out: torch.Tensor | None = None, stream=None, v_tile: int = 64,
+    out: torch.Tensor | None = None, stream=None, v_tile: int = 128,
     block_dim: int | None = None, cu_seqlens: torch.Tensor | None = None,
-    use_qk_l2norm: bool = False,
+    use_qk_l2norm: bool = False, state_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the default ``fused_recurrent_kda`` recurrence.
 
@@ -49,6 +49,14 @@ def run_kdn_decode(
     requires ``B == 1`` and turns the token axis into ``N`` variable-length
     sequences, one state slot each.  ``use_qk_l2norm`` normalizes q and k over
     K inside the kernel, matching the fused sglang reference.
+
+    ``state_out`` makes the recurrence out of place: the kernel reads
+    ``initial_state`` and writes the final state to ``state_out``, which may be
+    uninitialized.  It is rejected together with ``state_indices`` -- a gathered
+    run only visits the selected slots, so every other slot of ``state_out``
+    would be garbage, and pre-copying the pool to fix that costs far more
+    traffic than the decode itself.  Paged/gathered callers want the default
+    in-place update.
     """
     if q.ndim != 4:
         raise ValueError("q must be [B,T,H,K]")
@@ -86,6 +94,19 @@ def run_kdn_decode(
         raise ValueError("initial_state must be contiguous fp32 [slots,H,V,K]")
     if initial_state.device != q.device:
         raise ValueError("initial_state must share a device with q")
+    if state_out is not None:
+        if state_indices is not None:
+            raise ValueError(
+                "state_out cannot be combined with state_indices: a gathered run only "
+                "writes the selected slots, leaving the rest of state_out undefined"
+            )
+        if (tuple(state_out.shape) != tuple(initial_state.shape)
+                or state_out.dtype != torch.float32
+                or not state_out.is_contiguous()
+                or state_out.device != q.device):
+            raise ValueError(
+                "state_out must match initial_state's shape/dtype/device and be contiguous"
+            )
     if state_indices is None:
         if initial_state.shape[0] < n_seq:
             raise ValueError("initial_state needs one slot per sequence without state_indices")
@@ -117,11 +138,12 @@ def run_kdn_decode(
     stream = torch.npu.current_stream(q.device)._as_parameter_
     lib.call_kernel(
         ctypes.c_uint32(block_dim), stream, *(_vp(x) for x in work_inputs),
-        _vp(initial_state), _vp(work_out), _vp(state_indices), _vp(cu_seqlens),
+        _vp(initial_state), _vp(state_out),
+        _vp(work_out), _vp(state_indices), _vp(cu_seqlens),
         ctypes.c_int64(n_seq), ctypes.c_int64(t), ctypes.c_int32(h),
         ctypes.c_int32(initial_state.shape[0]), ctypes.c_float(scale),
         ctypes.c_int32(1 if use_qk_l2norm else 0),
     )
     if work_out is not out:
         out.copy_(work_out)
-    return out, initial_state
+    return out, initial_state if state_out is None else state_out
