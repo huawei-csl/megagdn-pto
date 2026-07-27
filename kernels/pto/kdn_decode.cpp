@@ -1,6 +1,12 @@
 // Vector-only recurrent KDA/KDN decode kernel.
 // The launcher accepts model bf16 and converts it once to the fp16 wire format
 // required by C220 vector TCVT. State is fp32 in [slot, head, V, K] layout.
+//
+// Token addressing follows the fused sglang reference: without `cu_seqlens`
+// each batch entry owns a contiguous run of `seq_len` tokens, with it every
+// sequence's tokens are flattened onto one B=1 axis and sequence `n` spans
+// [cu_seqlens[n], cu_seqlens[n + 1]).  `l2norm` enables the reference's
+// in-kernel normalization q /= sqrt(sum(q*q)) + 1e-6 (likewise for k).
 
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
@@ -34,8 +40,9 @@ AICORE void kdn_decode_kernel(
     __gm__ half *v_ptr, __gm__ half *g_ptr,
     __gm__ half *beta_ptr, __gm__ float *state_ptr,
     __gm__ half *out_ptr, __gm__ int32_t *state_indices,
-    int64_t batch_size, int64_t seq_len, int32_t num_heads,
-    int32_t num_state_slots, float scale, uint64_t ffts_addr) {
+    __gm__ int32_t *cu_seqlens, int64_t batch_size, int64_t seq_len,
+    int32_t num_heads, int32_t num_state_slots, float scale, int32_t l2norm,
+    uint64_t ffts_addr) {
   const int32_t cid = get_block_idx();
   const int32_t block_num = get_block_num();
   const int32_t vid = get_subblockid();
@@ -51,8 +58,10 @@ AICORE void kdn_decode_kernel(
   const int worker = cid * 2 + vid;
   const int workers = block_num * 2;
   const int64_t total = batch_size * static_cast<int64_t>(num_heads) * NumVTiles;
+  const bool use_l2norm = l2norm != 0;
 
-  // [state, work, reduction scratch, q, k, g, fp16 staging, v, rows, output]
+  // [state, work, reduction scratch, q, k, g, fp16 staging, v, rows, output,
+  //  l2norm scratch]
   constexpr int StateAddr = 0;
   constexpr int WorkAddr = StateAddr + VTile * KDim * 4;
   constexpr int TmpAddr = WorkAddr + VTile * KDim * 4;
@@ -66,6 +75,13 @@ AICORE void kdn_decode_kernel(
   constexpr int VAddr = VBfAddr + VTile * 2;
   constexpr int RowAddr = VAddr + VTile * 4;
   constexpr int OutBfAddr = RowAddr + VTile * 4;
+  // q and k are adjacent fp32 rows, so one [2, KDim] view normalizes both with
+  // a single instruction chain instead of two.
+  constexpr int SqAddr = OutBfAddr + VTile * 2;
+  constexpr int NrmTmpAddr = SqAddr + 2 * KDim * 4;
+  constexpr int NrmAddr = NrmTmpAddr + 2 * KDim * 4;
+  static_assert(KAddr == QAddr + KDim * 4, "q/k must be adjacent for the [2, KDim] l2norm view");
+  static_assert(NrmAddr + 32 <= 184 * 1024, "UB overflow (TMP_UB_OFFSET at 184 KiB)");
 
   using DynShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
   using KStride = Stride<1, 1, 1, KDim, 1>;
@@ -85,6 +101,16 @@ AICORE void kdn_decode_kernel(
                                                : state_indices[batch];
     if (slot < 0 || slot >= num_state_slots) continue;
 
+    int64_t bos, tokens;
+    if (cu_seqlens == nullptr) {
+      bos = batch * seq_len;
+      tokens = seq_len;
+    } else {
+      bos = cu_seqlens[batch];
+      tokens = static_cast<int64_t>(cu_seqlens[batch + 1]) - bos;
+    }
+    if (tokens <= 0) continue;
+
     const int64_t state_off =
         ((static_cast<int64_t>(slot) * num_heads + head) * VDim + v0) * KDim;
     DynShape state_shape;
@@ -97,8 +123,8 @@ AICORE void kdn_decode_kernel(
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-    for (int64_t t = 0; t < seq_len; ++t) {
-      const int64_t token_head = (batch * seq_len + t) * num_heads + head;
+    for (int64_t t = 0; t < tokens; ++t) {
+      const int64_t token_head = (bos + t) * num_heads + head;
       const int64_t k_off = token_head * KDim;
       const int64_t v_off = token_head * VDim + v0;
       DynShape ks;
@@ -122,6 +148,22 @@ AICORE void kdn_decode_kernel(
       TCVT(k, k_bf, pto::RoundMode::CAST_NONE);
       TCVT(decay, g_bf, pto::RoundMode::CAST_NONE);
       pipe_barrier(PIPE_V);
+      if (use_l2norm) {
+        UbND<float, 2, KDim> qk, sq, nrm_tmp;
+        TASSIGN(qk, QAddr); TASSIGN(sq, SqAddr); TASSIGN(nrm_tmp, NrmTmpAddr);
+        // ColMajor tiles need a 32-byte-aligned row count, so allocate 8 rows
+        // and use the two that hold the q and k norms.  Unary math needs the
+        // row-major view of those same two floats.
+        UbDN<float, 8, 1, 2, 1> nrm;
+        TASSIGN(nrm, NrmAddr);
+        UbND<float, 1, 8, 1, 2> nrm_flat;
+        TRESHAPE(nrm_flat, nrm);
+        TMUL(sq, qk, qk); pipe_barrier(PIPE_V);
+        TROWSUM(nrm, sq, nrm_tmp); pipe_barrier(PIPE_V);
+        TSQRT(nrm_flat, nrm_flat); pipe_barrier(PIPE_V);
+        TADDS(nrm_flat, nrm_flat, 1e-6f); pipe_barrier(PIPE_V);
+        TROWEXPANDDIV(qk, qk, nrm); pipe_barrier(PIPE_V);
+      }
       TMULS(q, q, scale); TEXP(decay, decay); pipe_barrier(PIPE_V);
 
       UbND<float, 1, VTile, DYNAMIC, DYNAMIC> v_row(1, rows);
@@ -171,23 +213,27 @@ AICORE void kdn_decode_kernel(
 extern "C" __global__ AICORE void launch_kdn_decode(
     __gm__ uint8_t *q, __gm__ uint8_t *k, __gm__ uint8_t *v,
     __gm__ uint8_t *g, __gm__ uint8_t *beta, __gm__ uint8_t *state,
-    __gm__ uint8_t *out, __gm__ uint8_t *indices, int64_t batch, int64_t seq,
-    int32_t heads, int32_t slots, float scale, uint64_t ffts) {
+    __gm__ uint8_t *out, __gm__ uint8_t *indices, __gm__ uint8_t *cu_seqlens,
+    int64_t batch, int64_t seq, int32_t heads, int32_t slots, float scale,
+    int32_t l2norm, uint64_t ffts) {
   kdn_decode_kernel<GDN_D, KDN_V, KDN_BV>(
       reinterpret_cast<__gm__ half *>(q), reinterpret_cast<__gm__ half *>(k),
       reinterpret_cast<__gm__ half *>(v), reinterpret_cast<__gm__ half *>(g),
       reinterpret_cast<__gm__ half *>(beta), reinterpret_cast<__gm__ float *>(state),
       reinterpret_cast<__gm__ half *>(out), reinterpret_cast<__gm__ int32_t *>(indices),
-      batch, seq, heads, slots, scale, ffts);
+      reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
+      batch, seq, heads, slots, scale, l2norm, ffts);
 }
 
 extern "C" void call_kernel(
     uint32_t block_dim, void *stream, uint8_t *q, uint8_t *k, uint8_t *v,
     uint8_t *g, uint8_t *beta, uint8_t *state, uint8_t *out, uint8_t *indices,
-    int64_t batch, int64_t seq, int32_t heads, int32_t slots, float scale) {
+    uint8_t *cu_seqlens, int64_t batch, int64_t seq, int32_t heads,
+    int32_t slots, float scale, int32_t l2norm) {
   uint32_t len{0}; uint64_t addr{0};
   rtGetC2cCtrlAddr(&addr, &len);
   launch_kdn_decode<<<block_dim, nullptr, stream>>>(q, k, v, g, beta, state,
-                                                    out, indices, batch, seq,
-                                                    heads, slots, scale, addr);
+                                                    out, indices, cu_seqlens,
+                                                    batch, seq, heads, slots,
+                                                    scale, l2norm, addr);
 }
