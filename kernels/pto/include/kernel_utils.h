@@ -46,4 +46,25 @@ AICORE inline T1 CeilDiv(T1 value, T2 divisor) {
   return (value + divisor - 1) / divisor;
 }
 
+/**
+ * @brief Returns the outer matrix layout based on the target architecture and
+ * matrix orientation.
+ *
+ * On DAV C310 targets, the layout depends on whether the matrix is "left-sided"
+ * (L0A). DAV C310: L0A is NZ, L0B is ZN. Older: L0A is ZZ, L0B is ZN.
+ *
+ * Link:
+ * https://pto-isa.github.io/docs/isa/cube/nz-fractal-layout/#per-buffer-nz-layouts
+ *
+ * @param is_left Whether the matrix is on the left side (L0A) or not (L0B).
+ * @return The appropriate @c BLayout for the target architecture.
+ */
+constexpr pto::BLayout GetOuterLayout(bool is_left) {
+#ifdef __DAV_C310__
+  return is_left ? pto::BLayout::ColMajor : pto::BLayout::RowMajor;
+#else
+  return pto::BLayout::RowMajor;
+#endif
+}
+
 }  // namespace kernel_utils
