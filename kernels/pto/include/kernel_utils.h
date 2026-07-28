@@ -59,7 +59,7 @@ AICORE inline T1 CeilDiv(T1 value, T2 divisor) {
  * @param is_left Whether the matrix is on the left side (L0A) or not (L0B).
  * @return The appropriate @c BLayout for the target architecture.
  */
-constexpr pto::BLayout GetOuterLayout(bool is_left) {
+constexpr inline pto::BLayout GetOuterLayout(bool is_left) {
 #ifdef __DAV_C310__
   return is_left ? pto::BLayout::ColMajor : pto::BLayout::RowMajor;
 #else
