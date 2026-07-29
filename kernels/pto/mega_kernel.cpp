@@ -35,7 +35,10 @@
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 #include <type_traits>
+#include "kernel_utils.h"
+
 using namespace pto;
+using namespace kernel_utils;
 
 // ===================================================================
 // Device-only helpers (shared with standard mega-kernel)

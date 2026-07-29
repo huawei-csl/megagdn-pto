@@ -51,7 +51,10 @@
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+#include "kernel_utils.h"
+
 using namespace pto;
+using namespace kernel_utils;
 
 // GDN_C: Compile-time chunk size injected by the build system.
 // Using compile-time constants allows the compiler to optimize tile sizes,
@@ -275,12 +278,12 @@ AICORE void cumsum_kernel(
       TASSIGN(g_row_0, GUbAddr);
       // TMOV(dst, src): Element-wise copy, like dst = src.clone() in UB.
       TMOV(acc_ub, g_row_0);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
 
       UbND<float, 1, HTC> s_row_0;
       TASSIGN(s_row_0, SUbAddr);
       TMOV(s_row_0, acc_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
 
       // Rows 1..valid-1:  acc[h] += g[i,h];  g_sum[i,h] = acc[h]
       for (int32_t i = 1; i < valid; ++i) {
@@ -297,19 +300,19 @@ AICORE void cumsum_kernel(
         UbND<float, 1, HTC> s_row_i;
         TASSIGN(s_row_i, SUbAddr + i * RowBytes);
         TMOV(s_row_i, acc_ub);
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
       }
 
       // Zero-fill rows beyond valid (tail padding for downstream kernels)
       // TEXPANDS(tile, scalar): Fill entire tile with a scalar value.
       // Equivalent to: tile[:] = scalar  (like torch.full_like(tile, scalar))
       TEXPANDS(acc_ub, 0.0f);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       for (int32_t i = valid; i < ChunkSize; ++i) {
         UbND<float, 1, HTC> s_row_i;
         TASSIGN(s_row_i, SUbAddr + i * RowBytes);
         TMOV(s_row_i, acc_ub);
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
       }
 
       // ── DMA: store g_sum from UB → GM (MTE3 pipe) ────────────────────
@@ -381,12 +384,12 @@ AICORE void cumsum_kernel(
           UbND<float, 1, HTC> g_row_0;
           TASSIGN(g_row_0, GUbAddr);
           TMOV(acc_ub, g_row_0);
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
 
           UbND<float, 1, HTC> s_row_0;
           TASSIGN(s_row_0, SUbAddr);
           TMOV(s_row_0, acc_ub);
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
 
           // acc += g[i]; g_sum[i] = acc
           for (int32_t i = 1; i < valid; ++i) {
@@ -400,17 +403,17 @@ AICORE void cumsum_kernel(
             UbND<float, 1, HTC> s_row_i;
             TASSIGN(s_row_i, SUbAddr + i * RowBytes);
             TMOV(s_row_i, acc_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
           }
 
           // Zero-fill padding rows
           TEXPANDS(acc_ub, 0.0f);
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
           for (int32_t i = valid; i < ChunkSize; ++i) {
             UbND<float, 1, HTC> s_row_i;
             TASSIGN(s_row_i, SUbAddr + i * RowBytes);
             TMOV(s_row_i, acc_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
           }
 
           // Store g_sum to GM

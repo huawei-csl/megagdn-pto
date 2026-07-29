@@ -46,4 +46,14 @@ AICORE inline T1 CeilDiv(T1 value, T2 divisor) {
   return (value + divisor - 1) / divisor;
 }
 
+/**
+ * @brief Pipe in-core barrier for vector core that is a no-op for A5.
+ *
+ */
+AICORE inline void PipeBarrierVec() {
+#if __CCE_AICORE__ == 220
+  pipe_barrier(PIPE_V);
+#endif
+}
+
 }  // namespace kernel_utils

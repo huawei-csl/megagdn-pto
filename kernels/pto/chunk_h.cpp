@@ -92,7 +92,10 @@
 #include <type_traits>
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+#include "kernel_utils.h"
+
 using namespace pto;
+using namespace kernel_utils;
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -710,9 +713,9 @@ AICORE void chunk_h_kernel(
       // Torch-like:
       //   coeff = exp(g_last - g_rows_owned_by_this_subblock)
       TADDS(coeff_ub, g_v_ub, -g_last);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TSUB(coeff_ub, zero_ub, coeff_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TEXP(coeff_ub, coeff_ub);
 
       TEXP(g_ub, g_ub);
@@ -728,10 +731,10 @@ AICORE void chunk_h_kernel(
       // Broadcast one decay scalar per token row across the D feature columns:
       //   coeff_2d[row, :] = coeff[row]
       TROWEXPAND(coeff_2d_ub, coeff_col_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       // `k_ub` now holds k_tilde = exp(g_last - g_i) * K_i.
       TMUL(k_ub, k_ub, coeff_2d_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
 
       wait_flag_dev(0);
       {
