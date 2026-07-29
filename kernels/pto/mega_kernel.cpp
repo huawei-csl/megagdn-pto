@@ -35,6 +35,11 @@
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 #include <type_traits>
+// Included here, at global scope, on purpose: the sub-kernels below are
+// #included inside mk_* namespaces, and kernel_utils.h is #pragma once, so
+// pulling it in first keeps ::kernel_utils out of whichever namespace would
+// otherwise have been the first to include it.
+#include "kernel_utils.h"
 using namespace pto;
 
 // ===================================================================

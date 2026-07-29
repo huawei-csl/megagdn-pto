@@ -63,7 +63,11 @@
 #include <type_traits>
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+#include "kernel_utils.h"
 using namespace pto;
+using kernel_utils::SetCrossFlag;
+using kernel_utils::SignalBothVecOnA5;
+using kernel_utils::WaitBothVecOnA5;
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -332,7 +336,15 @@ AICORE void chunk_o_kda_kernel(
 
     for (int32_t ci = grp; ci < num_chunks; ci += static_cast<int32_t>(split)) {
       // ── Wait Vec phase A: q_eff, Aqk(masked), V_corr, S all in workspace ─
+      // A2: Cube and Vec are separate cores → FFTS cross-core flag.
+      // A5: Cube and both Vec sub-blocks share ONE core → intra-block flags,
+      //     with each Vec sub-block signalling its own flag (base, base+16).
+#if __CCE_AICORE__ == 220
       wait_flag_dev(0);
+#else
+      WaitBothVecOnA5<PIPE_MTE2>(0);
+      pipe_barrier(PIPE_ALL);
+#endif
 
       // Load q_eff [C, K] from WS_Q.
       {
@@ -412,7 +424,14 @@ AICORE void chunk_o_kda_kernel(
         TASSIGN(qkv_store, 0);
         TSTORE(qkv_global, qkv_store);
       }
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (1 << 8));
+      // Signal Vec: QS + QKV ready (flag 1)
+      // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (1 << 8));
+#if __CCE_AICORE__ == 220
+      SetCrossFlag<PIPE_FIX>(1);
+#else
+      pipe_barrier(PIPE_ALL);
+      SignalBothVecOnA5<PIPE_FIX>(1);
+#endif
     }
   }
 
@@ -752,13 +771,22 @@ AICORE void chunk_o_kda_kernel(
 
       // ── (A.6) Signal Cube: phase A workspace ready ───────────────────
       pipe_barrier(PIPE_ALL);
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (0 << 8));
+      // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (0 << 8));
+#if __CCE_AICORE__ == 220
+      SetCrossFlag<PIPE_MTE3>(0);
+#else
+      set_intra_block(PIPE_MTE3, 0);
+#endif
 
       // ====================================================================
       // PHASE C — wait QS + QKV from Cube; combine O = QS + QKV; write to GM.
       // (No separate mask phase: Aqk was masked element-wise in phase A.)
       // ====================================================================
+#if __CCE_AICORE__ == 220
       wait_flag_dev(1);
+#else
+      wait_intra_block(PIPE_MTE3, 1);
+#endif
       pipe_barrier(PIPE_ALL);
 
       if (valid_rows > 0) {
