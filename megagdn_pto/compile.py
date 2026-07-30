@@ -15,7 +15,7 @@ Environment variables:
                             ``MEMORY_BASE`` (default) or ``REGISTER_BASE``. Also
                             selects the AI Core arch and SoC version:
                             ``dav-2201``/``Ascend910B4`` for ``MEMORY_BASE``,
-                            ``dav-c310``/``Ascend910_9599`` otherwise.
+                            ``dav-3510``/``Ascend910_9599`` otherwise.
 """
 
 from __future__ import annotations
@@ -79,9 +79,12 @@ if MEMORY_MODEL not in _MEMORY_MODELS:
     )
 
 # The memory-base backend targets dav-2201 (A2/A3); every other backend targets
-# dav-c310 (A5), matching the SOC_VERSION → arch mapping used by the pto-isa tests.
+# dav-3510 (A5), matching the SOC_VERSION → arch mapping used by the pto-isa tests.
+# These are the driver-level ``--npu-arch`` names; bisheng expands them to the
+# AI Core archs pto-isa names directly (dav-c220 / dav-c310), keeping mix mode
+# so both __DAV_*_CUBE__ and __DAV_*_VEC__ are defined.
 _IS_MEMORY_BASE = MEMORY_MODEL == "MEMORY_BASE"
-AICORE_ARCH: str = "dav-2201" if _IS_MEMORY_BASE else "dav-c310"
+AICORE_ARCH: str = "dav-2201" if _IS_MEMORY_BASE else "dav-3510"
 
 # ---------------------------------------------------------------------------
 # Hardware info
@@ -215,8 +218,7 @@ def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
         "-fPIC", "-shared", "-xcce", f"-D{MEMORY_MODEL}", "-O2", "-std=c++17",
         f"-I{_KERNEL_INCLUDE}",
         f"-I{os.path.join(PTO_LIB_PATH, 'include')}",
-        f"--npu-arch=={AICORE_ARCH}",
-        "--cce-soc-core-type=CubeCore",
+        f"--npu-arch={AICORE_ARCH}",
     ]
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=180)
     return lib_path
