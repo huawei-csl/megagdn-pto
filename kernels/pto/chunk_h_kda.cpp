@@ -63,12 +63,12 @@ using namespace pto;
 AICORE inline void sync_all()
 {
     pipe_barrier(PIPE_ALL);
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
     ffts_cross_core_sync(PIPE_FIX, 1 | (0 << 4) | (7 << 8));
     wait_flag_dev(7);
     ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (8 << 8));
     wait_flag_dev(9);
-#elif defined(__DAV_C220_VEC__)
+#elif defined(__DAV_VEC__)
     ffts_cross_core_sync(PIPE_MTE3, 1 | (0 << 4) | (6 << 8));
     wait_flag_dev(6);
     ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (9 << 8));
@@ -353,7 +353,7 @@ AICORE void chunk_h_kda_kernel(
   int64_t num_seqs = batch_size;
   int64_t total_work = num_seqs * H;
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   sync_all();
 
   for (int64_t wi = 0; wi < (total_work + block_num - 1) / block_num; ++wi) {
@@ -473,7 +473,7 @@ AICORE void chunk_h_kda_kernel(
   sync_all();
 #endif
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
 

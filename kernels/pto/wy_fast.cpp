@@ -384,7 +384,7 @@ AICORE void wy_fast_kernel(
     total_work = num_seqs * chunks_per_seq * H;
   }
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
 
@@ -711,7 +711,7 @@ AICORE void wy_fast_kernel(
   }
 #endif
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   // Cube consumes the two Vec-generated workspaces and turns them into the
   // branch outputs U and W.
   if (cu_seqlens == nullptr) {

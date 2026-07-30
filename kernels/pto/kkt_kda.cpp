@@ -93,12 +93,12 @@ using namespace pto;
 AICORE inline void sync_all()
 {
     pipe_barrier(PIPE_ALL);
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
     ffts_cross_core_sync(PIPE_FIX, 1 | (0 << 4) | (7 << 8));
     wait_flag_dev(7);
     ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (8 << 8));
     wait_flag_dev(9);
-#elif defined(__DAV_C220_VEC__)
+#elif defined(__DAV_VEC__)
     ffts_cross_core_sync(PIPE_MTE3, 1 | (0 << 4) | (6 << 8));
     wait_flag_dev(6);
     ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (9 << 8));
@@ -185,14 +185,14 @@ AICORE void kkt_kda_kernel(
     // (innermost stride 1).  Independent of head count, so a compile-time stride.
     using GmFloatMaskColRow = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
     // Cube does no compute here; it only participates in the entry/exit barriers
     // so the Vec-side sync_all() handshakes complete.
     sync_all();
     sync_all();
 #endif
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
     sync_all();
@@ -435,7 +435,7 @@ AICORE void kkt_kda_kernel(
     }
 
     sync_all();
-#endif // __DAV_C220_VEC__
+#endif // __DAV_VEC__
 }
 
 // ── Device entry point ────────────────────────────────────────────────────────

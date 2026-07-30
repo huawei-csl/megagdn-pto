@@ -411,7 +411,7 @@ AICORE void chunk_h_kernel(
   int64_t num_seqs = batch_size;
   int64_t total_work = num_seqs * H;
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   for (int64_t wi = 0; wi < (total_work + block_num - 1) / block_num; ++wi) {
     int64_t pid = wi * block_num + cid;
     if (pid >= total_work) break;
@@ -538,7 +538,7 @@ AICORE void chunk_h_kernel(
     }
   }
 #endif
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
 

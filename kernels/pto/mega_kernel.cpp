@@ -27,9 +27,6 @@
 #ifndef GDN_MAX_HEADS
 #define GDN_MAX_HEADS 64
 #endif
-#ifndef MEMORY_BASE
-#define MEMORY_BASE
-#endif
 
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
@@ -64,12 +61,12 @@ AICORE inline void SyncAllImpl()
         wait_flag_dev(SYNC_AIV_ONLY_ALL);
         return;
     }
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
     wait_flag_dev(SYNC_AIV_FLAG);
     ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
     wait_flag_dev(SYNC_AIC_FLAG);
     ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
-#elif defined(__DAV_C220_VEC__)
+#elif defined(__DAV_VEC__)
     ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
     wait_flag_dev(SYNC_AIC_AIV_FLAG);
 #endif
@@ -79,7 +76,7 @@ template <typename T>
 AICORE void mega_transpose_TH_to_HT(
     __gm__ T *src, __gm__ T *dst, int64_t T_len, int32_t H)
 {
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
     if (get_subblockid() != 0) return;
     set_mask_norm();
     set_vector_mask(-1, -1);
@@ -168,7 +165,7 @@ AICORE void mega_cast_fp32_to_fp16_bsnd(
     __gm__ float *src, __gm__ half *dst,
     uint32_t num_matrices, int64_t total_tokens)
 {
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
     if (get_subblockid() != 0) return;
     set_mask_norm();
     set_vector_mask(-1, -1);
@@ -379,7 +376,7 @@ AICORE inline void mega_kernel_impl(
         batch_size, seq_len, total_tokens, static_cast<uint32_t>(H),
         num_key_heads, ffts_addr);
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
     pipe_barrier(PIPE_ALL);
     wait_flag_dev(2);
     wait_flag_dev(3);
@@ -431,7 +428,7 @@ AICORE inline void mega_kernel_impl(
         batch_size, seq_len, total_tokens, static_cast<uint32_t>(H),
         num_key_heads, ffts_addr);
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
     if (get_block_idx() < num_matrices) {
         pipe_barrier(PIPE_ALL);
         wait_flag_dev(3);
@@ -484,7 +481,7 @@ AICORE inline void mega_kernel_impl(
         batch_size, seq_len, total_tokens, static_cast<uint32_t>(H),
         num_key_heads, ffts_addr);
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
     if (get_block_idx() < num_matrices) {
         pipe_barrier(PIPE_ALL);
         wait_flag_dev(3);

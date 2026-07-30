@@ -282,7 +282,7 @@ AICORE void chunk_o_kernel(
 // performs the heavy matmuls, then writes results to GM workspace for
 // the Vec engine to apply gating and produce the final output.
 // =====================================================================
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   if (cu_seqlens == nullptr) {
     // ── Fixed-length sequence path ──────────────────────────────────────
     int64_t chunks_per_seq = (seq_len + ChunkSize - 1) / ChunkSize;
@@ -730,7 +730,7 @@ AICORE void chunk_o_kernel(
 //   3. Scales the Cube's QS result by exp(g)
 //   4. Combines QKV + scaled QS → final output O
 // =====================================================================
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   // Vec engine initialization: set_mask_norm selects "normal" masking mode,
   // and set_vector_mask(-1, -1) enables ALL SIMD lanes (no masking).
   set_mask_norm();

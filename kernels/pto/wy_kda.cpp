@@ -86,12 +86,12 @@ using namespace pto;
 AICORE inline void sync_all()
 {
     pipe_barrier(PIPE_ALL);
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
     ffts_cross_core_sync(PIPE_FIX, 1 | (0 << 4) | (7 << 8));
     wait_flag_dev(7);
     ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (8 << 8));
     wait_flag_dev(9);
-#elif defined(__DAV_C220_VEC__)
+#elif defined(__DAV_VEC__)
     ffts_cross_core_sync(PIPE_MTE3, 1 | (0 << 4) | (6 << 8));
     wait_flag_dev(6);
     ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (9 << 8));
@@ -378,7 +378,7 @@ AICORE void wy_kda_kernel(
           ChunkSize, HiddenSize> w_l0;
   TASSIGN(w_l0, 65536);
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
 
@@ -788,7 +788,7 @@ AICORE void wy_kda_kernel(
   sync_all();
 #endif
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   // Global all-core barrier at kernel start (matches Vec side).
   sync_all();
 

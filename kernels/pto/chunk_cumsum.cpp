@@ -147,13 +147,13 @@ AICORE void cumsum_kernel(
   // Required before any cross-core sync (ffts_cross_core_sync / wait_flag_dev).
   set_ffts_base_addr(ffts_addr);
 
-// #if defined(__DAV_C220_VEC__): This block only compiles for the Vec core pass.
+// #if defined(__DAV_VEC__): This block only compiles for the Vec core pass.
 // The bisheng compiler makes 3 passes over the same source file:
-//   Pass 1: __DAV_C220_VEC__  defined → compiles Vec (SIMD) code
-//   Pass 2: __DAV_C220_CUBE__ defined → compiles Cube (matrix) code
+//   Pass 1: __DAV_VEC__  defined → compiles Vec (SIMD) code
+//   Pass 2: __DAV_CUBE__ defined → compiles Cube (matrix) code
 //   Pass 3: neither defined → compiles host (CPU) launcher code
 // Using these guards lets us put Vec, Cube, and host code in one file.
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   if (vid != 0) return;
 
   // set_mask_norm(): Reset Vec mask to normal mode (all lanes active).

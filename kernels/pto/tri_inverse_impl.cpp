@@ -7,9 +7,6 @@ https://github.com/huawei-csl/pto-kernels/
 for the full License text.
 */
 
-#ifndef MEMORY_BASE
-#define MEMORY_BASE
-#endif
 #include <pto/pto-inst.hpp>
 
 #include "kernel_utils.h"
@@ -714,7 +711,7 @@ AICORE void runKernelTriInvRecUnroll(__gm__ StoreT* M_inv, __gm__ InputT* M,
                                      __gm__ int32_t* cu_seqlens = nullptr,
                                      uint32_t is_lower = 0) {
 #if (__CHECK_FEATURE_AT_PRECOMPILE) || \
-    (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))  // Cube compilation
+    (__CCE_AICORE__ == 220 && defined(__DAV_CUBE__))  // Cube compilation
 
   TriInvRecUnrollKernel<InputT, OutputT, MatrixSize, NumTilesPerCubeIter,
                         IsBSND, StoreT>(M_inv, M, I_neg, total_tiles, num_bsnd_heads,
