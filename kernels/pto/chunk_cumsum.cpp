@@ -199,7 +199,7 @@ AICORE void cumsum_kernel(
   // This is equivalent to:
   //   g_gm = torch.as_strided(g_ptr, size=[valid, NumHeads], stride=[NumHeads, 1])
   using GmShape  = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
-  using GmStride = Stride<1, 1, 1, DYNAMIC, 1>;
+  using GmStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
   using GmFloat  = GlobalTensor<float, GmShape, GmStride>;
   // Runtime row pitch = NumHeads elements (BSND: token t at offset t*NumHeads).
   GmStride g_stride(NumHeads);
