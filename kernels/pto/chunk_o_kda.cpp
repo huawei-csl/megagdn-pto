@@ -61,6 +61,8 @@
 
 #include <pto/pto-inst.hpp>
 #include <type_traits>
+
+#include "kernel_utils.h"
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 #include "kernel_utils.h"
@@ -132,17 +134,17 @@ using TileMatL1ZN = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
-using TileMatL0A = pto::Tile<pto::TileType::Left, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::RowMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0A =
+    pto::Tile<pto::TileType::Left, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/true), RowValid,
+              ColValid, pto::SLayout::RowMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
-using TileMatL0B = pto::Tile<pto::TileType::Right, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::ColMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0B =
+    pto::Tile<pto::TileType::Right, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/false), RowValid,
+              ColValid, pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols,
