@@ -49,7 +49,6 @@
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 #include "kernel_utils.h"
-
 using namespace pto;
 using namespace kernel_utils;
 
@@ -382,7 +381,15 @@ AICORE void chunk_h_kda_kernel(
 
     for (int32_t ci = 0; ci < num_chunks; ++ci) {
       // Wait for Vec to publish S entering this chunk (S₀=0 for ci=0).
+      // A2: Cube and Vec are separate cores → FFTS cross-core flag.
+      // A5: Cube and both Vec sub-blocks share ONE core → intra-block flags,
+      //     with each Vec sub-block signalling its own flag (base, base+16).
+#if __CCE_AICORE__ == 220
       wait_flag_dev(3);
+#else
+      WaitBothVecOnA5<PIPE_MTE2>(3);
+      pipe_barrier(PIPE_ALL);
+#endif
 
       int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
       int64_t valid = slen - static_cast<int64_t>(ci) * C;
@@ -428,10 +435,22 @@ AICORE void chunk_h_kda_kernel(
         TASSIGN(ws_store, 0);
         TSTORE(ws_global, ws_store);
       }
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
+      // Signal Vec: WS workspace ready (flag 0)
+      // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (0 << 8));
+#if __CCE_AICORE__ == 220
+      SetCrossFlag<PIPE_FIX>(0);
+#else
+      pipe_barrier(PIPE_ALL);
+      SignalBothVecOnA5<PIPE_FIX>(0);
+#endif
 
       // Wait for Vec to publish K_rest in WS_K and V_corr (fp16) in WS_V.
+#if __CCE_AICORE__ == 220
       wait_flag_dev(1);
+#else
+      WaitBothVecOnA5<PIPE_MTE2>(1);
+      pipe_barrier(PIPE_ALL);
+#endif
 
       {
         GmShape2D k_shape(K_DIM, C);
@@ -471,7 +490,14 @@ AICORE void chunk_h_kda_kernel(
         TASSIGN(kv_store, C * V_DIM * static_cast<int32_t>(sizeof(float)));
         TSTORE(kv_global, kv_store);
       }
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
+      // Signal Vec: KV workspace ready (flag 2)
+      // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (2 << 8));
+#if __CCE_AICORE__ == 220
+      SetCrossFlag<PIPE_FIX>(2);
+#else
+      pipe_barrier(PIPE_ALL);
+      SignalBothVecOnA5<PIPE_FIX>(2);
+#endif
     }
   }
 
@@ -531,7 +557,14 @@ AICORE void chunk_h_kda_kernel(
       TASSIGN(s_store, S_UB_HALF);
       TSTORE(s_global, s_store);
     }
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+    // Signal Cube: S workspace ready (flag 3)
+    // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+#if __CCE_AICORE__ == 220
+    SetCrossFlag<PIPE_MTE3>(3);
+#else
+    pipe_barrier(PIPE_ALL);
+    set_intra_block(PIPE_MTE3, 3);
+#endif
 
     for (int32_t ci = 0; ci < static_cast<int32_t>(num_chunks); ++ci) {
       int64_t chunk_start = bos + static_cast<int64_t>(ci) * C;
@@ -672,7 +705,12 @@ AICORE void chunk_h_kda_kernel(
       }
 
       // ── 5. Wait Cube WS ready, load WS (fp16) into U_UB_HALF buffer ───
+#if __CCE_AICORE__ == 220
       wait_flag_dev(0);
+#else
+      wait_intra_block(PIPE_MTE3, 0);
+      pipe_barrier(PIPE_ALL);
+#endif
       {
         GmShape2D ws_shape(HalfC, V_DIM);
         GmStride2D ws_stride(V_DIM);
@@ -732,7 +770,14 @@ AICORE void chunk_h_kda_kernel(
         TASSIGN(k_store, K_UB_HALF);
         TSTORE(k_global, k_store);
       }
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+      // Signal Cube: K_rest / V_corr workspace ready (flag 1)
+      // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (1 << 8));
+#if __CCE_AICORE__ == 220
+      SetCrossFlag<PIPE_MTE3>(1);
+#else
+      pipe_barrier(PIPE_ALL);
+      set_intra_block(PIPE_MTE3, 1);
+#endif
 
       // ── 7. State decay: S *= exp(g_total) (per-K row, broadcast over V) ─
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
@@ -755,7 +800,12 @@ AICORE void chunk_h_kda_kernel(
       PipeBarrierVec();
 
       // ── 8. Wait Cube KV ready, S += KV ─────────────────────────────────
+#if __CCE_AICORE__ == 220
       wait_flag_dev(2);
+#else
+      wait_intra_block(PIPE_MTE3, 2);
+      pipe_barrier(PIPE_ALL);
+#endif
       {
         GmShape2D kv_shape(HalfC, V_DIM);
         GmStride2D kv_stride(V_DIM);
@@ -799,7 +849,14 @@ AICORE void chunk_h_kda_kernel(
           TASSIGN(s_store, S_UB_HALF);
           TSTORE(s_global, s_store);
         }
-        ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+        // Signal Cube: S workspace ready (flag 3)
+        // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+#if __CCE_AICORE__ == 220
+        SetCrossFlag<PIPE_MTE3>(3);
+#else
+        pipe_barrier(PIPE_ALL);
+        set_intra_block(PIPE_MTE3, 3);
+#endif
       }
     }
   }

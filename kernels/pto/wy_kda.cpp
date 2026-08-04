@@ -66,6 +66,7 @@
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+#include "kernel_utils.h"
 #include <type_traits>
 #include "kernel_utils.h"
 
@@ -485,7 +486,17 @@ AICORE void wy_kda_kernel(
               TCVT(a2_ub_half, a2_ub, pto::RoundMode::CAST_NONE);
             }
 
-            if (!first_iter) wait_flag_dev(12);
+            // Wait Cube: ws_a2 slot free (flag 12).
+            // A2: Cube is a separate core → FFTS cross-core flag.
+            // A5: Cube shares the core → intra-block flag.
+            if (!first_iter) {
+#if __CCE_AICORE__ == 220
+              wait_flag_dev(12);
+#else
+              wait_intra_block(PIPE_MTE3, 12);
+              pipe_barrier(PIPE_ALL);
+#endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -499,7 +510,13 @@ AICORE void wy_kda_kernel(
               TSTORE(workspace_a2_global, a2_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (10 << 8));
+            // Signal Cube: ws_a2 ready (flag 10)
+            // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (10 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_MTE3>(10);
+#else
+            set_intra_block(PIPE_MTE3, 10);
+#endif
 
             // ─── Phase 2: build K_eff = k * exp(g_cs) ──────────────────────
             // k and g_cs are head-major [HV, total_tokens, K] fp16; per-head
@@ -568,7 +585,15 @@ AICORE void wy_kda_kernel(
               TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
             }
 
-            if (!first_iter) wait_flag_dev(13);
+            // Wait Cube: ws_keff slot free (flag 13).
+            if (!first_iter) {
+#if __CCE_AICORE__ == 220
+              wait_flag_dev(13);
+#else
+              wait_intra_block(PIPE_MTE3, 13);
+              pipe_barrier(PIPE_ALL);
+#endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -582,7 +607,13 @@ AICORE void wy_kda_kernel(
               TSTORE(workspace_keff_global, keff_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (11 << 8));
+            // Signal Cube: ws_keff ready (flag 11)
+            // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (11 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_MTE3>(11);
+#else
+            set_intra_block(PIPE_MTE3, 11);
+#endif
             first_iter = false;
           }
           gi++;
@@ -674,7 +705,17 @@ AICORE void wy_kda_kernel(
               TCVT(a2_ub_half, a2_ub, pto::RoundMode::CAST_NONE);
             }
 
-            if (!first_iter) wait_flag_dev(12);
+            // Wait Cube: ws_a2 slot free (flag 12).
+            // A2: Cube is a separate core → FFTS cross-core flag.
+            // A5: Cube shares the core → intra-block flag.
+            if (!first_iter) {
+#if __CCE_AICORE__ == 220
+              wait_flag_dev(12);
+#else
+              wait_intra_block(PIPE_MTE3, 12);
+              pipe_barrier(PIPE_ALL);
+#endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -688,7 +729,13 @@ AICORE void wy_kda_kernel(
               TSTORE(workspace_a2_global, a2_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (10 << 8));
+            // Signal Cube: ws_a2 ready (flag 10)
+            // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (10 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_MTE3>(10);
+#else
+            set_intra_block(PIPE_MTE3, 10);
+#endif
 
             // ─── Phase 2: build K_eff = k * exp(g_cs) ──────────────────────
             if (local_rows > 0) {
@@ -754,7 +801,15 @@ AICORE void wy_kda_kernel(
               TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
             }
 
-            if (!first_iter) wait_flag_dev(13);
+            // Wait Cube: ws_keff slot free (flag 13).
+            if (!first_iter) {
+#if __CCE_AICORE__ == 220
+              wait_flag_dev(13);
+#else
+              wait_intra_block(PIPE_MTE3, 13);
+              pipe_barrier(PIPE_ALL);
+#endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -768,7 +823,13 @@ AICORE void wy_kda_kernel(
               TSTORE(workspace_keff_global, keff_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (11 << 8));
+            // Signal Cube: ws_keff ready (flag 11)
+            // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (11 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_MTE3>(11);
+#else
+            set_intra_block(PIPE_MTE3, 11);
+#endif
             first_iter = false;
           }
           gi++;
@@ -782,8 +843,14 @@ AICORE void wy_kda_kernel(
   // flags 3 and 4 (because the in-loop wait is gated by `!first_iter`), and
   // that stale count corrupts the next launch's first non-first-iter wait.
   if (!first_iter) {
+#if __CCE_AICORE__ == 220
     wait_flag_dev(12);
     wait_flag_dev(13);
+#else
+    wait_intra_block(PIPE_MTE3, 12);
+    wait_intra_block(PIPE_MTE3, 13);
+    pipe_barrier(PIPE_ALL);
+#endif
   }
 
   // Global all-core barrier at kernel exit: matches the entry sync_all so
@@ -833,7 +900,14 @@ AICORE void wy_kda_kernel(
               }
             }
 
+            // Cube waits Vec: ws_a2 ready (flag 10).
+            // The wait must block MTE2: the consuming op is the GM->L1 TLOAD.
+#if __CCE_AICORE__ == 220
             wait_flag_dev(10);
+#else
+            WaitBothVecOnA5<PIPE_MTE2>(10);
+            pipe_barrier(PIPE_ALL);
+#endif
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
@@ -860,9 +934,23 @@ AICORE void wy_kda_kernel(
               TASSIGN(u_store, 0);
               TSTORE(u_global, u_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (12 << 8));
+            // Cube signals Vec: ws_a2 slot free (flag 12)
+            // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (12 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_FIX>(12);
+#else
+            pipe_barrier(PIPE_ALL);
+            SignalBothVecOnA5<PIPE_FIX>(12);
+#endif
 
+            // Cube waits Vec: ws_keff ready (flag 11).
+            // The wait must block MTE2: the consuming op is the GM->L1 TLOAD.
+#if __CCE_AICORE__ == 220
             wait_flag_dev(11);
+#else
+            WaitBothVecOnA5<PIPE_MTE2>(11);
+            pipe_barrier(PIPE_ALL);
+#endif
             {
               GmShape2D keff_shape(ChunkSize, HiddenSize);
               GmStride2D keff_stride(HiddenSize);
@@ -890,7 +978,14 @@ AICORE void wy_kda_kernel(
               TASSIGN(w_store, 65536);
               TSTORE(w_global, w_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (13 << 8));
+            // Cube signals Vec: ws_keff slot free (flag 13)
+            // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (13 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_FIX>(13);
+#else
+            pipe_barrier(PIPE_ALL);
+            SignalBothVecOnA5<PIPE_FIX>(13);
+#endif
           }
           gi++;
         }
@@ -932,7 +1027,14 @@ AICORE void wy_kda_kernel(
               }
             }
 
+            // Cube waits Vec: ws_a2 ready (flag 10).
+            // The wait must block MTE2: the consuming op is the GM->L1 TLOAD.
+#if __CCE_AICORE__ == 220
             wait_flag_dev(10);
+#else
+            WaitBothVecOnA5<PIPE_MTE2>(10);
+            pipe_barrier(PIPE_ALL);
+#endif
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
@@ -958,9 +1060,23 @@ AICORE void wy_kda_kernel(
               TASSIGN(u_store, 0);
               TSTORE(u_global, u_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (12 << 8));
+            // Cube signals Vec: ws_a2 slot free (flag 12)
+            // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (12 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_FIX>(12);
+#else
+            pipe_barrier(PIPE_ALL);
+            SignalBothVecOnA5<PIPE_FIX>(12);
+#endif
 
+            // Cube waits Vec: ws_keff ready (flag 11).
+            // The wait must block MTE2: the consuming op is the GM->L1 TLOAD.
+#if __CCE_AICORE__ == 220
             wait_flag_dev(11);
+#else
+            WaitBothVecOnA5<PIPE_MTE2>(11);
+            pipe_barrier(PIPE_ALL);
+#endif
             {
               GmShape2D keff_shape(ChunkSize, HiddenSize);
               GmStride2D keff_stride(HiddenSize);
@@ -987,7 +1103,14 @@ AICORE void wy_kda_kernel(
               TASSIGN(w_store, 65536);
               TSTORE(w_global, w_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (13 << 8));
+            // Cube signals Vec: ws_keff slot free (flag 13)
+            // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (13 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_FIX>(13);
+#else
+            pipe_barrier(PIPE_ALL);
+            SignalBothVecOnA5<PIPE_FIX>(13);
+#endif
           }
           gi++;
         }

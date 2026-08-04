@@ -43,6 +43,30 @@ AICORE inline T1 CeilDiv(T1 value, T2 divisor) {
   return (value + divisor - 1) / divisor;
 }
 
+template <pipe_t Pipe, uint8_t VEC_NUM = 2>
+AICORE inline void SetCrossFlag(int32_t flag) {
+  ffts_cross_core_sync(Pipe, 1 | (VEC_NUM << 4) | (flag << 8));
+}
+
+template <pipe_t Pipe>
+AICORE inline void SignalBothVecOnA5(uint16_t flag) {
+  // A5: the flag offset is 16 on new core.
+  constexpr uint16_t VEC_FLAG_OFFSET = 16;
+
+  set_intra_block(Pipe, flag);
+  set_intra_block(Pipe, flag + VEC_FLAG_OFFSET);
+}
+
+template <pipe_t Pipe>
+AICORE inline void WaitBothVecOnA5(uint16_t flag) {
+  // A5: the flag offset is 16 on new core.
+  constexpr uint16_t VEC_FLAG_OFFSET = 16;
+
+  wait_intra_block(Pipe, flag);
+  wait_intra_block(Pipe, flag + VEC_FLAG_OFFSET);
+}
+
+
 /**
  * @brief Returns the outer matrix layout based on the target architecture and
  * matrix orientation.
