@@ -508,11 +508,11 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT* M_inv,
       TileShape2D<InputT, MatrixSize, MatrixSize, Layout::ND>;
   using GlobalTileStridesIn = typename std::conditional<
       !IsBSND, BaseShape2D<InputT, MatrixSize, MatrixSize, Layout::ND>,
-      Stride<1, 1, 1, -1, 1>>::type;
+      pto::Stride<1, 1, 1, -1, 1>>::type;
   using GlobalTileIn =
       GlobalTensor<InputT, GlobalTileShapeIn, GlobalTileStridesIn, Layout::ND>;
   using GlobalTileDynamicShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
-  using GlobalTileDynamicStride = Stride<1, 1, 1, DYNAMIC, 1>;
+  using GlobalTileDynamicStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
   using GlobalTileDynamicIn = GlobalTensor<InputT, GlobalTileDynamicShape,
                                            GlobalTileDynamicStride, Layout::ND>;
   using GlobalTileStridesINeg =
@@ -524,7 +524,7 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT* M_inv,
       TileShape2D<StoreT, MatrixSize, MatrixSize, Layout::ND>;
   using GlobalTileStridesOut = typename std::conditional<
       !IsBSND, BaseShape2D<StoreT, MatrixSize, MatrixSize, Layout::ND>,
-      Stride<1, 1, 1, -1, 1>>::type;
+      pto::Stride<1, 1, 1, -1, 1>>::type;
   using GlobalTileOut = GlobalTensor<StoreT, GlobalTileShapeOut,
                                      GlobalTileStridesOut, Layout::ND>;
   using GlobalTileDynamicOut =
