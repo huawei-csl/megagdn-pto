@@ -71,11 +71,10 @@
 #include <pto/pto-inst.hpp>   // PTO (Performance Tile Operator): NPU kernel API
 #include "acl/acl.h"          // ACL (Ascend Computing Language): runtime API
 #include <runtime/rt_ffts.h>  // FFTS: cross-core synchronization primitives
-#include "kernel_utils.h"     // SetCrossFlag / SignalBothVecOnA5 / WaitBothVecOnA5
+#include "kernel_utils.h"
+
 using namespace pto;
-using kernel_utils::SetCrossFlag;
-using kernel_utils::SignalBothVecOnA5;
-using kernel_utils::WaitBothVecOnA5;
+using namespace kernel_utils;
 
 // ── Compile-time constants (set by the JIT compiler from Python) ──────
 // D/C stay compile-time because tile shapes depend on them. H/Hg are runtime.
@@ -574,15 +573,15 @@ AICORE void kkt_kernel(
                 GUbAddr + row_offset *
                               static_cast<int32_t>(sizeof(float)));
         TMOV(g_v_ub, g_ub_temp);   // g_v = g[row_offset:row_offset+C/2]
-        pipe_barrier(PIPE_V);       // Wait for TMOV to complete
+        PipeBarrierVec();       // Wait for TMOV to complete
 
         TLOG(beta_ub, beta_ub);     // beta_ub = log(beta) in-place
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
         TADD(g_v_ub, g_v_ub, beta_ub);  // g_v = g_sub + log(beta) — the combined gate
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
         TMOV(g_r_ub, g_v_ub);      // Copy to g_r for row-broadcast
         TMOV(g_c_ub, g_ub);        // Copy full g to g_c for col-broadcast
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
 
         // Broadcast g_v to rows, g to columns → 2D gating matrix
         // coeff[i,j] = exp(min(g_v[i] - g[j], 0))
@@ -594,11 +593,11 @@ AICORE void kkt_kernel(
         TASSIGN(g_r_ub_temp, GRUbAddr);
         TROWEXPAND(g_r_2d_ub, g_r_ub_temp);  // g_r_2d[i,j] = g_v[i] for all j
         TCOLEXPAND(g_c_2d_ub, g_c_ub);       // g_c_2d[i,j] = g[j] for all i
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
         TSUB(coeff_ub, g_r_2d_ub, g_c_2d_ub);  // coeff[i,j] = g_v[i] - g[j]
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
         TMINS(coeff_ub, coeff_ub, 0.0f);        // clamp to ≤ 0 (coeff will be ≤ 1 after exp)
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
         TEXP(coeff_ub, coeff_ub);                // coeff = exp(clamped_diff) ∈ (0, 1]
 
         // V→MTE2 sync: ensure gating computation is done before we start

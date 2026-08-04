@@ -44,13 +44,13 @@
 
 #include <pto/pto-inst.hpp>
 #include <type_traits>
+
+#include "kernel_utils.h"
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 #include "kernel_utils.h"
 using namespace pto;
-using kernel_utils::SetCrossFlag;
-using kernel_utils::SignalBothVecOnA5;
-using kernel_utils::WaitBothVecOnA5;
+using namespace kernel_utils;
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -119,17 +119,17 @@ using TileMatL1ZN = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
-using TileMatL0A = pto::Tile<pto::TileType::Left, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::RowMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0A =
+    pto::Tile<pto::TileType::Left, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/true), RowValid,
+              ColValid, pto::SLayout::RowMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
-using TileMatL0B = pto::Tile<pto::TileType::Right, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::ColMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0B =
+    pto::Tile<pto::TileType::Right, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/false), RowValid,
+              ColValid, pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols,
@@ -618,7 +618,7 @@ AICORE void chunk_h_kda_kernel(
           TileUbDataND<half, HalfC, K_DIM, HalfC, K_DIM> k_stg_cvt;
           TASSIGN(k_stg_cvt, K_UB_HALF);
           TCVT(k_ub, k_stg_cvt, pto::RoundMode::CAST_NONE);
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
         }
         {
           GmShape2D g_shape(valid_rows, K_DIM);
@@ -659,15 +659,15 @@ AICORE void chunk_h_kda_kernel(
       // ── 3. coeff_2d = exp(g_total - g_cs)  [HalfC, K] ─────────────────
       // Broadcast g_total [1, K] across HalfC rows: 2d[i,j] = row[j] (TCOLEXPAND).
       TCOLEXPAND(coeff_2d_ub, gtotal_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TSUB(coeff_2d_ub, coeff_2d_ub, gcs_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TEXP(coeff_2d_ub, coeff_2d_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
 
       // K_rest = K * coeff_2d (element-wise).
       TMUL(k_ub, k_ub, coeff_2d_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TCVT(k_ub_half, k_ub, pto::RoundMode::CAST_NONE);
 
       // ── 4. Reuse GCS_UB region to load U (g_cs is now dead) ────────────
@@ -698,7 +698,7 @@ AICORE void chunk_h_kda_kernel(
           TileUbDataND<half, HalfC, V_DIM, HalfC, V_DIM> u_stg_cvt;
           TASSIGN(u_stg_cvt, U_UB_HALF);
           TCVT(u_ub, u_stg_cvt, pto::RoundMode::CAST_NONE);
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
         }
       } else {
         TEXPANDS(u_ub, 0.0f);
@@ -728,9 +728,9 @@ AICORE void chunk_h_kda_kernel(
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       // Cast WS to fp32 into the broadcast/scratch buffer at WS_UB.
       TCVT(ws_ub, u_ub_half, pto::RoundMode::CAST_NONE);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TSUB(u_ub, u_ub, ws_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       // V_corr fp16 → U_UB_HALF (overwrites WS bytes).
       TCVT(u_ub_half, u_ub, pto::RoundMode::CAST_NONE);
 
@@ -783,7 +783,7 @@ AICORE void chunk_h_kda_kernel(
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
       TEXP(gtotal_ub, gtotal_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
 
       // This sub-block owns K-rows [vid*HalfC, (vid+1)*HalfC) of the state.
       // Reinterpret that slice of gtotal_ub as a [HalfC, 1] DN-column vector,
@@ -795,9 +795,9 @@ AICORE void chunk_h_kda_kernel(
                     static_cast<int32_t>(sizeof(float)));
         TROWEXPAND(exp_gt_2d_ub, exp_gt_col);
       }
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TMUL(s_ub, s_ub, exp_gt_2d_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
 
       // ── 8. Wait Cube KV ready, S += KV ─────────────────────────────────
 #if __CCE_AICORE__ == 220
@@ -827,7 +827,7 @@ AICORE void chunk_h_kda_kernel(
         TASSIGN(kv_load_view, KV_LOAD_UB);
         TCVT(kv_ub, kv_load_view, pto::RoundMode::CAST_NONE);
       }
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TADD(s_ub, s_ub, kv_ub);
 
       // ── 9. Write fp16(S) to workspace WS_S for next chunk's W @ S ──────

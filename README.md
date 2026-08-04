@@ -59,7 +59,7 @@ pip install -e '.[eval,plot]'
 
 ```bash
 # accuracy tests
-python tests/test_single_kernels.py --H-list 16,32,48,64
+python tests/test_gdn_single_kernels.py --H-list 16,32,48,64
 python tests/test_e2e.py --no-triton
 
 # performance benchmark
