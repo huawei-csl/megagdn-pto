@@ -81,7 +81,10 @@
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+#include "kernel_utils.h"
+
 using namespace pto;
+using namespace kernel_utils;
 
 // ── Compile-time configuration (overridable at build time via -D flags) ──
 // D/C stay compile-time because tile shapes depend on them. H/Hg are runtime.
@@ -830,13 +833,13 @@ AICORE void chunk_o_kernel(
         TROWEXPAND(g_r_2d, g_v_col);       // g_r_2d[i,j] = g_row[i]
         TCOLEXPAND(coeff_ub, g_ub);        // coeff[i,j] = g_col[j]
         TSUB(coeff_ub, g_r_2d, coeff_ub);  // d = g_row - g_col
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
         TMINS(coeff_ub, coeff_ub, 0.0f);
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
         TEXP(coeff_ub, coeff_ub);
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
         TMUL(coeff_ub, coeff_ub, msk_ub);
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
         TEXP(g_v_ub, g_v_ub);              // exp(g_row) for QS scaling
       }
 
@@ -923,7 +926,7 @@ AICORE void chunk_o_kernel(
       UbDN<float, HalfChunk, 1> g_v_col2;
       TASSIGN(g_v_col2, GvUbAddr);
       TROWEXPAND(g_exp_2d, g_v_col2);    // broadcast exp(g_row) across columns
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TMUL(qs_ub, qs_ub, g_exp_2d);      // QS_gated = QS * exp(g_row)
 
       // ── Wait for Cube→Vec flag 2: QKV ready ─────────────────────────
@@ -1040,13 +1043,13 @@ AICORE void chunk_o_kernel(
               TROWEXPAND(g_r_2d_v, g_v_col_v);
               TCOLEXPAND(coeff_ub, g_ub);
               TSUB(coeff_ub, g_r_2d_v, coeff_ub);  // d = g_row - g_col
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TMINS(coeff_ub, coeff_ub, 0.0f);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TEXP(coeff_ub, coeff_ub);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TMUL(coeff_ub, coeff_ub, msk_ub);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TEXP(g_v_ub, g_v_ub);
             }
 
@@ -1126,7 +1129,7 @@ AICORE void chunk_o_kernel(
               UbDN<float, HalfChunk, 1> g_v_col2_v;
               TASSIGN(g_v_col2_v, GvUbAddr);
               TROWEXPAND(g_exp_2d_v, g_v_col2_v);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TMUL(qs_ub, qs_ub, g_exp_2d_v);
 
               wait_flag_dev(2);

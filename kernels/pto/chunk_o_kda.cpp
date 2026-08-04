@@ -61,9 +61,14 @@
 
 #include <pto/pto-inst.hpp>
 #include <type_traits>
+
+#include "kernel_utils.h"
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+#include "kernel_utils.h"
+
 using namespace pto;
+using namespace kernel_utils;
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -129,17 +134,17 @@ using TileMatL1ZN = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
-using TileMatL0A = pto::Tile<pto::TileType::Left, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::RowMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0A =
+    pto::Tile<pto::TileType::Left, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/true), RowValid,
+              ColValid, pto::SLayout::RowMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
-using TileMatL0B = pto::Tile<pto::TileType::Right, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::ColMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0B =
+    pto::Tile<pto::TileType::Right, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/false), RowValid,
+              ColValid, pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols,
@@ -518,7 +523,7 @@ AICORE void chunk_o_kda_kernel(
           TileUbDataND<half, HalfC, K_DIM, HalfC, K_DIM> q_stg_cvt;
           TASSIGN(q_stg_cvt, SLOT_D_ADDR);
           TCVT(q_ub, q_stg_cvt, pto::RoundMode::CAST_NONE);
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
         }
         {
           GmShape2D g_shape(valid_rows, K_DIM);
@@ -546,11 +551,11 @@ AICORE void chunk_o_kda_kernel(
       // exp(g_cs) ≤ 1 (g_cs ≤ 0) so q_eff is bounded; kept fp32 to match the
       // fp32 GEMM (k_eff below overflows fp16).
       TEXP(exp_ub, g_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       // q_eff into exp_ub (SLOT_C) so q_ub (SLOT_B) keeps the raw scaled Q,
       // which the Aqk element-wise pass below needs as its row factor.
       TMUL(exp_ub, q_ub, exp_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
 
       // Store q_eff fp32 → WS_Q (full HalfC rows; padded zeros for invalid).
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -585,7 +590,7 @@ AICORE void chunk_o_kda_kernel(
           TileUbDataND<float, HalfC, C, HalfC, C> zero_ub;
           TASSIGN(zero_ub, SLOT_C_ADDR);
           TEXPANDS(zero_ub, 0.0f);
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
           set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
           wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
           GmShape2D z_shape(HalfC, C);
@@ -619,7 +624,7 @@ AICORE void chunk_o_kda_kernel(
             TileUbDataND<half, 1, K_DIM, 1, K_DIM> kc_h; TASSIGN(kc_h, AQK_KCH);
             TileUbDataND<float, 1, K_DIM, 1, K_DIM> kc_f; TASSIGN(kc_f, AQK_KC);
             TCVT(kc_f, kc_h, pto::RoundMode::CAST_NONE);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
           }
           TileUbDataND<float, 1, K_DIM, 1, K_DIM> gc; TASSIGN(gc, AQK_GC);
           TileUbDataND<float, 1, K_DIM, 1, K_DIM> kc; TASSIGN(kc, AQK_KC);
@@ -627,12 +632,12 @@ AICORE void chunk_o_kda_kernel(
           TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM> tmp;  TASSIGN(tmp, SLOT_D_ADDR);
           TileUbDataND<float, HalfC, 16, HalfC, 1> colsum; TASSIGN(colsum, AQK_COL);
 
-          TCOLEXPANDSUB(diff, g_ub, gc);  pipe_barrier(PIPE_V);   // g_cs[r]-g_cs[c]
-          TMINS(diff, diff, 0.0f);        pipe_barrier(PIPE_V);   // <= 0
-          TEXP(diff, diff);               pipe_barrier(PIPE_V);
-          TCOLEXPANDMUL(diff, diff, kc);  pipe_barrier(PIPE_V);   // * k[c]
-          TMUL(diff, diff, q_ub);         pipe_barrier(PIPE_V);   // * q[r] (raw scaled Q)
-          TROWSUM(colsum, diff, tmp);     pipe_barrier(PIPE_V);
+          TCOLEXPANDSUB(diff, g_ub, gc);  PipeBarrierVec();   // g_cs[r]-g_cs[c]
+          TMINS(diff, diff, 0.0f);        PipeBarrierVec();   // <= 0
+          TEXP(diff, diff);               PipeBarrierVec();
+          TCOLEXPANDMUL(diff, diff, kc);  PipeBarrierVec();   // * k[c]
+          TMUL(diff, diff, q_ub);         PipeBarrierVec();   // * q[r] (raw scaled Q)
+          TROWSUM(colsum, diff, tmp);     PipeBarrierVec();
           {  // inclusive mask: zero rows (my_off+r) < c
             TileUbDataND<float, HalfC, 16, HalfC, 1> mk; TASSIGN(mk, AQK_MSK);
             GmShape2D ms(HalfC, 1); GmStride2D mst(C);
@@ -641,7 +646,7 @@ AICORE void chunk_o_kda_kernel(
             TLOAD(mk, mk_gm);
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            TMUL(colsum, colsum, mk);  pipe_barrier(PIPE_V);
+            TMUL(colsum, colsum, mk);  PipeBarrierVec();
           }
           set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
           wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -690,10 +695,10 @@ AICORE void chunk_o_kda_kernel(
           set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
           wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
           TCVT(v_f_ub, vh_ub, pto::RoundMode::CAST_NONE);  // fp16 → fp32
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
         } else {
           TEXPANDS(v_f_ub, 0.0f);
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
         }
 
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -735,7 +740,7 @@ AICORE void chunk_o_kda_kernel(
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         TCVT(s_f_ub, sh_ub, pto::RoundMode::CAST_NONE);  // fp16 → fp32
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
 
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -796,13 +801,13 @@ AICORE void chunk_o_kda_kernel(
 
         // O = QS + QKV  (both bounded; fp32).
         TADD(qs_ub, qs_ub, qkv_ub);
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
 
         // Convert O fp32 → fp16, store to GM (BSND).
         TileUbDataND<half, HalfC, V_DIM, HalfC, V_DIM> oh_ub;
         TASSIGN(oh_ub, SLOT_D_ADDR);
         TCVT(oh_ub, qs_ub, pto::RoundMode::CAST_NONE);
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         int64_t o_offset = (chunk_start * H + head) * V_DIM +

@@ -76,7 +76,10 @@
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+#include "kernel_utils.h"
+
 using namespace pto;
+using namespace kernel_utils;
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -291,7 +294,7 @@ AICORE void kkt_kda_kernel(
                 UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> k_f(my_rows, KDim);
                 TASSIGN(k_f, MYK_ADDR);
                 TCVT(k_f, k_h, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
             }
             // ── Load my rows' beta (fp16 -> fp32) as a [1, my_rows] row, then
             //    re-view as a [my_rows, 1] column for the per-row scale. ───────
@@ -314,7 +317,7 @@ AICORE void kkt_kda_kernel(
                 UbND<float, 1, HalfChunk, DYNAMIC, DYNAMIC> b_f(1, my_rows);
                 TASSIGN(b_f, BETA_ADDR);
                 TCVT(b_f, b_h, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
             }
 
             UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> myg(my_rows, KDim);
@@ -350,7 +353,7 @@ AICORE void kkt_kda_kernel(
                     UbND<float, 1, KTC, 1, KTC> kc_f;
                     TASSIGN(kc_f, KC_ADDR);
                     TCVT(kc_f, kc_h, pto::RoundMode::CAST_NONE);
-                    pipe_barrier(PIPE_V);
+                    PipeBarrierVec();
                 }
 
                 UbND<float, 1, KTC, 1, KTC> gc;
@@ -366,23 +369,23 @@ AICORE void kkt_kda_kernel(
 
                 // diff[r,d] = g_cs[my r, d] - g_cs[c, d]
                 TCOLEXPANDSUB(diff, myg, gc);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
                 // clamp to <= 0 so exp(.) is finite for masked (r<c) entries too
                 TMINS(diff, diff, 0.0f);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
                 TEXP(diff, diff);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
                 // *= k[c,d]  (per-dim broadcast), then *= k[my r, d]
                 TCOLEXPANDMUL(diff, diff, kc);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
                 TMUL(diff, diff, myk);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
                 // per-row beta scale (TMUL can't take a [R,1] column directly)
                 TROWEXPANDMUL(diff, diff, beta_col);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
                 // colsum[r] = beta[r] * sum_d diff[r,d]   (unmasked)
                 TROWSUM(colsum, diff, tmp);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
 
                 // Strict-lower mask: load mask[my_off+r, c] as a padded [my_rows,1]
                 // strip (row-strided gather, innermost contiguous) and zero the
@@ -399,7 +402,7 @@ AICORE void kkt_kda_kernel(
                     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                     TMUL(colsum, colsum, mk);
-                    pipe_barrier(PIPE_V);
+                    PipeBarrierVec();
                 }
 
                 // cvt colsum -> fp16 into a padded RowMajor [my_rows, 1] tile and
@@ -408,7 +411,7 @@ AICORE void kkt_kda_kernel(
                 UbND<half, HalfChunk, 16, DYNAMIC, DYNAMIC> col_h(my_rows, 1);
                 TASSIGN(col_h, COLH_ADDR);
                 TCVT(col_h, colsum, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
 
                 set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
                 wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);

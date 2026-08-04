@@ -90,9 +90,14 @@
 
 #include <pto/pto-inst.hpp>
 #include <type_traits>
+
+#include "kernel_utils.h"
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+#include "kernel_utils.h"
+
 using namespace pto;
+using namespace kernel_utils;
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -142,17 +147,17 @@ using TileMatL1ZN = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
-using TileMatL0A = pto::Tile<pto::TileType::Left, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::RowMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0A =
+    pto::Tile<pto::TileType::Left, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/true), RowValid,
+              ColValid, pto::SLayout::RowMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
-using TileMatL0B = pto::Tile<pto::TileType::Right, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::ColMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0B =
+    pto::Tile<pto::TileType::Right, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/false), RowValid,
+              ColValid, pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols,
@@ -710,9 +715,9 @@ AICORE void chunk_h_kernel(
       // Torch-like:
       //   coeff = exp(g_last - g_rows_owned_by_this_subblock)
       TADDS(coeff_ub, g_v_ub, -g_last);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TSUB(coeff_ub, zero_ub, coeff_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       TEXP(coeff_ub, coeff_ub);
 
       TEXP(g_ub, g_ub);
@@ -728,10 +733,10 @@ AICORE void chunk_h_kernel(
       // Broadcast one decay scalar per token row across the D feature columns:
       //   coeff_2d[row, :] = coeff[row]
       TROWEXPAND(coeff_2d_ub, coeff_col_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
       // `k_ub` now holds k_tilde = exp(g_last - g_i) * K_i.
       TMUL(k_ub, k_ub, coeff_2d_ub);
-      pipe_barrier(PIPE_V);
+      PipeBarrierVec();
 
       wait_flag_dev(0);
       {

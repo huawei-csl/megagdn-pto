@@ -55,7 +55,10 @@
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 #include <type_traits>
+
+#include "kernel_utils.h"
 using namespace pto;
+using namespace kernel_utils;
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -84,17 +87,17 @@ using TileMatL1ZN = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
 
 template <typename T, int Rows, int Cols, int RowValid = Rows,
           int ColValid = Cols>
-using TileMatL0A = pto::Tile<pto::TileType::Left, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::RowMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0A =
+    pto::Tile<pto::TileType::Left, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/true), RowValid,
+              ColValid, pto::SLayout::RowMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int Rows, int Cols, int RowValid = Rows,
           int ColValid = Cols>
-using TileMatL0B = pto::Tile<pto::TileType::Right, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::ColMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0B =
+    pto::Tile<pto::TileType::Right, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/false), RowValid,
+              ColValid, pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int Rows, int Cols, int RowValid = Rows,
           int ColValid = Cols, pto::PadValue PadVal = pto::PadValue::Null>
@@ -459,7 +462,7 @@ AICORE void wy_fast_kernel(
               // Fully empty lower-half tail: materialize an all-zero tile so the
               // workspace still looks like a correctly padded HalfChunk block.
               TEXPANDS(a1_ub, 0.0f);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TCVT(a1_ub_half, a1_ub, pto::RoundMode::CAST_NONE);
             }
 
@@ -467,9 +470,9 @@ AICORE void wy_fast_kernel(
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
             TCVT(beta_ub, beta_ub_half, pto::RoundMode::CAST_NONE);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
             TMOV(beta_r_ub, beta_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
             // Replicate beta_j across rows so every column j of A gets the same beta.
             // PyTorch-like:
             //   beta_2d = beta[None, :].expand(HalfChunk, ChunkSize)
@@ -521,11 +524,11 @@ AICORE void wy_fast_kernel(
             // Torch-like:
             //   g_weight = exp(g) * beta
             TEXP(g_ub, g_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
             TMUL(g_ub, g_ub, beta_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
             TMOV(g_r_ub, g_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
             TCOLEXPAND(g_2d_ub, g_r_ub);
             // A1 keeps the same A columns but multiplies each one by exp(g_j) * beta_j.
             //   a1_ub = a1_ub * g_weight[None, :]
@@ -622,7 +625,7 @@ AICORE void wy_fast_kernel(
               // Empty stripe for this sub-block: write zeros so the downstream
               // full-tile Cube GEMM sees valid padding rather than old workspace.
               TEXPANDS(a1_ub, 0.0f);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TCVT(a1_ub_half, a1_ub, pto::RoundMode::CAST_NONE);
             }
 
@@ -630,9 +633,9 @@ AICORE void wy_fast_kernel(
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
             TCVT(beta_ub, beta_ub_half, pto::RoundMode::CAST_NONE);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
             TMOV(beta_r_ub, beta_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
             TCOLEXPAND(beta_2d_ub, beta_r_ub);
 
             TCVT(a1_ub, a1_ub_half, pto::RoundMode::CAST_NONE);
@@ -678,11 +681,11 @@ AICORE void wy_fast_kernel(
 
             // Build the g-based column weights before forming the W = A1 * K branch.
             TEXP(g_ub, g_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
             TMUL(g_ub, g_ub, beta_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
             TMOV(g_r_ub, g_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
             TCOLEXPAND(g_2d_ub, g_r_ub);
             TMUL(a1_ub, a1_ub, g_2d_ub);
             TCVT(a1_ub_half, a1_ub, pto::RoundMode::CAST_NONE);
