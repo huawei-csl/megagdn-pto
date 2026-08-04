@@ -47,7 +47,10 @@
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+#include "kernel_utils.h"
+
 using namespace pto;
+using namespace kernel_utils;
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -75,7 +78,7 @@ AICORE void cast_g_fp16_to_fp32(int32_t halfAddr, int32_t ubAddr)
   UbND<float, ChunkSize, CTC> g_f;
   TASSIGN(g_f, ubAddr);
   TCVT(g_f, g_h, pto::RoundMode::CAST_NONE);
-  pipe_barrier(PIPE_V);
+  PipeBarrierVec();
 }
 
 template <int32_t KDim, int32_t ChunkSize>
@@ -192,12 +195,12 @@ AICORE void gate_cumsum_kda_kernel(
         UbND<float, 1, CTC> g_row_0;
         TASSIGN(g_row_0, GUbAddr);
         TMOV(acc_ub, g_row_0);
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
 
         UbND<float, 1, CTC> s_row_0;
         TASSIGN(s_row_0, SUbAddr);
         TMOV(s_row_0, acc_ub);
-        pipe_barrier(PIPE_V);
+        PipeBarrierVec();
 
         // Rows 1..valid-1: acc += g[i]; g_sum[i] = acc
         for (int32_t i = 1; i < valid; ++i)
@@ -205,12 +208,12 @@ AICORE void gate_cumsum_kda_kernel(
           UbND<float, 1, CTC> g_row_i;
           TASSIGN(g_row_i, GUbAddr + i * RowBytes);
           TADD(acc_ub, acc_ub, g_row_i);
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
 
           UbND<float, 1, CTC> s_row_i;
           TASSIGN(s_row_i, SUbAddr + i * RowBytes);
           TMOV(s_row_i, acc_ub);
-          pipe_barrier(PIPE_V);
+          PipeBarrierVec();
         }
 
         // ── V → MTE2 sync ───────────────────────────────────────────────
@@ -290,24 +293,24 @@ AICORE void gate_cumsum_kda_kernel(
             UbND<float, 1, CTC> g_row_0;
             TASSIGN(g_row_0, GUbAddr);
             TMOV(acc_ub, g_row_0);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
 
             UbND<float, 1, CTC> s_row_0;
             TASSIGN(s_row_0, SUbAddr);
             TMOV(s_row_0, acc_ub);
-            pipe_barrier(PIPE_V);
+            PipeBarrierVec();
 
             for (int32_t i = 1; i < valid; ++i)
             {
               UbND<float, 1, CTC> g_row_i;
               TASSIGN(g_row_i, GUbAddr + i * RowBytes);
               TADD(acc_ub, acc_ub, g_row_i);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
 
               UbND<float, 1, CTC> s_row_i;
               TASSIGN(s_row_i, SUbAddr + i * RowBytes);
               TMOV(s_row_i, acc_ub);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
             }
 
             // V → MTE2: prevent next iter's TLOAD from clobbering UB[GUbAddr]

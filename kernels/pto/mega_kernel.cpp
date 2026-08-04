@@ -35,12 +35,10 @@
 #include "acl/acl.h"
 #include <runtime/rt_ffts.h>
 #include <type_traits>
-
-// Must be included at global scope: the sub-kernels below are #include'd into
-// separate namespaces, and #pragma once would otherwise trap kernel_utils
-// inside whichever namespace pulled it in first.
 #include "kernel_utils.h"
+
 using namespace pto;
+using namespace kernel_utils;
 
 // ===================================================================
 // Device-only helpers (shared with standard mega-kernel)
