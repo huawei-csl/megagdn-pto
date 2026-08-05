@@ -544,6 +544,34 @@ def test_kdn_decode_varlen() -> None:
         torch.testing.assert_close(actual_state[slot].cpu(), state_before[slot].cpu())
 
 
+def test_kdn_decode_varlen_packed_decode() -> None:
+    """Packed decode: N independent 1-token sequences sharing one T axis.
+
+    The production decode shape -- ``B=1``, ``T=N``, ``cu_seqlens=[0,1,..,N]``,
+    gathered slots.  Tokens sit along T but are mutually independent, so this
+    must be bit-identical to the dense ``B=N, T=1`` path.  A regression that
+    chained them into one N-token sequence would change the answer here.
+    """
+    n_seq, heads, dim = 48, 32, 128
+    q, k, v, g, beta = _inputs(n_seq, 1, heads, dim, seed=4242, model_like=True)
+    slots = n_seq + 5
+    state = (0.1 * torch.randn(slots, heads, dim, dim)).to(DEVICE)
+    indices = torch.randperm(slots)[:n_seq].to(torch.int32).to(DEVICE)
+    cu_seqlens = torch.arange(0, n_seq + 1, dtype=torch.int32, device=DEVICE)
+
+    dense_out, dense_state = run_kdn_decode(
+        q, k, v, g, beta, state.clone(), state_indices=indices
+    )
+    flat = [x.reshape(1, n_seq, *x.shape[2:]) for x in (q, k, v, g, beta)]
+    packed_out, packed_state = run_kdn_decode(
+        *flat, state.clone(), state_indices=indices, cu_seqlens=cu_seqlens
+    )
+    torch.npu.synchronize()
+
+    _assert_exact(packed_out.reshape_as(dense_out), dense_out)
+    _assert_exact(packed_state, dense_state)
+
+
 def test_kdn_decode_varlen_matches_dense() -> None:
     """Equal-length ``cu_seqlens`` spans reproduce the dense [B, T] path exactly."""
     batch, tokens, heads, dim = 4, 3, 4, 128
@@ -579,6 +607,7 @@ def test_kdn_decode() -> None:
     test_kdn_decode_state_out_rejects_indices()
     test_kdn_decode_state_out_of_place()
     test_kdn_decode_varlen()
+    test_kdn_decode_varlen_packed_decode()
     test_kdn_decode_varlen_matches_dense()
 
 
