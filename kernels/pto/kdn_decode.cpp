@@ -49,7 +49,7 @@ AICORE void kdn_decode_kernel(
   const int32_t vid = get_subblockid();
   set_ffts_base_addr(ffts_addr);
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   static_assert(KDim % 8 == 0, "KDim must be a multiple of 8");
   static_assert(VTile % 8 == 0, "VTile must be a multiple of 8");
   set_mask_norm();
