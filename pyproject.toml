@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "torch",
     "numpy",
+    "einops",
 ]
 
 [project.optional-dependencies]

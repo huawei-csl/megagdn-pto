@@ -58,9 +58,13 @@ pip install -e '.[eval,plot]'
 ## Kernel-only unit tests and benchmarks
 
 ```bash
-# accuracy tests
+# accuracy tests (GDN)
 python tests/test_gdn_single_kernels.py --H-list 16,32,48,64
-python tests/test_e2e.py --no-triton
+python tests/test_gdn_e2e.py --no-triton
+
+# accuracy tests (KDA)
+python tests/test_kda_single_kernels.py
+python tests/test_kda_e2e.py
 
 # performance benchmark
  python benchmarks/kernel/bench_gdn_kernels.py \
