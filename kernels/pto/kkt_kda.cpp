@@ -90,26 +90,6 @@ using namespace kernel_utils;
 #endif
 
 #ifdef __CCE_AICORE__
-// Global barrier across ALL AI cores: every Cube and every Vec sub-block must
-// reach this point before any of them proceeds.  Uses four reserved FFTS flag
-// IDs (6, 7, 8, 9).
-AICORE inline void sync_all()
-{
-    pipe_barrier(PIPE_ALL);
-#if defined(__DAV_CUBE__)
-    ffts_cross_core_sync(PIPE_FIX, 1 | (0 << 4) | (7 << 8));
-    wait_flag_dev(7);
-    ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (8 << 8));
-    wait_flag_dev(9);
-#elif defined(__DAV_VEC__)
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (0 << 4) | (6 << 8));
-    wait_flag_dev(6);
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (9 << 8));
-    wait_flag_dev(8);
-#endif
-    pipe_barrier(PIPE_ALL);
-}
-
 template <typename T, int R, int C, int RV = R, int CV = C,
           pto::PadValue P = pto::PadValue::Null>
 using UbND = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::RowMajor,
@@ -188,17 +168,10 @@ AICORE void kkt_kda_kernel(
     // (innermost stride 1).  Independent of head count, so a compile-time stride.
     using GmFloatMaskColRow = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
 
-#if defined(__DAV_CUBE__)
-    // Cube does no compute here; it only participates in the entry/exit barriers
-    // so the Vec-side sync_all() handshakes complete.
-    sync_all();
-    sync_all();
-#endif
 
 #if defined(__DAV_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
-    sync_all();
 
     // ── UB layout (per vid) ──────────────────────────────────────────────────
     constexpr int32_t MYG_ADDR = 0;                               // [HalfChunk, K] fp32
@@ -436,8 +409,6 @@ AICORE void kkt_kda_kernel(
             }
         }
     }
-
-    sync_all();
 #endif // __DAV_VEC__
 }
 

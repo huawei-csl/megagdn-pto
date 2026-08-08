@@ -29,9 +29,6 @@
 // its own s_snapshots entry).  Cube/Vec still process them sequentially per
 // work item to keep the per-core 4-flag protocol simple.
 //
-// Cross-core sync: same data-flow flags as chunk_h_kda (0-3), plus sync_all
-// on entry/exit using reserved IDs 6-9.
-//
 // Inputs:
 //   Q       [HV, T, K]               fp32  — queries (head-major), scale pre-applied
 //   K       [HV, T, K]               fp32  — keys    (head-major)
@@ -78,25 +75,6 @@ using namespace kernel_utils;
 #endif
 
 #ifdef __CCE_AICORE__
-
-// Global all-core barrier — drains stale FFTS counters from prior launches.
-// Mirrors chunk_h_kda.cpp:67-82.
-AICORE inline void sync_all()
-{
-    pipe_barrier(PIPE_ALL);
-#if defined(__DAV_CUBE__)
-    ffts_cross_core_sync(PIPE_FIX, 1 | (0 << 4) | (7 << 8));
-    wait_flag_dev(7);
-    ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (8 << 8));
-    wait_flag_dev(9);
-#elif defined(__DAV_VEC__)
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (0 << 4) | (6 << 8));
-    wait_flag_dev(6);
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (9 << 8));
-    wait_flag_dev(8);
-#endif
-    pipe_barrier(PIPE_ALL);
-}
 
 namespace {
 
@@ -311,8 +289,6 @@ AICORE void chunk_o_kda_kernel(
   int64_t total_work = bh_work * split;
 
 #if defined(__DAV_CUBE__)
-  sync_all();
-
   for (int64_t wi = 0; wi < (total_work + block_num - 1) / block_num; ++wi) {
     int64_t pid = wi * block_num + cid;
     if (pid >= total_work) break;
@@ -434,15 +410,11 @@ AICORE void chunk_o_kda_kernel(
 #endif
     }
   }
-
-  sync_all();
 #endif
 
 #if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
-
-  sync_all();
 
   auto vid = get_subblockid();
   int32_t my_row_offset = static_cast<int32_t>(vid) * HalfC;
@@ -849,8 +821,6 @@ AICORE void chunk_o_kda_kernel(
       pipe_barrier(PIPE_ALL);
     }
   }
-
-  sync_all();
 #endif
 }
 

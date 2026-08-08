@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "megagdn-pto"
-version = "0.1.0"
-description = "Fast PTO kernels for chunk GatedDeltaNet (GDN) on Ascend NPU"
+version = "0.1.1"
+description = "Fast PTO kernels for chunk GatedDeltaNet (GDN) and Kimi Delta Attention (KDA) on Ascend NPU"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch",
     "numpy",
+    "einops",
 ]
 
 [project.optional-dependencies]
