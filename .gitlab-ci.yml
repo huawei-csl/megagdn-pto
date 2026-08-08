@@ -1,0 +1,166 @@
+default:
+  tags: [cpu]
+
+stages:
+   - build_in_docker
+   - test
+   - test_aarch64_910B2
+
+
+# Define the workflow rules manually to make sure only a single pipeline
+# is created for each MR update. Without that, GitLab creates one pipeline
+# for branch update and one for MR update.
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_DRAFT'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+    - when: never
+
+
+.build_config: &build_config
+  image: quay.io/ascend/cann:9.1.0-beta.3-${NPU}-ubuntu22.04-py3.12
+  parallel:
+    matrix:
+      - {NPU: 910b}
+      - {NPU: 950}
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    - pip3 install pyyaml setuptools pytest packaging
+    - pip3 install -r requirements.txt
+
+build_docker:
+  stage: build_in_docker
+  tags:
+    - cpu # Build docker using CPU
+  <<: *build_config
+  script:
+    - make wheel
+
+build_and_test_x86_910B4:
+  image: quay.io/ascend/cann:9.1.0-beta.3-910b-ubuntu22.04-py3.12
+  tags:
+    - docker_npu # Build and test on-device NPU (x86-64 / 910B4)
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    - pip3 install pyyaml setuptools pytest packaging
+    - pip3 install -r requirements.txt
+  script:
+    - make setup_once
+    - make wheel
+    - pip install pto_kernels*.whl
+    - python3 -m pytest -v tests/
+
+build_and_test_aarch64_910B2_py3.12:
+  image: quay.io/ascend/cann:9.1.0-beta.3-910b-ubuntu22.04-py3.12
+  stage: test_aarch64_910B2
+  tags:
+    - docker_npu_910B2 # Build and test on-device (aarch64 / 910B2)
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    - pip3 install pyyaml setuptools pytest packaging
+    - pip3 install -r requirements.txt
+  script:
+    - make setup_once
+    - make wheel
+    - pip install pto_kernels*.whl
+    - python3 -m pytest -v tests/
+  when: manual
+  allow_failure: true
+
+###################################################
+# On-device unit tests using pip install pto-kernels #
+###################################################
+test_pypi_x86_910B4:
+  image: quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.11
+  tags:
+    - docker_npu # Build and test on-device NPU (x86-64 / 910B4)
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    - pip3 install pyyaml setuptools pytest packaging
+    - pip3 install -r requirements.txt
+  script:
+    - make setup_once
+    - pip install pto-kernels
+    - python3 -m pytest -v tests/
+  when: manual
+  allow_failure: true
+
+test_pypi_aarch64_910B2_py3.11:
+  image: quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.11
+  stage: test_aarch64_910B2
+  tags:
+    - docker_npu_910B2 # Build and test on-device (aarch64 / 910B2)
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    - pip3 install pyyaml setuptools pytest packaging
+    - pip3 install -r requirements.txt
+  script:
+    - make setup_once
+    - pip install pto-kernels
+    - python3 -m pytest -v tests/
+  when: manual
+  allow_failure: true
+
+##################################################
+# On-device accuracy tests (one job per test)    #
+##################################################
+.accuracy_test_x86_910B4:
+  image: quay.io/ascend/cann:9.1.0-beta.3-910b-ubuntu22.04-py3.12
+  stage: test
+  tags:
+    - docker_npu # Run accuracy tests on-device NPU (x86-64 / 910B4)
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    - git submodule update --init --recursive # PTO-ISA is a submodule
+    - pip3 install pyyaml setuptools packaging
+    - pip3 install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+    - pip3 install torch-npu==2.9.0
+    - pip3 install -e .
+
+# accuracy tests (GDN)
+test_gdn_single_kernels:
+  extends: .accuracy_test_x86_910B4
+  script:
+    - python3 tests/test_gdn_single_kernels.py --H-list 16,32,48,64
+
+test_gdn_e2e:
+  extends: .accuracy_test_x86_910B4
+  script:
+    - python3 tests/test_gdn_e2e.py --no-triton
+
+# accuracy tests (KDA)
+test_kda_single_kernels:
+  extends: .accuracy_test_x86_910B4
+  script:
+    - python3 tests/test_kda_single_kernels.py
+
+test_kda_e2e:
+  extends: .accuracy_test_x86_910B4
+  script:
+    - python3 tests/test_kda_e2e.py
+
+######################################
+# On-device test of examples/jit_cpp #
+######################################
+test_examples_on_x86_910B4:
+  image: quay.io/ascend/cann:9.1.0-beta.3-910b-ubuntu22.04-py3.12
+  tags:
+    - docker_npu # Build and test on-device NPU (x86-64 / 910B4)
+  parallel:
+    matrix:
+      - EXAMPLE: ["scan", "silu_dynamic"]
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    - pip3 install pyyaml setuptools pytest packaging
+    - pip3 install -r requirements.txt
+  script:
+    - echo "Testing example ${EXAMPLE}"
+    - make setup_once
+    - cd examples/jit_cpp/${EXAMPLE}
+    - export PTO_LIB_PATH=${ASCEND_TOOLKIT_HOME}
+    - python3 run_${EXAMPLE}.py
+
