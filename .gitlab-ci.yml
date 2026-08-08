@@ -1,0 +1,45 @@
+default:
+  tags: [cpu]
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive # PTO-ISA is a submodule
+
+stages:
+   - test
+
+##################################################
+# On-device accuracy tests (one job per test)    #
+##################################################
+.accuracy_test_x86_910B4:
+  image: quay.io/ascend/cann:9.1.0-910b-ubuntu22.04-py3.12
+  stage: test
+  tags:
+    - docker_npu # Run accuracy tests on-device NPU (x86-64 / 910B4)
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    - pip3 install pyyaml setuptools packaging
+    - pip3 install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+    - pip3 install torch-npu==2.9.0
+    - pip3 install -e .
+
+# accuracy tests (GDN)
+test_gdn_single_kernels:
+  extends: .accuracy_test_x86_910B4
+  script:
+    - python3 tests/test_gdn_single_kernels.py --H-list 16,32
+
+test_gdn_e2e:
+  extends: .accuracy_test_x86_910B4
+  script:
+    - python3 tests/test_gdn_e2e.py --no-triton
+
+# accuracy tests (KDA)
+test_kda_single_kernels:
+  extends: .accuracy_test_x86_910B4
+  script:
+    - python3 tests/test_kda_single_kernels.py
+
+test_kda_e2e:
+  extends: .accuracy_test_x86_910B4
+  script:
+    - python3 tests/test_kda_e2e.py
