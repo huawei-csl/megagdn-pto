@@ -44,10 +44,6 @@
 //   11 : V→C reduce "ws_keff ready"
 //   12 : C→V broadcast "ws_a2 free"
 //   13 : C→V broadcast "ws_keff free"
-// Sync_all uses 6-9 (matches kkt_kda).  We pick data-flow IDs ≥ 10 so they
-// don't collide with kkt_kda / tri_inverse / gate_cumsum_kda (which all use
-// IDs 0-5 for data flow + 6-9 for sync_all).
-//
 // Layout (matches Python kda_kernel_libs convention; v cast to fp16 wrap-side):
 //   k       head-major [HV, T, K]    fp32
 //   v       BSND       [B, T, HV, V] fp16   (V == K in current setup)
@@ -81,27 +77,6 @@ using namespace kernel_utils;
 #endif
 
 #ifdef __CCE_AICORE__
-
-// Global barrier across ALL AI cores: drains any leftover FFTS state from
-// prior kernel launches and balances the trailing data-flow signals on
-// exit.  Uses four reserved FFTS flag IDs (6, 7, 8, 9) — distinct from the
-// data-flow flags 1-4 used by this kernel.  Pattern matches kkt_kda.cpp.
-AICORE inline void sync_all()
-{
-    pipe_barrier(PIPE_ALL);
-#if defined(__DAV_C220_CUBE__)
-    ffts_cross_core_sync(PIPE_FIX, 1 | (0 << 4) | (7 << 8));
-    wait_flag_dev(7);
-    ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (8 << 8));
-    wait_flag_dev(9);
-#elif defined(__DAV_C220_VEC__)
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (0 << 4) | (6 << 8));
-    wait_flag_dev(6);
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (9 << 8));
-    wait_flag_dev(8);
-#endif
-    pipe_barrier(PIPE_ALL);
-}
 
 namespace {
 
@@ -384,12 +359,6 @@ AICORE void wy_kda_kernel(
 #if defined(__DAV_C220_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
-
-  // Global all-core barrier at kernel start: drains any stale FFTS counters
-  // left by previous launches (this kernel's Cube emits flags 3/4 N times
-  // per block while Vec only waits N-1 times, so without this entry/exit
-  // pair the trailing signal would leak into the next launch).
-  sync_all();
 
   // Vec prepares the two workspaces (ws_a2 holding A2 = INV*beta_2d, and
   // ws_keff holding K_eff = k*exp(g_cs)) that the Cube phase then consumes.
@@ -785,16 +754,9 @@ AICORE void wy_kda_kernel(
     wait_flag_dev(12);
     wait_flag_dev(13);
   }
-
-  // Global all-core barrier at kernel exit: matches the entry sync_all so
-  // the next launch starts with clean FFTS state.
-  sync_all();
 #endif
 
 #if defined(__DAV_C220_CUBE__)
-  // Global all-core barrier at kernel start (matches Vec side).
-  sync_all();
-
   // Cube reads V from BSND and the two Vec-produced workspaces, then issues
   // U = A2 @ V and W = A2 @ K_eff.  a2_l1 stays resident in L1 across both
   // GEMMs so the second matmul is just a different B-side load away.
@@ -994,9 +956,6 @@ AICORE void wy_kda_kernel(
       }
     }
   }
-
-  // Global all-core barrier at kernel exit (matches Vec side).
-  sync_all();
 #endif
 }
 
