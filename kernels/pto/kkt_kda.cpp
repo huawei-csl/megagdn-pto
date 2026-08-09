@@ -168,7 +168,8 @@ AICORE void kkt_kda_kernel(
     // (innermost stride 1).  Independent of head count, so a compile-time stride.
     using GmFloatMaskColRow = GlobalTensor<float, GmShapeDyn, Stride<1, 1, 1, ChunkSize, 1>>;
 
-#if defined(__DAV_C220_VEC__)
+
+#if defined(__DAV_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
 
@@ -408,7 +409,7 @@ AICORE void kkt_kda_kernel(
             }
         }
     }
-#endif // __DAV_C220_VEC__
+#endif // __DAV_VEC__
 }
 
 // ── Device entry point ────────────────────────────────────────────────────────

@@ -25,9 +25,6 @@
 #ifndef GDN_C
 #define GDN_C 128
 #endif
-#ifndef MEMORY_BASE
-#define MEMORY_BASE
-#endif
 
 #include <pto/pto-inst.hpp>
 #include "acl/acl.h"
@@ -69,12 +66,12 @@ AICORE inline void SyncAllImpl()
         wait_flag_dev(SYNC_AIV_ONLY_ALL);
         return;
     }
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
     wait_flag_dev(SYNC_AIV_FLAG);
     ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
     wait_flag_dev(SYNC_AIC_FLAG);
     ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
-#elif defined(__DAV_C220_VEC__)
+#elif defined(__DAV_VEC__)
     ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
     wait_flag_dev(SYNC_AIC_AIV_FLAG);
 #endif
@@ -88,7 +85,7 @@ template <typename T, int32_t KD>
 AICORE void mega_permute_THK_to_HTK(
     __gm__ T *src, __gm__ T *dst, int64_t T_len, int32_t HV)
 {
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
     if (get_subblockid() != 0)
         return;
     set_mask_norm();

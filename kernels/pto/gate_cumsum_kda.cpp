@@ -93,7 +93,7 @@ AICORE void gate_cumsum_kda_kernel(
   auto vid = get_subblockid();
   set_ffts_base_addr(ffts_addr);
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   if (vid != 0)
     return;
 

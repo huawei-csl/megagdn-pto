@@ -357,7 +357,7 @@ AICORE void wy_kda_kernel(
           ChunkSize, HiddenSize> w_l0;
   TASSIGN(w_l0, 65536);
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
 
@@ -823,7 +823,7 @@ AICORE void wy_kda_kernel(
   }
 #endif
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   // Cube reads V from BSND and the two Vec-produced workspaces, then issues
   // U = A2 @ V and W = A2 @ K_eff.  a2_l1 stays resident in L1 across both
   // GEMMs so the second matmul is just a different B-side load away.

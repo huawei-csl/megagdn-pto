@@ -258,9 +258,9 @@ AICORE void kkt_kernel(
   //     (TRESHAPE is FREE — it just reinterprets the fractal layout as transposed)
   //   Result: KK^T [C×C] in L0C (float32 accumulator, even though inputs are fp16)
   // ========================================================================
-  // __DAV_C220_CUBE__: This code only compiles for the Cube core.
+  // __DAV_CUBE__: This code only compiles for the Cube core.
   // On NPU, Cube and Vec are separate compilation targets (like two different GPUs).
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   // Outer loop: iterate over all (sequence, head) work items assigned to this core
   for (int64_t work_idx = 0;
        work_idx < (total_work + block_num - 1) / block_num; ++work_idx) {
@@ -433,8 +433,8 @@ AICORE void kkt_kernel(
   // # Final: A = KK_T * coeff * causal_mask
   // A = KK_T[my_rows] * coeff * mask[my_rows]           # TMUL × 2
   // ========================================================================
-  // __DAV_C220_VEC__: This code only compiles for the Vec core.
-#if defined(__DAV_C220_VEC__)
+  // __DAV_VEC__: This code only compiles for the Vec core.
+#if defined(__DAV_VEC__)
   // set_mask_norm / set_vector_mask: configure the SIMD mask for Vec ops.
   // (-1, -1) means "all lanes active" — process every element.
   // (Like CUDA's __activemask() returning all 1s for a full warp.)

@@ -212,7 +212,7 @@ AICORE void chunk_o_kda_kernel(
   constexpr int32_t WS_QKV = WS_QS  + C * V_DIM;
   constexpr int32_t WS_PER_CORE = WS_QKV + C * V_DIM;
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   // ── Cube L1 tiles ────────────────────────────────────────────────────────
   // L1 layout (fp16, ~160 KB out of 1 MB budget):
   //   q_l1   @       0  : [C, K]     — input to GEMM1, GEMM2
@@ -243,7 +243,7 @@ AICORE void chunk_o_kda_kernel(
   TASSIGN(qkv_l0, 0);
 #endif
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   // ── Vec UB plan (192 KB budget) ──────────────────────────────────────────
   // Persistent (across entire kernel run):
   //   MASK_UB [HalfC, C] fp32 — loaded once, used in every chunk's Phase B.
@@ -288,7 +288,7 @@ AICORE void chunk_o_kda_kernel(
   }
   int64_t total_work = bh_work * split;
 
-#if defined(__DAV_C220_CUBE__)
+#if defined(__DAV_CUBE__)
   for (int64_t wi = 0; wi < (total_work + block_num - 1) / block_num; ++wi) {
     int64_t pid = wi * block_num + cid;
     if (pid >= total_work) break;
@@ -412,7 +412,7 @@ AICORE void chunk_o_kda_kernel(
   }
 #endif
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
 
