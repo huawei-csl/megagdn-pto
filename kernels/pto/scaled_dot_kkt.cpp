@@ -293,8 +293,15 @@ AICORE void kkt_kernel(
     // This overlaps Cube computation with Vec computation for pipelining.
     for (int64_t ci = 0; ci < num_chunks; ++ci) {
       int32_t slot = static_cast<int32_t>(ci & 1);
-      // Wait for Vec to finish reading the previous KK^T from this slot
+      // Wait for Vec to finish reading the previous KK^T from this slot.
+      // A2: Cube and Vec are separate cores → FFTS cross-core flag.
+      // A5: Cube and both Vec sub-blocks live in ONE core → intra-block flags,
+      //     and each Vec sub-block signals its own flag (base and base+16).
+#if __CCE_AICORE__ == 220
       wait_flag_dev(2 + slot);
+#else
+      WaitBothVecOnA5<PIPE_MTE2>(2 + slot);
+#endif
       pipe_barrier(PIPE_ALL);
 
       int64_t chunk_start = ci * ChunkSize;
@@ -393,7 +400,13 @@ AICORE void kkt_kernel(
       //   Vec sets flag 2/3 → Cube waits on wait_flag_dev(2/3) (workspace free)
       //
       // Signal Vec that this slot's KK^T is ready
-      ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (slot << 8));
+      // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (slot << 8));
+#if __CCE_AICORE__ == 220
+      SetCrossFlag<PIPE_FIX>(slot);
+#else
+      pipe_barrier(PIPE_ALL);
+      SignalBothVecOnA5<PIPE_FIX>(slot);
+#endif
     }
   }
 #endif
@@ -449,8 +462,15 @@ AICORE void kkt_kernel(
   // Initial cross-core sync: release both workspace slots so Cube can start.
   // Vec tells Cube "slots 0 and 1 are free" by setting flags 2 and 3.
   // Without this, Cube would hang on wait_flag_dev(2/3) at the first iteration.
-  ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
-  ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+  // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (2 << 8));
+  // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (3 << 8));
+#if __CCE_AICORE__ == 220
+  SetCrossFlag<PIPE_MTE3>(2);
+  SetCrossFlag<PIPE_MTE3>(3);
+#else
+  set_intra_block(PIPE_MTE3, 2);
+  set_intra_block(PIPE_MTE3, 3);
+#endif
 
   for (int64_t work_idx = 0;
        work_idx < (total_work + block_num - 1) / block_num; ++work_idx) {
@@ -530,7 +550,11 @@ AICORE void kkt_kernel(
       }
 
       // Wait for Cube to finish writing KK^T for this slot
+#if __CCE_AICORE__ == 220
       wait_flag_dev(slot);
+#else
+      wait_intra_block(PIPE_MTE3, slot);
+#endif
       pipe_barrier(PIPE_ALL);
 
       if (local_valid > 0) {
@@ -639,7 +663,12 @@ AICORE void kkt_kernel(
       // Signal Cube that this workspace slot is free for reuse.
       // Flag (2+slot): slot 0 → flag 2, slot 1 → flag 3.
       // Cube is waiting on wait_flag_dev(2+slot) before writing the next chunk.
-      ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | ((2 + slot) << 8));
+      // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | ((2 + slot) << 8));
+#if __CCE_AICORE__ == 220
+      SetCrossFlag<PIPE_MTE3>(2 + slot);
+#else
+      set_intra_block(PIPE_MTE3, 2 + slot);
+#endif
     }
   }
 #endif
