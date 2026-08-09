@@ -136,7 +136,7 @@ using GmTensor2D = pto::GlobalTensor<T, GmShape2D, GmStride2D>;
 // __gm__: Marks pointers as Global Memory (HBM) — the NPU equivalent of
 // CUDA's device memory. All input/output tensors live in GM.
 template <int32_t HiddenSize, int32_t ChunkSize>
-AICORE void kkt_kernel(
+AICORE inline void kkt_kernel(
     __gm__ half *K_handle, __gm__ half *Beta_handle,
     __gm__ float *G_handle, __gm__ float *Msk_handle,
     __gm__ half *workspace_handle, __gm__ half *A_handle,
@@ -147,6 +147,8 @@ AICORE void kkt_kernel(
     uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
+  // To avoid ambiguity with bisheng intrinsic header's global `enum class Stride`
+  using pto::Stride;
   constexpr int32_t HalfChunk = ChunkSize / 2;
   constexpr int32_t ChunkSquare = ChunkSize * ChunkSize;
   const int32_t H = static_cast<int32_t>(num_heads);

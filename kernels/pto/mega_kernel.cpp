@@ -79,6 +79,9 @@ template <typename T>
 AICORE void mega_transpose_TH_to_HT(
     __gm__ T *src, __gm__ T *dst, int64_t T_len, int32_t H)
 {
+    // To avoid ambiguity with bisheng intrinsic header's global `enum class Stride`
+    using pto::Stride;
+
 #if defined(__DAV_VEC__)
     if (get_subblockid() != 0) return;
     set_mask_norm();
@@ -168,6 +171,9 @@ AICORE void mega_cast_fp32_to_fp16_bsnd(
     __gm__ float *src, __gm__ half *dst,
     uint32_t num_matrices, int64_t total_tokens)
 {
+    // See mega_transpose_TH_to_HT above — hides the global `enum class Stride`.
+    using pto::Stride;
+
 #if defined(__DAV_VEC__)
     if (get_subblockid() != 0) return;
     set_mask_norm();

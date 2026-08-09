@@ -115,6 +115,9 @@ AICORE void kkt_kda_kernel(
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
     int32_t num_heads, uint64_t ffts_addr)
 {
+    // To avoid ambiguity with bisheng intrinsic header's global `enum class Stride`
+    using pto::Stride;
+
     auto cid = get_block_idx();
     auto block_num = get_block_num();
     auto vid = get_subblockid();

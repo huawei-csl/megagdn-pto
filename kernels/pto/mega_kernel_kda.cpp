@@ -85,6 +85,9 @@ template <typename T, int32_t KD>
 AICORE void mega_permute_THK_to_HTK(
     __gm__ T *src, __gm__ T *dst, int64_t T_len, int32_t HV)
 {
+    // To avoid ambiguity with bisheng intrinsic header's global `enum class Stride`
+    using pto::Stride;
+
 #if defined(__DAV_VEC__)
     if (get_subblockid() != 0)
         return;
