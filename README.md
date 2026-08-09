@@ -67,7 +67,7 @@ python tests/test_kda_single_kernels.py
 python tests/test_kda_e2e.py
 
 # performance benchmark
- python benchmarks/kernel/bench_gdn_kernels.py \
+python benchmarks/kernel/bench_gdn_kernels.py \
     --device npu:0 --n-seq 16 --l-seg 8192 --H-list 16,32,48,64 
 ```
 
