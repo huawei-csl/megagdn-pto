@@ -148,7 +148,7 @@ def compile_chunk_kernel(
     cpp_path = os.path.join(_KERNELS_PTO, cpp_basename)
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"{so_stem}_D{hidden_size}_C{chunk_size}.so",
+        f"{so_stem}_D{hidden_size}_C{chunk_size}_{MEMORY_MODEL}.so",
     )
     flags = _common_flags(hidden_size=hidden_size, chunk_size=chunk_size)
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=300)
@@ -167,7 +167,7 @@ def compile_mega_kernel(
     cpp_path = os.path.join(_KERNELS_PTO, "mega_kernel.cpp")
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"mega_kernel_D{hidden_size}_C{chunk_size}.so",
+        f"mega_kernel_D{hidden_size}_C{chunk_size}_{MEMORY_MODEL}.so",
     )
     flags = _common_flags(hidden_size=hidden_size, chunk_size=chunk_size)
     print("[megagdn_pto] Compiling mega_kernel …")
@@ -195,7 +195,7 @@ def compile_mega_kernel_kda(
     cpp_path = os.path.join(_KERNELS_PTO, "mega_kernel_kda.cpp")
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"mega_kernel_kda_D{hidden_size}_C{chunk_size}.so",
+        f"mega_kernel_kda_D{hidden_size}_C{chunk_size}_{MEMORY_MODEL}.so",
     )
     flags = _common_flags(hidden_size=hidden_size, chunk_size=chunk_size)
     print(f"[megagdn_pto] Compiling mega_kernel_kda (K={hidden_size} C={chunk_size}) …")
@@ -209,8 +209,6 @@ def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
     """Compile the triangular-inverse CubeCore kernel and return the ``.so`` path."""
     os.makedirs(_COMPILED_DIR, exist_ok=True)
     cpp_path = os.path.join(_KERNELS_PTO, "tri_inverse.cpp")
-    # Keyed on the memory model: each backend targets a different SoC, so the two
-    # binaries are not interchangeable and must not share a cache filename.
     lib_path = os.path.join(_COMPILED_DIR, f"tri_inverse_jit_{MEMORY_MODEL}.so")
     if os.path.exists(lib_path):
         return lib_path
