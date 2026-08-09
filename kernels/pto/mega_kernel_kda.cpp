@@ -2,7 +2,7 @@
 //
 // Fuses the six KDA stages into a single NPU launch, modelled on the GDN mega_kernel.cpp.
 // Sub-kernels are reused verbatim via namespaced #include (the `call_kernel` macro trick),
-// and their templated device functions are invoked in sequence with SyncAllImpl<false>()
+// and their templated device functions are invoked in sequence with SyncAllMegaKernel<false>()
 // barriers between stages.
 //
 // Stages:
@@ -40,49 +40,12 @@ using namespace kernel_utils;
 // ===================================================================
 #ifdef __CCE_AICORE__
 
-constexpr uint16_t SYNC_AIV_FLAG = 12;
-constexpr uint16_t SYNC_AIC_FLAG = 11;
-constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
-constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
-constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
-constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
-
-AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId)
-{
-    return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) +
-            ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
-}
-
-// Full Cube+Vec all-core barrier.  Uses FFTS flags 11-14, distinct from the sub-kernels'
-// internal sync flags (6-9), so a sub-kernel's exit-sync immediately followed by this
-// barrier never reuses the same flag back-to-back.
-template <bool isAIVOnly = true>
-AICORE inline void SyncAllImpl()
-{
-    pipe_barrier(PIPE_ALL);
-    if constexpr (isAIVOnly)
-    {
-        ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x0, SYNC_AIV_ONLY_ALL));
-        wait_flag_dev(SYNC_AIV_ONLY_ALL);
-        return;
-    }
-#if defined(__DAV_CUBE__)
-    wait_flag_dev(SYNC_AIV_FLAG);
-    ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
-    wait_flag_dev(SYNC_AIC_FLAG);
-    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
-#elif defined(__DAV_VEC__)
-    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
-    wait_flag_dev(SYNC_AIC_AIV_FLAG);
-#endif
-}
-
 // Strided GM->GM copy reordering a per-dimension tensor from BSND [T,HV,K] to head-major
 // [HV,T,K].  K stays innermost-contiguous; only the (T,HV) axes swap, so this is a pure
 // gather/scatter of K-contiguous rows (no element transpose).  Layout-only — independent
 // of cu_seqlens.
 template <typename T, int32_t KD>
-AICORE void mega_permute_THK_to_HTK(
+AICORE inline void mega_permute_THK_to_HTK(
     __gm__ T *src, __gm__ T *dst, int64_t T_len, int32_t HV)
 {
     // To avoid ambiguity with bisheng intrinsic header's global `enum class Stride`
@@ -278,7 +241,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
     // ── Stage 2: transpose g_sum -> head-major g_cs ──────────────────
     mega_permute_THK_to_HTK<float, KD>(
@@ -291,7 +254,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
     // ── Stage 3: kkt (gated K·K^T lower-tri matrix) ──────────────────
     mk_kkt::kkt_kda_kernel<KD, C>(
@@ -310,7 +273,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
     // ── Stage 4: solve_tril ((I + L)^{-1}) ───────────────────────────
     mega_solve_tril(
@@ -325,7 +288,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
     // ── Stage 5: wy (auxiliaries u, w) ───────────────────────────────
     mk_wy::wy_kda_kernel<KD, C>(
@@ -346,7 +309,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
     // ── Stage 6: chunk_h (state snapshots + v_corr) ──────────────────
     mk_h::chunk_h_kda_kernel<KD, C>(
@@ -365,7 +328,7 @@ extern "C" __global__ AICORE void launch_mega_kernel_kda(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
     // ── Stage 7: chunk_o (output) ────────────────────────────────────
     mk_o::chunk_o_kda_kernel<KD, C>(

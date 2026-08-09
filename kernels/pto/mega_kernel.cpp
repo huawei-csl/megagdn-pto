@@ -42,39 +42,6 @@ using namespace kernel_utils;
 // ===================================================================
 #ifdef __CCE_AICORE__
 
-constexpr uint16_t SYNC_AIV_FLAG = 12;
-constexpr uint16_t SYNC_AIC_FLAG = 11;
-constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
-constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
-constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
-constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
-
-AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId)
-{
-    return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) +
-            ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
-}
-
-template <bool isAIVOnly = true>
-AICORE inline void SyncAllImpl()
-{
-    pipe_barrier(PIPE_ALL);
-    if constexpr (isAIVOnly) {
-        ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x0, SYNC_AIV_ONLY_ALL));
-        wait_flag_dev(SYNC_AIV_ONLY_ALL);
-        return;
-    }
-#if defined(__DAV_CUBE__)
-    wait_flag_dev(SYNC_AIV_FLAG);
-    ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
-    wait_flag_dev(SYNC_AIC_FLAG);
-    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
-#elif defined(__DAV_VEC__)
-    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
-    wait_flag_dev(SYNC_AIC_AIV_FLAG);
-#endif
-}
-
 template <typename T>
 AICORE void mega_transpose_TH_to_HT(
     __gm__ T *src, __gm__ T *dst, int64_t T_len, int32_t H)
@@ -352,7 +319,7 @@ AICORE inline void mega_kernel_impl(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
 #ifdef MEGA_STOP_AFTER_SYNC1
     return;
@@ -372,7 +339,7 @@ AICORE inline void mega_kernel_impl(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
     mk_kkt::kkt_kernel<D, C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
@@ -385,10 +352,21 @@ AICORE inline void mega_kernel_impl(
         batch_size, seq_len, total_tokens, static_cast<uint32_t>(H),
         num_key_heads, ffts_addr);
 
+// Drain the kkt handshake: Vec released both workspace slots (flags 2/3) one
+// last time after Cube's final iteration, so consume them before the next stage.
+// A2: Vec is a separate core → FFTS cross-core flag.
+// A5: both Vec sub-blocks share Cube's core → each signals its own intra-block
+//     flag (base, base + 16).
 #if defined(__DAV_CUBE__)
     pipe_barrier(PIPE_ALL);
+#if __CCE_AICORE__ == 220
     wait_flag_dev(2);
     wait_flag_dev(3);
+#else
+    WaitBothVecOnA5<PIPE_MTE2>(2);
+    WaitBothVecOnA5<PIPE_MTE2>(3);
+    pipe_barrier(PIPE_ALL);
+#endif
 #endif
 
 #ifdef MEGA_STOP_AFTER_KKT
@@ -396,7 +374,7 @@ AICORE inline void mega_kernel_impl(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
     mega_solve_tril(
         reinterpret_cast<__gm__ half *>(A_inv_ptr),
@@ -410,14 +388,14 @@ AICORE inline void mega_kernel_impl(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
 #ifdef MEGA_STOP_AFTER_CAST
     pipe_barrier(PIPE_ALL);
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
 #ifdef MEGA_STOP_AFTER_SYNC_BEFORE_WY
     return;
@@ -437,11 +415,21 @@ AICORE inline void mega_kernel_impl(
         batch_size, seq_len, total_tokens, static_cast<uint32_t>(H),
         num_key_heads, ffts_addr);
 
+// Drain the wy_fast handshake: Cube freed the A2/A1 slots (flags 3/4) one last
+// time after Vec's final iteration.
+// A5: Cube signalled both sub-blocks (base, base + 16); each sub-block waits on
+//     its own flag, so a plain intra-block wait is what mirrors the signal.
 #if defined(__DAV_VEC__)
     if (get_block_idx() < num_matrices) {
         pipe_barrier(PIPE_ALL);
+#if __CCE_AICORE__ == 220
         wait_flag_dev(3);
         wait_flag_dev(4);
+#else
+        wait_intra_block(PIPE_MTE3, 3);
+        wait_intra_block(PIPE_MTE3, 4);
+        pipe_barrier(PIPE_ALL);
+#endif
     }
 #endif
 
@@ -450,7 +438,7 @@ AICORE inline void mega_kernel_impl(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
     mk_h::chunk_h_kernel<D, C>(
         reinterpret_cast<__gm__ half *>(k_ptr),
@@ -473,7 +461,7 @@ AICORE inline void mega_kernel_impl(
     return;
 #endif
 
-    SyncAllImpl<false>();
+    SyncAllMegaKernel<false>();
 
     mk_o::chunk_o_kernel<D, C>(
         reinterpret_cast<__gm__ half *>(q_ptr),
@@ -490,10 +478,17 @@ AICORE inline void mega_kernel_impl(
         batch_size, seq_len, total_tokens, static_cast<uint32_t>(H),
         num_key_heads, ffts_addr);
 
+// Drain the chunk_o handshake: Vec's final "workspace free" (flag 3) is never
+// consumed by Cube's loop, so consume it here.
 #if defined(__DAV_CUBE__)
     if (get_block_idx() < num_matrices) {
         pipe_barrier(PIPE_ALL);
+#if __CCE_AICORE__ == 220
         wait_flag_dev(3);
+#else
+        WaitBothVecOnA5<PIPE_MTE2>(3);
+        pipe_barrier(PIPE_ALL);
+#endif
     }
 #endif
 }
