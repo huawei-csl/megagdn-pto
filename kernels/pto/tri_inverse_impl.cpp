@@ -766,6 +766,9 @@ AICORE void run_tri_inv_rec_unroll(__gm__ OutputT* tensor_out,
       std::is_same_v<InputT, half> or std::is_same_v<InputT, bfloat16_t>,
       "tri_inv_rec_unroll supports only fp16 or bf16.");
 
+  static_assert(
+      std::is_same_v<OutputT, float> or std::is_same_v<OutputT, bfloat16_t>,
+      "tri_inv_rec_unroll supports only fp32 or bf16.");
   switch (matrix_size) {
     case 16:
       runKernelTriInvRecUnroll<InputT, OutputT, 16, NumTilesPerCubeIter,
@@ -810,8 +813,7 @@ AICORE void run_tri_inv_rec_unroll(__gm__ OutputT* tensor_out,
  * strided accesses. If each tile is stored consecutively (and row-wise) in
  * memory, then num_bsnd_heads=0.
  */
-template <typename InputT, typename OutputT, uint32_t NumTilesPerCubeIter,
-          bool IsBSND>
+template <typename InputT, typename OutputT, uint32_t NumTilesPerCubeIter>
 AICORE void run_tri_inv_rec_unroll_per_num_matrices(
     __gm__ OutputT* tensor_out, __gm__ InputT* tensor_in,
     __gm__ InputT* minus_eye_in, uint32_t matrix_size, uint32_t num_matrices,
@@ -877,8 +879,8 @@ extern "C" __global__ AICORE void tri_inv_rec_unroll_fp16(
   const uint32_t is_lower = (num_bsnd_heads >> 16) & 1u;
   const uint32_t actual_heads = num_bsnd_heads & 0xFFFFu;
 
-  run_tri_inv_rec_unroll_per_num_matrices<
-      half, float, 1 /* NumTilesPerCubeIter */, false /* IsBSND */>(
+  run_tri_inv_rec_unroll_per_num_matrices<half, float,
+                                          1 /* NumTilesPerCubeIter */>(
       (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
       (__gm__ half*)minus_identity_in, matrix_size, num_matrices, actual_heads,
       is_lower, (__gm__ int32_t*)cu_seqlens);
