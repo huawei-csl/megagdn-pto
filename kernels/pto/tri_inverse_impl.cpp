@@ -11,7 +11,6 @@ for the full License text.
 
 #include "kernel_utils.h"
 
-#define GM_ADDR __gm__ uint8_t*  // To avoid #include "kernel_operator.h"
 using namespace pto;
 using namespace kernel_utils;
 
@@ -719,14 +718,10 @@ AICORE void runKernelTriInvRecUnroll(__gm__ StoreT* M_inv, __gm__ InputT* M,
                                      uint32_t num_bsnd_heads = 0,
                                      __gm__ int32_t* cu_seqlens = nullptr,
                                      uint32_t is_lower = 0) {
-#if (__CHECK_FEATURE_AT_PRECOMPILE) || \
-    (__CCE_AICORE__ == 220 && defined(__DAV_CUBE__))  // Cube compilation
-
+#ifdef __DAV_CUBE__
   TriInvRecUnrollKernel<InputT, OutputT, MatrixSize, NumTilesPerCubeIter,
                         IsBSND, StoreT>(M_inv, M, I_neg, total_tiles, num_bsnd_heads,
                                 cu_seqlens, is_lower);
-#else
-// Nothing to do on AIV
 #endif
 }
 
