@@ -65,7 +65,7 @@ AICORE inline BSNDVarlenTileInfo GetBSNDVarlenTileInfoFromCuSeqlens(
   }
 }
 
-/*
+/**
  * @brief: Takes as input two matrices of size MatrixSize * MatrixSize each.
  * The src matrix lies in L1, while the dst matrix lies either in L0A or L0B.
  * This kernel copies only the diagonal blocks (fractals) of size FractalSize *
@@ -104,7 +104,7 @@ AICORE inline void CopyDiagonalFractalsL1ToL0(SrcL1TileT src, DstL0TileT dst) {
   }
 }
 
-/*
+/**
  * @brief: Takes as input two matrices of size MatrixSize * MatrixSize each,
  * and an integer block_size. The src matrix lies in L1, while the dst matrix
  * either in L0A or L0B. This method copies some of the diagonal blocks from the
@@ -123,6 +123,10 @@ AICORE inline void CopyDiagonalFractalsL1ToL0(SrcL1TileT src, DstL0TileT dst) {
  * @param src Tile in L1 memory.
  * @param dst Tile in L0A or L0B memory.
  * @param block_size Size of diagonal blocks. Needs: block_size >= FractalSize.
+ * @param swap_parity If true, then the parity of copied blocks is swapped: left
+ * tile gets odd blocks, while right tile gets even blocks. This is used in the
+ * unrolled recursion part of the algorithm, where we need to copy alternating
+ * blocks of X in each iteration.
  */
 template <typename InputT, uint32_t FractalSize, uint32_t MatrixSize,
           typename SrcL1TileT, typename DstL0TileT>
@@ -135,9 +139,11 @@ AICORE inline void CopyOddOrEvenBlocksL1ToL0(SrcL1TileT src, DstL0TileT dst,
   constexpr SLayout InnerLayout =
       is_left ? SLayout::RowMajor : SLayout::ColMajor;
   constexpr BLayout OuterLayout = kernel_utils::GetOuterLayout(is_left);
-
+  // For left: copy even blocks 0, 2, 4, ... (starting_block=0)
+  // For right: copy odd blocks 1, 3, 5, ... (starting_block=1)
   // Default: left→even(0), right→odd(1). swap_parity flips this.
-  const uint32_t starting_block_index = (is_left ? 0u : 1u) ^ (swap_parity ? 1u : 0u);
+  const uint32_t starting_block_index =
+      (is_left ? 0u : 1u) ^ (swap_parity ? 1u : 0u);
 
   const uint32_t num_blocks = MatrixSize / block_size;
   const uint32_t num_fractals_per_block = block_size / FractalSize;
@@ -171,7 +177,7 @@ AICORE inline void CopyOddOrEvenBlocksL1ToL0(SrcL1TileT src, DstL0TileT dst,
   }
 }
 
-/*
+/**
  * @brief: Prepares Identity and Zeros matrix.
  *
  * @tparam TileL1AB The type of the input tiles in L1.
@@ -218,7 +224,7 @@ AICORE inline void PrepareAuxiliaryMatrices(
   wait_flag(PIPE_FIX, PIPE_MTE1, static_cast<event_t>(0));
 }
 
-/*
+/**
  * @brief: Inverts a single matrix / tile of the global tensor.
  * The first part of the algorithm inverts the FractalSize * FractalSize
  * diagonal blocks of the input matrix (inv_trick part). The second phase
@@ -244,6 +250,10 @@ AICORE inline void PrepareAuxiliaryMatrices(
  * @param b_l0_tile* Array of two tiles in L0B (for double-buffering).
  * @param c_l0_tile* Tile in L0C for matmuls.
  * @param tile_id Index of the current tile (used for sync).
+ * @param swap_parity If true, then the parity of copied blocks is swapped: left
+ * tile gets odd blocks, while right tile gets even blocks. This is used in the
+ * unrolled recursion part of the algorithm, where we need to copy alternating
+ * blocks of X in each iteration.
  */
 template <typename InputT, typename TileL1AB, typename TileL0A,
           typename TileL0B, typename TileL0C, uint32_t MatrixSize,
@@ -253,8 +263,7 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
                                     TileL1AB M_neg_l1_tile,
                                     TileL1AB Zero_l1_tile, TileL1AB Y_l1_tile,
                                     TileL0A* a_l0_tile, TileL0B* b_l0_tile,
-                                    TileL0C* c_l0_tile,
-                                    const uint32_t tile_id,
+                                    TileL0C* c_l0_tile, const uint32_t tile_id,
                                     const bool swap_parity = false) {
   const event_t event_0 = static_cast<event_t>(tile_id);
   const event_t event_1 = static_cast<event_t>(tile_id + NumTilesPerCubeIter);
@@ -392,6 +401,15 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
 
   /*
    * Unrolled recursion part:
+   * block_size = FractalSize
+   * while block_size < MatrixSize:
+   *     LX = even_blocks(X, block_size)
+   *     RX = odd_blocks(X, block_size)
+   *     Y = LX @ (-M) + I
+   *     X = Y @ RX + LX
+   *     block_size *= 2
+   *
+   * Comments:
    * Upper-tri (swap_parity=false):
    *   LX = even_blocks(X), RX = odd_blocks(X)
    *   Y = LX @ (-M) + I, X = Y @ RX + LX
@@ -420,7 +438,8 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
 
     wait_flag(PIPE_FIX, PIPE_MTE1, event_1);  // Wait to write last X
     CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
-        X_l1_tile, a_l0_tile[1], block_size, swap_parity);  // a_l0[1]: even(LX) or odd(RX)
+        X_l1_tile, a_l0_tile[1], block_size,
+        swap_parity);  // a_l0[1]: even(LX) or odd(RX)
     set_flag(PIPE_MTE1, PIPE_M, event_1);
 
     wait_flag(PIPE_MTE1, PIPE_M, event_0);
@@ -442,11 +461,13 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
     set_flag(PIPE_FIX, PIPE_MTE1, event_0);
     set_flag(PIPE_FIX, PIPE_M, event_0);
 
-    /* Load complementary blocks of X in L0B */
+    /* Load complementary blocks of X in L0B. If swap_parity = fase, "Load Odd
+     * Blocks Of X In L0B" */
     wait_flag(PIPE_M, PIPE_MTE1, event_1);
     TMOV(b_l0_tile[0], Zero_l1_tile);
     CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
-        X_l1_tile, b_l0_tile[0], block_size, swap_parity);  // b_l0[0]: odd(RX) or even(LX)
+        X_l1_tile, b_l0_tile[0], block_size,
+        swap_parity);  // b_l0[0]: odd(RX) or even(LX)
 
     wait_flag(PIPE_M, PIPE_MTE1, event_0);  // Wait for previous use of a_l0[1]
     wait_flag(PIPE_FIX, PIPE_MTE1, event_0);  // Wait for Y_l1
@@ -472,10 +493,10 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
   wait_flag(PIPE_FIX, PIPE_MTE1, event_1);  // Write c_l0[1] to X_l1
 }
 
-/*
+/**
  * @brief: Runs the main kernel (inverts all matrices in the tensor)
  *
- * @tparam InputT The type of the input elements.
+ * @tparam InputT The type of the input elements. Supports fp16 and bf16.
  * @tparam OutputT The type of the output elements.
  * @tparam MatrixSize Size of the entire input/output matrices.
  * @tparam NumTilesPerCubeIter How many matrices to load and invert in a single
@@ -493,18 +514,23 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
  * @param I_neg Pointer to global memory that contains the negative identity.
  * @param total_tiles The total number of matrices to invert.
  * @param num_bsnd_heads The number of heads, only for BSND format.
+ * @param is_lower If input matrices are lower-triangular (is_lower == 1) or
+ * upper-triangular (is_lower == 0). Default is upper triangular.
+ * @param num_bsnd_heads The number of heads, only for BSND format.
  */
 template <typename InputT, typename OutputT, uint32_t MatrixSize,
-          uint32_t NumTilesPerCubeIter, bool IsBSND, typename StoreT = OutputT>
-AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT* M_inv,
+          uint32_t NumTilesPerCubeIter, bool IsBSND>
+AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
                                          __gm__ InputT* M, __gm__ InputT* I_neg,
                                          uint32_t total_tiles,
                                          uint32_t num_bsnd_heads = 0,
-                                         __gm__ int32_t* cu_seqlens = nullptr,
-                                         uint32_t is_lower = 0) {
+                                         uint32_t is_lower = 0,
+                                         __gm__ int32_t* cu_seqlens = nullptr) {
+  using pto::Stride;
+
   /* Initializations */
   constexpr uint32_t TileLen = MatrixSize * MatrixSize;
-  constexpr uint32_t FractalSize = 16;  // fractal size for half
+  constexpr uint32_t FractalSize = 16;  // fractal size for half /bf16
   constexpr uint32_t NumFractalsRowWise = MatrixSize / FractalSize;
   constexpr uint32_t NumL0Buffers = 2;
 
@@ -529,14 +555,14 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT* M_inv,
                                       GlobalTileStridesINeg, Layout::ND>;
 
   using GlobalTileShapeOut =
-      TileShape2D<StoreT, MatrixSize, MatrixSize, Layout::ND>;
+      TileShape2D<OutputT, MatrixSize, MatrixSize, Layout::ND>;
   using GlobalTileStridesOut = typename std::conditional<
-      !IsBSND, BaseShape2D<StoreT, MatrixSize, MatrixSize, Layout::ND>,
+      !IsBSND, BaseShape2D<OutputT, MatrixSize, MatrixSize, Layout::ND>,
       pto::Stride<1, 1, 1, -1, 1>>::type;
-  using GlobalTileOut = GlobalTensor<StoreT, GlobalTileShapeOut,
+  using GlobalTileOut = GlobalTensor<OutputT, GlobalTileShapeOut,
                                      GlobalTileStridesOut, Layout::ND>;
   using GlobalTileDynamicOut =
-      GlobalTensor<StoreT, GlobalTileDynamicShape, GlobalTileDynamicStride,
+      GlobalTensor<OutputT, GlobalTileDynamicShape, GlobalTileDynamicStride,
                    Layout::ND>;
   using TileL1AB =
       Tile<TileType::Mat, InputT, MatrixSize, MatrixSize, BLayout::ColMajor,
@@ -548,9 +574,9 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT* M_inv,
   // L0 Memory
   using TileL0A = TileLeft<InputT, MatrixSize, MatrixSize>;
   using TileL0B = TileRight<InputT, MatrixSize, MatrixSize>;
-  using TileL0C = TileAcc<OutputT, MatrixSize, MatrixSize>;
+  using TileL0C = TileAcc<float, MatrixSize, MatrixSize>;
   using TileL0CDynamic =
-      TileAcc<OutputT, MatrixSize, MatrixSize, DYNAMIC, DYNAMIC>;
+      TileAcc<float, MatrixSize, MatrixSize, DYNAMIC, DYNAMIC>;
 
   GlobalTileINeg I_neg_global_in(I_neg);
 
@@ -577,8 +603,7 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT* M_inv,
   for (uint32_t buffer_num = 0; buffer_num < NumL0Buffers; ++buffer_num) {
     TASSIGN(a_l0_tile[buffer_num], 0x0 + buffer_num * TileLen * sizeof(InputT));
     TASSIGN(b_l0_tile[buffer_num], 0x0 + buffer_num * TileLen * sizeof(InputT));
-    TASSIGN(c_l0_tile[buffer_num],
-            0x0 + buffer_num * TileLen * sizeof(OutputT));
+    TASSIGN(c_l0_tile[buffer_num], 0x0 + buffer_num * TileLen * sizeof(float));
   }
   TLOAD(I_neg_l1_tile, I_neg_global_in);
   set_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(0));
@@ -678,7 +703,7 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT* M_inv,
         if (valid_size < MatrixSize) {
           TileL0CDynamic c_l0_tail_tile(valid_size, valid_size);
           TASSIGN(c_l0_tail_tile,
-                  0x0 + final_c_buffer_index * TileLen * sizeof(OutputT));
+                  0x0 + final_c_buffer_index * TileLen * sizeof(float));
           GlobalTileDynamicOut M_inv_global_out_dyn(
               M_inv + bsnd_offset,
               {1, 1, 1, static_cast<int>(valid_size),
@@ -712,60 +737,73 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ StoreT* M_inv,
  * @brief: Computes the inverses of the blocks of tensor M
  */
 template <typename InputT, typename OutputT, uint32_t MatrixSize,
-          uint32_t NumTilesPerCubeIter, bool IsBSND, typename StoreT = OutputT>
-AICORE void runKernelTriInvRecUnroll(__gm__ StoreT* M_inv, __gm__ InputT* M,
+          uint32_t NumTilesPerCubeIter, bool IsBSND>
+AICORE void runKernelTriInvRecUnroll(__gm__ OutputT* M_inv, __gm__ InputT* M,
                                      __gm__ InputT* I_neg, uint32_t total_tiles,
                                      uint32_t num_bsnd_heads = 0,
-                                     __gm__ int32_t* cu_seqlens = nullptr,
-                                     uint32_t is_lower = 0) {
-#ifdef __DAV_CUBE__
+                                     uint32_t is_lower = 0,
+                                     __gm__ int32_t* cu_seqlens = nullptr) {
+#if defined(__DAV_CUBE__)  // Cube compilation
+
   TriInvRecUnrollKernel<InputT, OutputT, MatrixSize, NumTilesPerCubeIter,
-                        IsBSND, StoreT>(M_inv, M, I_neg, total_tiles, num_bsnd_heads,
-                                cu_seqlens, is_lower);
+                        IsBSND>(M_inv, M, I_neg, total_tiles, num_bsnd_heads,
+                                is_lower, cu_seqlens);
+#else
+// Nothing to do on AIV
 #endif
 }
 
-template <typename InputT, uint32_t NumTilesPerCubeIter, bool IsBSND>
-AICORE void run_tri_inv_rec_unroll(__gm__ float* tensor_out,
+template <typename InputT, typename OutputT, uint32_t NumTilesPerCubeIter,
+          bool IsBSND>
+AICORE void run_tri_inv_rec_unroll(__gm__ OutputT* tensor_out,
                                    __gm__ InputT* tensor_in,
-                                   __gm__ InputT* minus_identity_in,
+                                   __gm__ InputT* minus_eye_in,
                                    uint32_t matrix_size, uint32_t num_matrices,
                                    uint32_t num_bsnd_heads,
-                                   __gm__ int32_t* cu_seqlens = nullptr,
-                                   uint32_t is_lower = 0) {
-  static_assert(std::is_same_v<InputT, half>,
-                "tri_inv_rec_unroll supports only fp16.");
+                                   uint32_t is_lower = 0,
+                                   __gm__ int32_t* cu_seqlens = nullptr) {
+  static_assert(
+      std::is_same_v<InputT, half> or std::is_same_v<InputT, bfloat16_t>,
+      "tri_inv_rec_unroll supports only fp16 or bf16.");
+
+  static_assert(
+      std::is_same_v<OutputT, half> or std::is_same_v<OutputT, bfloat16_t>,
+      "tri_inv_rec_unroll supports only fp16 or bf16.");
   switch (matrix_size) {
     case 16:
-      runKernelTriInvRecUnroll<InputT, float, 16, NumTilesPerCubeIter, IsBSND>(
-          tensor_out, tensor_in, minus_identity_in, num_matrices,
-          num_bsnd_heads, cu_seqlens, is_lower);
+      runKernelTriInvRecUnroll<InputT, OutputT, 16, NumTilesPerCubeIter,
+                               IsBSND>(tensor_out, tensor_in, minus_eye_in,
+                                       num_matrices, num_bsnd_heads, is_lower,
+                                       cu_seqlens);
       break;
     case 32:
-      runKernelTriInvRecUnroll<InputT, float, 32, NumTilesPerCubeIter, IsBSND>(
-          tensor_out, tensor_in, minus_identity_in, num_matrices,
-          num_bsnd_heads, cu_seqlens, is_lower);
+      runKernelTriInvRecUnroll<InputT, OutputT, 32, NumTilesPerCubeIter,
+                               IsBSND>(tensor_out, tensor_in, minus_eye_in,
+                                       num_matrices, num_bsnd_heads, is_lower,
+                                       cu_seqlens);
       break;
     case 64:
-      runKernelTriInvRecUnroll<InputT, float, 64, NumTilesPerCubeIter, IsBSND>(
-          tensor_out, tensor_in, minus_identity_in, num_matrices,
-          num_bsnd_heads, cu_seqlens, is_lower);
+      runKernelTriInvRecUnroll<InputT, OutputT, 64, NumTilesPerCubeIter,
+                               IsBSND>(tensor_out, tensor_in, minus_eye_in,
+                                       num_matrices, num_bsnd_heads, is_lower,
+                                       cu_seqlens);
       break;
     case 128:
-      runKernelTriInvRecUnroll<InputT, float, 128, NumTilesPerCubeIter, IsBSND>(
-          tensor_out, tensor_in, minus_identity_in, num_matrices,
-          num_bsnd_heads, cu_seqlens, is_lower);
+      runKernelTriInvRecUnroll<InputT, OutputT, 128, NumTilesPerCubeIter,
+                               IsBSND>(tensor_out, tensor_in, minus_eye_in,
+                                       num_matrices, num_bsnd_heads, is_lower,
+                                       cu_seqlens);
       break;
   }
 }
 
 /*
- * @brief: Wrapper for the kernel, "half" type (fp16).
+ * @brief: Wrapper for the kernel supporting fp16 and bfloat16 types.
  *
  * @param tensor_out pointer to the global memory to store the final inverse.
  * @param tensor_in Pointer to the global tensor matrix in global memory.
- * @param minus_identity_in Pointer to global memory that contains the negative
- * identity.
+ * @param minus_eye_in Pointer to the global tensor matrix containing the
+ * negative identity matrix.
  * @param matrix_size The size if each individual matrix / tile. Can take
  * values: {16, 32, 64, 128}.
  * @param num_matrices The total number of matrices / tiles in the global
@@ -775,51 +813,46 @@ AICORE void run_tri_inv_rec_unroll(__gm__ float* tensor_out,
  * strided accesses. If each tile is stored consecutively (and row-wise) in
  * memory, then num_bsnd_heads=0.
  */
-extern "C" __global__ AICORE void tri_inv_rec_unroll_fp16(
-    __gm__ void* tensor_out, __gm__ void* tensor_in,
-    __gm__ void* minus_identity_in, uint32_t matrix_size, uint32_t num_matrices,
-    uint32_t num_bsnd_heads, __gm__ void* cu_seqlens) {
-  const uint32_t is_lower = (num_bsnd_heads >> 16) & 1u;
-  const uint32_t actual_heads = num_bsnd_heads & 0xFFFFu;
-  if (actual_heads == 0) {
+template <typename InputT, typename OutputT, uint32_t NumTilesPerCubeIter,
+          bool IsBSND>
+AICORE void run_tri_inv_rec_unroll_per_num_matrices(
+    __gm__ OutputT* tensor_out, __gm__ InputT* tensor_in,
+    __gm__ InputT* minus_eye_in, uint32_t matrix_size, uint32_t num_matrices,
+    uint32_t num_bsnd_heads, uint32_t is_lower = 0,
+    __gm__ int32_t* cu_seqlens = nullptr) {
+  if (num_bsnd_heads == 0) {
     if (num_matrices <= get_block_num()) {
-      run_tri_inv_rec_unroll<half, 1 /* NumTilesPerCubeIter */,
+      run_tri_inv_rec_unroll<InputT, OutputT, 1 /* NumTilesPerCubeIter */,
                              false /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, (__gm__ int32_t*)cu_seqlens, is_lower);
+          tensor_out, tensor_in, minus_eye_in, matrix_size, num_matrices,
+          num_bsnd_heads, is_lower, cu_seqlens);
     } else if (num_matrices <= 2 * get_block_num()) {
-      run_tri_inv_rec_unroll<half, 2 /* NumTilesPerCubeIter */,
+      run_tri_inv_rec_unroll<InputT, OutputT, 2 /* NumTilesPerCubeIter */,
                              false /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, (__gm__ int32_t*)cu_seqlens, is_lower);
+          tensor_out, tensor_in, minus_eye_in, matrix_size, num_matrices,
+          num_bsnd_heads, is_lower, cu_seqlens);
     } else {
-      run_tri_inv_rec_unroll<half, 4 /* NumTilesPerCubeIter */,
+      run_tri_inv_rec_unroll<InputT, OutputT, 4 /* NumTilesPerCubeIter */,
                              false /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, (__gm__ int32_t*)cu_seqlens, is_lower);
+          tensor_out, tensor_in, minus_eye_in, matrix_size, num_matrices,
+          num_bsnd_heads, is_lower, cu_seqlens);
     }
   } else {
     if (num_matrices <= get_block_num()) {
-      run_tri_inv_rec_unroll<half, 1 /* NumTilesPerCubeIter */,
+      run_tri_inv_rec_unroll<InputT, OutputT, 1 /* NumTilesPerCubeIter */,
                              true /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, (__gm__ int32_t*)cu_seqlens, is_lower);
+          tensor_out, tensor_in, minus_eye_in, matrix_size, num_matrices,
+          num_bsnd_heads, is_lower, cu_seqlens);
     } else if (num_matrices <= 2 * get_block_num()) {
-      run_tri_inv_rec_unroll<half, 2 /* NumTilesPerCubeIter */,
+      run_tri_inv_rec_unroll<InputT, OutputT, 2 /* NumTilesPerCubeIter */,
                              true /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, (__gm__ int32_t*)cu_seqlens, is_lower);
+          tensor_out, tensor_in, minus_eye_in, matrix_size, num_matrices,
+          num_bsnd_heads, is_lower, cu_seqlens);
     } else {
-      run_tri_inv_rec_unroll<half, 4 /* NumTilesPerCubeIter */,
+      run_tri_inv_rec_unroll<InputT, OutputT, 4 /* NumTilesPerCubeIter */,
                              true /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, (__gm__ int32_t*)cu_seqlens, is_lower);
+          tensor_out, tensor_in, minus_eye_in, matrix_size, num_matrices,
+          num_bsnd_heads, is_lower, cu_seqlens);
     }
   }
 }
