@@ -876,45 +876,10 @@ extern "C" __global__ AICORE void tri_inv_rec_unroll_fp16(
     uint32_t num_bsnd_heads, __gm__ void* cu_seqlens) {
   const uint32_t is_lower = (num_bsnd_heads >> 16) & 1u;
   const uint32_t actual_heads = num_bsnd_heads & 0xFFFFu;
-  if (actual_heads == 0) {
-    if (num_matrices <= get_block_num()) {
-      run_tri_inv_rec_unroll<half, float, 1 /* NumTilesPerCubeIter */,
-                             false /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, is_lower, (__gm__ int32_t*)cu_seqlens);
-    } else if (num_matrices <= 2 * get_block_num()) {
-      run_tri_inv_rec_unroll<half, float, 2 /* NumTilesPerCubeIter */,
-                             false /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, is_lower, (__gm__ int32_t*)cu_seqlens);
-    } else {
-      run_tri_inv_rec_unroll<half, float, 4 /* NumTilesPerCubeIter */,
-                             false /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, is_lower, (__gm__ int32_t*)cu_seqlens);
-    }
-  } else {
-    if (num_matrices <= get_block_num()) {
-      run_tri_inv_rec_unroll<half, float, 1 /* NumTilesPerCubeIter */,
-                             true /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, is_lower, (__gm__ int32_t*)cu_seqlens);
-    } else if (num_matrices <= 2 * get_block_num()) {
-      run_tri_inv_rec_unroll<half, float, 2 /* NumTilesPerCubeIter */,
-                             true /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, is_lower, (__gm__ int32_t*)cu_seqlens);
-    } else {
-      run_tri_inv_rec_unroll<half, float, 4 /* NumTilesPerCubeIter */,
-                             true /* IsBSND */>(
-          (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
-          (__gm__ half*)minus_identity_in, matrix_size, num_matrices,
-          actual_heads, is_lower, (__gm__ int32_t*)cu_seqlens);
-    }
-  }
+
+  run_tri_inv_rec_unroll_per_num_matrices<
+      half, float, 1 /* NumTilesPerCubeIter */, false /* IsBSND */>(
+      (__gm__ float*)tensor_out, (__gm__ half*)tensor_in,
+      (__gm__ half*)minus_identity_in, matrix_size, num_matrices, actual_heads,
+      is_lower, (__gm__ int32_t*)cu_seqlens);
 }
