@@ -115,6 +115,9 @@ AICORE void kkt_kda_kernel(
     int64_t batch_size, int64_t seq_len, int64_t total_tokens,
     int32_t num_heads, uint64_t ffts_addr)
 {
+    // To avoid ambiguity with bisheng intrinsic header's global `enum class Stride`
+    using pto::Stride;
+
     auto cid = get_block_idx();
     auto block_num = get_block_num();
     auto vid = get_subblockid();
@@ -127,6 +130,12 @@ AICORE void kkt_kda_kernel(
 
     constexpr int32_t HalfChunk = ChunkSize / 2;
     constexpr int32_t KTC = ((KDim + 7) / 8) * 8;
+    // A RowMajor/NoneBox tile needs its column byte-width 32-byte aligned, and a
+    // ColMajor/NoneBox one its row byte-width: 16 halves / 8 floats.  HalfChunk
+    // itself is only 8 at ChunkSize=16, so the [1, HalfChunk] beta tiles must use
+    // padded widths (both collapse to HalfChunk at ChunkSize=128).
+    constexpr int32_t HalfChunkH = ((HalfChunk + 15) / 16) * 16; // fp16 cols
+    constexpr int32_t HalfChunkF = ((HalfChunk + 7) / 8) * 8;    // fp32 cols/rows
 
     int64_t num_seqs = batch_size;
 
@@ -184,9 +193,9 @@ AICORE void kkt_kda_kernel(
     constexpr int32_t KCH_ADDR = KC_ADDR + KTC * 4;               // [1, K] fp16 (k_c staging)
     constexpr int32_t COL_ADDR = KCH_ADDR + KTC * 2;              // [HalfChunk, 16] fp32 (colsum, RowMajor padded)
     constexpr int32_t COLH_ADDR = COL_ADDR + HalfChunk * 16 * 4;  // [HalfChunk, 16] fp16 (padded store, RowMajor)
-    constexpr int32_t BETA_ADDR = COLH_ADDR + HalfChunk * 16 * 2; // [1, HalfChunk] fp32 (beta)
-    constexpr int32_t BETAH_ADDR = BETA_ADDR + HalfChunk * 4;     // [1, HalfChunk] fp16 (beta staging)
-    constexpr int32_t MSKC_ADDR = BETAH_ADDR + HalfChunk * 2;     // [1, HalfChunk] fp32 (mask col)
+    constexpr int32_t BETA_ADDR = COLH_ADDR + HalfChunk * 16 * 2; // [1, HalfChunkF] fp32 (beta)
+    constexpr int32_t BETAH_ADDR = BETA_ADDR + HalfChunkF * 4;    // [1, HalfChunkH] fp16 (beta staging)
+    constexpr int32_t MSKC_ADDR = BETAH_ADDR + HalfChunkH * 2;    // [HalfChunk, 16] fp32 (mask col)
 
     int32_t my_off = static_cast<int32_t>(vid) * HalfChunk;
 
@@ -278,16 +287,16 @@ AICORE void kkt_kda_kernel(
                 GmHalf_1 b_gm(beta_ptr + static_cast<int64_t>(head_idx) * total_tokens +
                                   my_first,
                               gs);
-                UbND<half, 1, HalfChunk, DYNAMIC, DYNAMIC> b_ld(1, my_rows);
+                UbND<half, 1, HalfChunkH, DYNAMIC, DYNAMIC> b_ld(1, my_rows);
                 TASSIGN(b_ld, BETAH_ADDR);
                 TLOAD(b_ld, b_gm);
             }
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             {
-                UbND<half, 1, HalfChunk, DYNAMIC, DYNAMIC> b_h(1, my_rows);
+                UbND<half, 1, HalfChunkH, DYNAMIC, DYNAMIC> b_h(1, my_rows);
                 TASSIGN(b_h, BETAH_ADDR);
-                UbND<float, 1, HalfChunk, DYNAMIC, DYNAMIC> b_f(1, my_rows);
+                UbND<float, 1, HalfChunkF, DYNAMIC, DYNAMIC> b_f(1, my_rows);
                 TASSIGN(b_f, BETA_ADDR);
                 TCVT(b_f, b_h, pto::RoundMode::CAST_NONE);
                 PipeBarrierVec();
@@ -297,7 +306,7 @@ AICORE void kkt_kda_kernel(
             TASSIGN(myg, MYG_ADDR);
             UbND<float, HalfChunk, KTC, DYNAMIC, DYNAMIC> myk(my_rows, KDim);
             TASSIGN(myk, MYK_ADDR);
-            UbDN<float, HalfChunk, 1, DYNAMIC, DYNAMIC> beta_col(my_rows, 1);
+            UbDN<float, HalfChunkF, 1, DYNAMIC, DYNAMIC> beta_col(my_rows, 1);
             TASSIGN(beta_col, BETA_ADDR);
 
             // ── Column loop ──────────────────────────────────────────────────

@@ -155,6 +155,9 @@ AICORE void chunk_o_kernel(
     uint32_t num_key_heads,
     uint64_t ffts_addr)
 {
+  // To avoid ambiguity with bisheng intrinsic header's global `enum class Stride`
+  using pto::Stride;
+
   // Half the chunk — each Vec sub-block handles C/2 rows independently.
   constexpr int32_t HalfChunk = ChunkSize / 2;
   // KTail / CTail: the number of valid elements in the last 128-element tile
