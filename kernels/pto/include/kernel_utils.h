@@ -66,7 +66,6 @@ AICORE inline void WaitBothVecOnA5(uint16_t flag) {
   wait_intra_block(Pipe, flag + VEC_FLAG_OFFSET);
 }
 
-
 /**
  * @brief Returns the outer matrix layout based on the target architecture and
  * matrix orientation.
@@ -98,74 +97,70 @@ AICORE inline void PipeBarrierVec() {
 #endif
 }
 
-
-AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId)
-{
-    constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
-    constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
-    return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) +
-            ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
+AICORE inline uint16_t GetffstMsg(uint16_t mode, uint16_t flagId) {
+  constexpr uint16_t SYNC_MODE_SHIFT_VALUE = 4;
+  constexpr uint16_t SYNC_FLAG_SHIFT_VALUE = 8;
+  return (0x1 + ((mode & 0x3) << SYNC_MODE_SHIFT_VALUE) +
+          ((flagId & 0xf) << SYNC_FLAG_SHIFT_VALUE));
 }
 
 template <bool isAIVOnly = true>
-AICORE inline void SyncAllA2A3()
-{
+AICORE inline void SyncAllA2A3() {
 // These constants are defined on A5
 #if __CCE_AICORE__ == 220
-    constexpr uint16_t SYNC_AIV_FLAG = 12;
-    constexpr uint16_t SYNC_AIC_FLAG = 11;
-    constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
-    constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
-    pipe_barrier(PIPE_ALL);
-    if constexpr (isAIVOnly) {
-        ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x0, SYNC_AIV_ONLY_ALL));
-        wait_flag_dev(SYNC_AIV_ONLY_ALL);
-        return;
-    }
+  constexpr uint16_t SYNC_AIV_FLAG = 12;
+  constexpr uint16_t SYNC_AIC_FLAG = 11;
+  constexpr uint16_t SYNC_AIC_AIV_FLAG = 13;
+  constexpr uint16_t SYNC_AIV_ONLY_ALL = 14;
+  pipe_barrier(PIPE_ALL);
+  if constexpr (isAIVOnly) {
+    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x0, SYNC_AIV_ONLY_ALL));
+    wait_flag_dev(SYNC_AIV_ONLY_ALL);
+    return;
+  }
 #if defined(__DAV_CUBE__)
-    wait_flag_dev(SYNC_AIV_FLAG);
-    ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
-    wait_flag_dev(SYNC_AIC_FLAG);
-    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
+  wait_flag_dev(SYNC_AIV_FLAG);
+  ffts_cross_core_sync(PIPE_FIX, GetffstMsg(0x0, SYNC_AIC_FLAG));
+  wait_flag_dev(SYNC_AIC_FLAG);
+  ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIC_AIV_FLAG));
 #elif defined(__DAV_VEC__)
-    ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
-    wait_flag_dev(SYNC_AIC_AIV_FLAG);
+  ffts_cross_core_sync(PIPE_MTE3, GetffstMsg(0x02, SYNC_AIV_FLAG));
+  wait_flag_dev(SYNC_AIC_AIV_FLAG);
 #endif
 #endif
 }
 
 // ── A5 ── mirrors include/pto/npu/a5/SyncAll.hpp:101-111
-  // Requires: getFFTSMsg from <pto/npu/a5/SyncAll.hpp> (A5 defines its own)
-AICORE inline void SyncAllMixA5()
-{
+// Requires: getFFTSMsg from <pto/npu/a5/SyncAll.hpp> (A5 defines its own)
+AICORE inline void SyncAllMixA5() {
 #if __CCE_AICORE__ != 220
-      pipe_barrier(PIPE_ALL);
+  pipe_barrier(PIPE_ALL);
 #if defined(__DAV_CUBE__)
-      // 1. Wait for both paired AIVs: one flag ID per subblock (base, base + SYNC_FLAG_ID_MAX).
-      wait_intra_block(PIPE_S, SYNC_AIV_FLAG);
-      wait_intra_block(PIPE_S, SYNC_AIV_FLAG + SYNC_FLAG_ID_MAX);
-      // 2. Global all-AIC barrier.
-      ffts_cross_core_sync(PIPE_FIX, getFFTSMsg(0x0, SYNC_AIC_FLAG));
-      wait_flag_dev(PIPE_S, SYNC_AIC_FLAG);
-      // 3. Release both paired AIVs.
-      set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
-      set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG + SYNC_FLAG_ID_MAX);
+  // 1. Wait for both paired AIVs: one flag ID per subblock (base, base +
+  // SYNC_FLAG_ID_MAX).
+  wait_intra_block(PIPE_S, SYNC_AIV_FLAG);
+  wait_intra_block(PIPE_S, SYNC_AIV_FLAG + SYNC_FLAG_ID_MAX);
+  // 2. Global all-AIC barrier.
+  ffts_cross_core_sync(PIPE_FIX, getFFTSMsg(0x0, SYNC_AIC_FLAG));
+  wait_flag_dev(PIPE_S, SYNC_AIC_FLAG);
+  // 3. Release both paired AIVs.
+  set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
+  set_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG + SYNC_FLAG_ID_MAX);
 #elif defined(__DAV_VEC__)
-      // Set on MTE3 so prior stores drain; wait on PIPE_S.
-      set_intra_block(PIPE_MTE3, SYNC_AIV_FLAG);
-      wait_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
+  // Set on MTE3 so prior stores drain; wait on PIPE_S.
+  set_intra_block(PIPE_MTE3, SYNC_AIV_FLAG);
+  wait_intra_block(PIPE_S, SYNC_AIC_AIV_FLAG);
 #endif
 #endif
 }
 
 template <bool isAIVOnly = true>
-AICORE inline void SyncAllMegaKernel()
-{
+AICORE inline void SyncAllMegaKernel() {
 #if __CCE_AICORE__ == 220
-	SyncAllA2A3<isAIVOnly>();
+  SyncAllA2A3<isAIVOnly>();
 #else
-	static_assert(isAIVOnly == false, "No support for AIV only global sync");
-	SyncAllMixA5();
+  static_assert(isAIVOnly == false, "No support for AIV only global sync");
+  SyncAllMixA5();
 #endif
 }
 

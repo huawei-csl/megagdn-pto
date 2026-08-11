@@ -49,7 +49,7 @@ Batch和sequence维度显然要作为动态轴以应对prefill。我们沿用FLA
 - `TLOAD` & `TSTORE`指令的global memory offset需要累计的`cu_seqlens`而不是每个`seqlen`
 
 熟悉FLA triton代码的读者会注意到Triton里还用了`chunk_indices`和`chunk_offset`这两个入参，而在我们的NPU kernel里不需要，反而看起来简单一点。这是由于多核`block_idx`的计算行为不同，在我们前一篇教程的[NPU kernel launch行为](https://github.com/huawei-csl/pto-dsl/blob/0.1.2/examples/aot/matmul_optimization_guide/matmul_optim_guide_zh.md#typical-kernel-launch-syntax)里有解释。Triton/CUDA惯用的launch grid和输入数据size成正比，例如：
-- [chunk_delta_h.py里的](https://github.com/fla-org/flash-linear-attention/blob/v0.4.2/fla/ops/common/chunk_delta_h.py#L691)`grid = (triton.cdiv(V, meta['BV']), N*H)`. 
+- [chunk_delta_h.py里的](https://github.com/fla-org/flash-linear-attention/blob/v0.4.2/fla/ops/common/chunk_delta_h.py#L691)`grid = (triton.cdiv(V, meta['BV']), N*H)`.
 - 由于`block_idx` (triton的`program_id`) 的上限不固定，每个`block_idx`到chunk下标的映射需要额外的metadata(`chunk_indices`和`chunk_offset`)辅助计算。
 - 而NPU kernel惯用`block_dim = num_cores`，程序里的`block_idx`永远是`0`到`num_cores - 1`, 直接在循环内部把workload依次分配给每个核就行了。
 

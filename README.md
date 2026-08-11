@@ -25,7 +25,7 @@ See full report [in English](blog/mega_gdn_en.md) or [in Chinese](blog/mega_gdn_
 Recommend using [vllm-ascend docker images](https://quay.io/repository/ascend/vllm-ascend?tab=tags) with pre-installed vllm-ascend and triton-ascend (as baseline). This repo provides "plug-in" style patch compatile with vllm 0.18 and 0.19, without needing to rebuild vllm sources.
 
 ```bash
-docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1 
+docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1
 docker pull quay.io/ascend/vllm-ascend:v0.19.1rc1
 ```
 
@@ -52,7 +52,7 @@ cd megagdn-pto
 git submodule update --init --recursive
 
 # install `megagdn_pto` utilities, mostly just torch interface to PTO kernel call
-pip install -e '.[eval,plot]' 
+pip install -e '.[eval,plot]'
 ```
 
 ## Kernel-only unit tests and benchmarks
@@ -67,8 +67,8 @@ python tests/test_kda_single_kernels.py
 python tests/test_kda_e2e.py
 
 # performance benchmark
-python benchmarks/kernel/bench_gdn_kernels.py \
-    --device npu:0 --n-seq 16 --l-seg 8192 --H-list 16,32,48,64 
+ python benchmarks/kernel/bench_gdn_kernels.py \
+    --device npu:0 --n-seq 16 --l-seg 8192 --H-list 16,32,48,64
 ```
 
 ## End-to-end evaluation in vLLM

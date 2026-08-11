@@ -26,10 +26,10 @@
 //   K   [HV, T, K]              fp32  — keys (head-major)
 //   W   [B, T, HV, K]           fp16  — wy_kda output, cast to fp16 in wrapper
 //   U   [B, T, HV, V]           fp32  — wy_kda output (BSND)
-//   G   [HV, T, K]              fp32  — per-dim cumulative gate sum (head-major)
-//   S   [total_chunks, HV, K, V] fp32 — snapshots (output)
-//   V_corr [B, T, HV, V]        fp32  — corrected values (BSND, output)
-//   workspace [per-core scratch] fp16  — 5 slots × K*V halves
+//   G   [HV, T, K]              fp32  — per-dim cumulative gate sum
+//   (head-major) S   [total_chunks, HV, K, V] fp32 — snapshots (output) V_corr
+//   [B, T, HV, V]        fp32  — corrected values (BSND, output) workspace
+//   [per-core scratch] fp16  — 5 slots × K*V halves
 //
 // Workspace per AI core (5 slots, fp16; assumes K == V == HiddenSize):
 //   WS_WS [C, V]   Cube writes WS = W @ S          → Vec reads
@@ -39,12 +39,12 @@
 //   WS_KV [K, V]   Cube writes K_rest^T @ V_corr   → Vec reads
 // ============================================================================
 
+#include <runtime/rt_ffts.h>
+
 #include <pto/pto-inst.hpp>
 #include <type_traits>
 
-#include "kernel_utils.h"
 #include "acl/acl.h"
-#include <runtime/rt_ffts.h>
 #include "kernel_utils.h"
 using namespace pto;
 using namespace kernel_utils;
@@ -69,15 +69,14 @@ using GmTensor2D = pto::GlobalTensor<T, GmShape2D, GmStride2D>;
 
 template <typename T, int32_t Rows, int32_t Cols>
 using DynMatL1 = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
-                           pto::BLayout::ColMajor, pto::DYNAMIC,
-                           pto::DYNAMIC, pto::SLayout::RowMajor, 512,
-                           pto::PadValue::Zero>;
+                           pto::BLayout::ColMajor, pto::DYNAMIC, pto::DYNAMIC,
+                           pto::SLayout::RowMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols,
           pto::PadValue PadVal = pto::PadValue::Null>
-using DynVecTile = pto::Tile<pto::TileType::Vec, T, Rows, Cols,
-                             pto::BLayout::RowMajor, pto::DYNAMIC,
-                             pto::DYNAMIC, pto::SLayout::NoneBox, 512, PadVal>;
+using DynVecTile =
+    pto::Tile<pto::TileType::Vec, T, Rows, Cols, pto::BLayout::RowMajor,
+              pto::DYNAMIC, pto::DYNAMIC, pto::SLayout::NoneBox, 512, PadVal>;
 
 template <typename T, int32_t Rows, int32_t Cols>
 using DynAccTile = pto::TileAcc<T, Rows, Cols, pto::DYNAMIC, pto::DYNAMIC>;
@@ -92,8 +91,7 @@ template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
 using TileMatL1ZN = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
                               pto::BLayout::RowMajor, RowValid, ColValid,
-                              pto::SLayout::ColMajor, 512,
-                              pto::PadValue::Zero>;
+                              pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
           int32_t ColValid = Cols>
@@ -110,31 +108,28 @@ using TileMatL0B =
               ColValid, pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
-          int32_t ColValid = Cols,
-          pto::PadValue PadVal = pto::PadValue::Null>
-using TileUbDataND = pto::Tile<pto::TileType::Vec, T, Rows, Cols,
-                               pto::BLayout::RowMajor, RowValid, ColValid,
-                               pto::SLayout::NoneBox, 512, PadVal>;
+          int32_t ColValid = Cols, pto::PadValue PadVal = pto::PadValue::Null>
+using TileUbDataND =
+    pto::Tile<pto::TileType::Vec, T, Rows, Cols, pto::BLayout::RowMajor,
+              RowValid, ColValid, pto::SLayout::NoneBox, 512, PadVal>;
 
 template <typename T, int32_t Rows, int32_t Cols, int32_t RowValid = Rows,
-          int32_t ColValid = Cols,
-          pto::PadValue PadVal = pto::PadValue::Null>
-using TileUbDataDN = pto::Tile<pto::TileType::Vec, T, Rows, Cols,
-                               pto::BLayout::ColMajor, RowValid, ColValid,
-                               pto::SLayout::NoneBox, 512, PadVal>;
+          int32_t ColValid = Cols, pto::PadValue PadVal = pto::PadValue::Null>
+using TileUbDataDN =
+    pto::Tile<pto::TileType::Vec, T, Rows, Cols, pto::BLayout::ColMajor,
+              RowValid, ColValid, pto::SLayout::NoneBox, 512, PadVal>;
 
 // K-sliced matmul helper — verbatim copy from chunk_h.cpp::gemm_v0.
 template <typename T1, typename T2, uint32_t M, uint32_t N, uint32_t K,
           uint32_t validM = M, uint32_t validN = N, uint32_t validK = K,
           uint32_t K_tail = K, bool transpose_A = false,
           bool transpose_B = false>
-AICORE PTO_INLINE void
-gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
-                           TileMatL1<T1, M, K, validM, validK>> &A,
-        std::conditional_t<transpose_B, TileMatL1<T1, N, K, validN, validK>,
-                           TileMatL1<T1, K, N, validK, validN>> &B,
-        pto::TileAcc<T2, M, N, validM, validN> &C, bool clear)
-{
+AICORE PTO_INLINE void gemm_v0(
+    std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
+                       TileMatL1<T1, M, K, validM, validK>> &A,
+    std::conditional_t<transpose_B, TileMatL1<T1, N, K, validN, validK>,
+                       TileMatL1<T1, K, N, validK, validN>> &B,
+    pto::TileAcc<T2, M, N, validM, validN> &C, bool clear) {
   constexpr uint32_t kL0Size = 128;
   const uint32_t kL0split = (K + kL0Size - 1) / kL0Size;
 
@@ -228,20 +223,18 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
   wait_flag(PIPE_M, PIPE_FIX, war_event_id);
 }
 
-} // namespace
+}  // namespace
 
 #endif
 
 template <int32_t HiddenSize, int32_t ChunkSize>
-AICORE void chunk_h_kda_kernel(
-    __gm__ half *K_handle, __gm__ half *W_handle, __gm__ half *U_handle,
-    __gm__ float *G_handle,
-    __gm__ half *S_handle, __gm__ half *V_handle,
-    __gm__ half  *workspace_handle,
-    __gm__ int32_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    int32_t num_heads, uint64_t ffts_addr)
-{
+AICORE void chunk_h_kda_kernel(__gm__ half *K_handle, __gm__ half *W_handle,
+                               __gm__ half *U_handle, __gm__ float *G_handle,
+                               __gm__ half *S_handle, __gm__ half *V_handle,
+                               __gm__ half *workspace_handle,
+                               __gm__ int32_t *cu_seqlens, int64_t batch_size,
+                               int64_t seq_len, int64_t total_tokens,
+                               int32_t num_heads, uint64_t ffts_addr) {
   auto cid = get_block_idx();
   auto block_num = get_block_num();
   set_ffts_base_addr(ffts_addr);
@@ -250,21 +243,21 @@ AICORE void chunk_h_kda_kernel(
   // math reads correctly.
   constexpr int32_t K_DIM = HiddenSize;
   constexpr int32_t V_DIM = HiddenSize;
-  constexpr int32_t C     = ChunkSize;
+  constexpr int32_t C = ChunkSize;
   // Head count (HV) is a runtime argument; it only drives the work-item decode
   // and the BSND GM stride, never a UB buffer size or tile shape.
-  const int32_t H     = num_heads;          // HV in KDA terminology
+  const int32_t H = num_heads;  // HV in KDA terminology
   constexpr int32_t HalfC = C / 2;
   const int32_t BSND_STRIDE = H * HiddenSize;
-  constexpr int32_t HM_STRIDE   = HiddenSize;        // head-major K, G stride
+  constexpr int32_t HM_STRIDE = HiddenSize;  // head-major K, G stride
   constexpr int32_t KV = K_DIM * V_DIM;
 
   // ── Workspace slots (fp16 half-elements, per AI core) ────────────────────
   constexpr int32_t WS_WS = 0;
-  constexpr int32_t WS_K  = WS_WS + C * V_DIM;
-  constexpr int32_t WS_V  = WS_K  + C * K_DIM;
-  constexpr int32_t WS_S  = WS_V  + C * V_DIM;
-  constexpr int32_t WS_KV = WS_S  + KV;
+  constexpr int32_t WS_K = WS_WS + C * V_DIM;
+  constexpr int32_t WS_V = WS_K + C * K_DIM;
+  constexpr int32_t WS_S = WS_V + C * V_DIM;
+  constexpr int32_t WS_KV = WS_S + KV;
   constexpr int32_t WS_PER_CORE = WS_KV + KV;
 
   // ── Cube L1 tiles ────────────────────────────────────────────────────────
@@ -287,21 +280,22 @@ AICORE void chunk_h_kda_kernel(
   //   COEFF_UB == WS_UB == EXP_GT_2D_UB   (sequential C-D, E, H-I)
   //   U_UB_HALF == KV_LOAD_UB             (sequential E-F, J)
   // Total at peak ≈ 176 KB out of 192 KB budget.
-  constexpr int32_t ZERO_UB     = 0;
-  constexpr int32_t S_UB        = ZERO_UB + 64 * sizeof(float);
-  constexpr int32_t GTOTAL_UB   = S_UB + HalfC * V_DIM * sizeof(float);
-  constexpr int32_t K_UB        = GTOTAL_UB + K_DIM * sizeof(float);
-  constexpr int32_t GCS_UB      = K_UB + HalfC * K_DIM * sizeof(float);
-  constexpr int32_t COEFF_UB    = GCS_UB + HalfC * K_DIM * sizeof(float);
-  constexpr int32_t K_UB_HALF   = COEFF_UB + HalfC * K_DIM * sizeof(float);
-  constexpr int32_t U_UB_HALF   = K_UB_HALF + HalfC * K_DIM * sizeof(half);
-  constexpr int32_t S_UB_HALF   = U_UB_HALF + HalfC * V_DIM * sizeof(half);
+  constexpr int32_t ZERO_UB = 0;
+  constexpr int32_t S_UB = ZERO_UB + 64 * sizeof(float);
+  constexpr int32_t GTOTAL_UB = S_UB + HalfC * V_DIM * sizeof(float);
+  constexpr int32_t K_UB = GTOTAL_UB + K_DIM * sizeof(float);
+  constexpr int32_t GCS_UB = K_UB + HalfC * K_DIM * sizeof(float);
+  constexpr int32_t COEFF_UB = GCS_UB + HalfC * K_DIM * sizeof(float);
+  constexpr int32_t K_UB_HALF = COEFF_UB + HalfC * K_DIM * sizeof(float);
+  constexpr int32_t U_UB_HALF = K_UB_HALF + HalfC * K_DIM * sizeof(half);
+  constexpr int32_t S_UB_HALF = U_UB_HALF + HalfC * V_DIM * sizeof(half);
   // Aliases:
-  constexpr int32_t U_UB        = GCS_UB;     // load U after g_cs is consumed
-  constexpr int32_t KV_FP32_UB  = GCS_UB;     // cast KV → fp32 into freed buffer
-  constexpr int32_t WS_UB       = COEFF_UB;   // load WS into freed coeff buffer
-  constexpr int32_t EXP_GT_2D_UB = COEFF_UB;  // broadcast exp(g_total) similarly
-  constexpr int32_t KV_LOAD_UB  = U_UB_HALF;  // load KV fp16 into freed U_HALF
+  constexpr int32_t U_UB = GCS_UB;        // load U after g_cs is consumed
+  constexpr int32_t KV_FP32_UB = GCS_UB;  // cast KV → fp32 into freed buffer
+  constexpr int32_t WS_UB = COEFF_UB;     // load WS into freed coeff buffer
+  constexpr int32_t EXP_GT_2D_UB =
+      COEFF_UB;                              // broadcast exp(g_total) similarly
+  constexpr int32_t KV_LOAD_UB = U_UB_HALF;  // load KV fp16 into freed U_HALF
 
   TileUbDataND<float, 1, 64, 1, 64> zero_ub;
   TASSIGN(zero_ub, ZERO_UB);
@@ -399,14 +393,14 @@ AICORE void chunk_h_kda_kernel(
       set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
       // WS = W @ S — [C, K] @ [K, V] → [C, V].
-      gemm_v0<half, float, C, V_DIM, K_DIM, C, V_DIM, K_DIM, K_DIM, false, false>(
-          w_l1, s_l1, ws_l0, (bool)1);
+      gemm_v0<half, float, C, V_DIM, K_DIM, C, V_DIM, K_DIM, K_DIM, false,
+              false>(w_l1, s_l1, ws_l0, (bool)1);
 
       {
         GmShape2D ws_shape(C, V_DIM);
         GmStride2D ws_stride(V_DIM);
-        GmTensor2D<half> ws_global(workspace_handle + ws_base + WS_WS,
-                                   ws_shape, ws_stride);
+        GmTensor2D<half> ws_global(workspace_handle + ws_base + WS_WS, ws_shape,
+                                   ws_stride);
         DynAccTile<float, C, V_DIM> ws_store(C, V_DIM);
         TASSIGN(ws_store, 0);
         TSTORE(ws_global, ws_store);
@@ -445,9 +439,8 @@ AICORE void chunk_h_kda_kernel(
         GmTensor2D<half> v_global(workspace_handle + ws_base + WS_V, v_shape,
                                   v_stride);
         DynMatL1<half, C, V_DIM> v_l1_load(C, V_DIM);
-        TASSIGN(v_l1_load,
-                (KV + C * K_DIM + K_DIM * C) *
-                static_cast<int32_t>(sizeof(half)));
+        TASSIGN(v_l1_load, (KV + C * K_DIM + K_DIM * C) *
+                               static_cast<int32_t>(sizeof(half)));
         TLOAD(v_l1_load, v_global);
       }
 
@@ -460,8 +453,8 @@ AICORE void chunk_h_kda_kernel(
       {
         GmShape2D kv_shape(K_DIM, V_DIM);
         GmStride2D kv_stride(V_DIM);
-        GmTensor2D<half> kv_global(workspace_handle + ws_base + WS_KV,
-                                   kv_shape, kv_stride);
+        GmTensor2D<half> kv_global(workspace_handle + ws_base + WS_KV, kv_shape,
+                                   kv_stride);
         DynAccTile<float, K_DIM, V_DIM> kv_store(K_DIM, V_DIM);
         TASSIGN(kv_store, C * V_DIM * static_cast<int32_t>(sizeof(float)));
         TSTORE(kv_global, kv_store);
@@ -521,10 +514,9 @@ AICORE void chunk_h_kda_kernel(
     {
       GmShape2D s_shape(HalfC, V_DIM);
       GmStride2D s_stride(V_DIM);
-      GmTensor2D<half> s_global(
-          workspace_handle + ws_base + WS_S +
-              static_cast<int64_t>(vid) * HalfC * V_DIM,
-          s_shape, s_stride);
+      GmTensor2D<half> s_global(workspace_handle + ws_base + WS_S +
+                                    static_cast<int64_t>(vid) * HalfC * V_DIM,
+                                s_shape, s_stride);
       DynVecTile<half, HalfC, V_DIM> s_store(HalfC, V_DIM);
       TASSIGN(s_store, S_UB_HALF);
       TSTORE(s_global, s_store);
@@ -565,19 +557,19 @@ AICORE void chunk_h_kda_kernel(
       }
 
       // ── 2. Load K, g_cs (head-major fp16) and g_total ──────────────────
-      int64_t hk_base = static_cast<int64_t>(head) * total_tokens * K_DIM +
-                        (chunk_start + static_cast<int64_t>(vid) * HalfC) *
-                            K_DIM;
+      int64_t hk_base =
+          static_cast<int64_t>(head) * total_tokens * K_DIM +
+          (chunk_start + static_cast<int64_t>(vid) * HalfC) * K_DIM;
       if (valid_rows > 0) {
         {
           GmShape2D k_shape(valid_rows, K_DIM);
           GmStride2D k_stride(HM_STRIDE);
           GmTensor2D<half> k_global(K_handle + hk_base, k_shape, k_stride);
-          TileUbDataND<half, HalfC, K_DIM, HalfC, K_DIM,
-                       pto::PadValue::Zero> k_stg_full;
+          TileUbDataND<half, HalfC, K_DIM, HalfC, K_DIM, pto::PadValue::Zero>
+              k_stg_full;
           TASSIGN(k_stg_full, K_UB_HALF);
-          DynVecTile<half, HalfC, K_DIM, pto::PadValue::Zero> k_load(
-              valid_rows, K_DIM);
+          DynVecTile<half, HalfC, K_DIM, pto::PadValue::Zero> k_load(valid_rows,
+                                                                     K_DIM);
           TASSIGN(k_load, K_UB_HALF);
           TLOAD(k_load, k_global);
           if (valid_rows != HalfC) {
@@ -596,8 +588,8 @@ AICORE void chunk_h_kda_kernel(
           GmShape2D g_shape(valid_rows, K_DIM);
           GmStride2D g_stride(HM_STRIDE);
           GmTensor2D<float> g_global(G_handle + hk_base, g_shape, g_stride);
-          TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM,
-                       pto::PadValue::Zero> g_stg_full;
+          TileUbDataND<float, HalfC, K_DIM, HalfC, K_DIM, pto::PadValue::Zero>
+              g_stg_full;
           TASSIGN(g_stg_full, GCS_UB);
           DynVecTile<float, HalfC, K_DIM, pto::PadValue::Zero> g_load(
               valid_rows, K_DIM);
@@ -629,7 +621,8 @@ AICORE void chunk_h_kda_kernel(
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
       // ── 3. coeff_2d = exp(g_total - g_cs)  [HalfC, K] ─────────────────
-      // Broadcast g_total [1, K] across HalfC rows: 2d[i,j] = row[j] (TCOLEXPAND).
+      // Broadcast g_total [1, K] across HalfC rows: 2d[i,j] = row[j]
+      // (TCOLEXPAND).
       TCOLEXPAND(coeff_2d_ub, gtotal_ub);
       PipeBarrierVec();
       TSUB(coeff_2d_ub, coeff_2d_ub, gcs_ub);
@@ -651,11 +644,11 @@ AICORE void chunk_h_kda_kernel(
         GmShape2D u_shape(valid_rows, V_DIM);
         GmStride2D u_stride(BSND_STRIDE);
         GmTensor2D<half> u_global(U_handle + u_offset, u_shape, u_stride);
-        TileUbDataND<half, HalfC, V_DIM, HalfC, V_DIM,
-                     pto::PadValue::Zero> u_stg_full;
+        TileUbDataND<half, HalfC, V_DIM, HalfC, V_DIM, pto::PadValue::Zero>
+            u_stg_full;
         TASSIGN(u_stg_full, U_UB_HALF);
-        DynVecTile<half, HalfC, V_DIM, pto::PadValue::Zero> u_load(
-            valid_rows, V_DIM);
+        DynVecTile<half, HalfC, V_DIM, pto::PadValue::Zero> u_load(valid_rows,
+                                                                   V_DIM);
         TASSIGN(u_load, U_UB_HALF);
         TLOAD(u_load, u_global);
         if (valid_rows != HalfC) {
@@ -734,10 +727,9 @@ AICORE void chunk_h_kda_kernel(
       {
         GmShape2D k_shape(HalfC, K_DIM);
         GmStride2D k_stride(K_DIM);
-        GmTensor2D<half> k_global(
-            workspace_handle + ws_base + WS_K +
-                static_cast<int64_t>(vid) * HalfC * K_DIM,
-            k_shape, k_stride);
+        GmTensor2D<half> k_global(workspace_handle + ws_base + WS_K +
+                                      static_cast<int64_t>(vid) * HalfC * K_DIM,
+                                  k_shape, k_stride);
         DynVecTile<half, HalfC, K_DIM> k_store(HalfC, K_DIM);
         TASSIGN(k_store, K_UB_HALF);
         TSTORE(k_global, k_store);
@@ -764,7 +756,7 @@ AICORE void chunk_h_kda_kernel(
         TileUbDataDN<float, HalfC, 1, HalfC, 1> exp_gt_col;
         TASSIGN(exp_gt_col,
                 GTOTAL_UB + static_cast<int32_t>(vid) * HalfC *
-                    static_cast<int32_t>(sizeof(float)));
+                                static_cast<int32_t>(sizeof(float)));
         TROWEXPAND(exp_gt_2d_ub, exp_gt_col);
       }
       PipeBarrierVec();
@@ -836,40 +828,30 @@ AICORE void chunk_h_kda_kernel(
 }
 
 extern "C" __global__ AICORE void launch_chunk_h_kda(
-    __gm__ uint8_t *K, __gm__ uint8_t *W, __gm__ uint8_t *U,
-    __gm__ uint8_t *G,
-    __gm__ uint8_t *S, __gm__ uint8_t *V_corr,
-    __gm__ uint8_t *workspace,
-    __gm__ uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    int32_t num_heads, uint64_t ffts_addr)
-{
+    __gm__ uint8_t *K, __gm__ uint8_t *W, __gm__ uint8_t *U, __gm__ uint8_t *G,
+    __gm__ uint8_t *S, __gm__ uint8_t *V_corr, __gm__ uint8_t *workspace,
+    __gm__ uint8_t *cu_seqlens, int64_t batch_size, int64_t seq_len,
+    int64_t total_tokens, int32_t num_heads, uint64_t ffts_addr) {
   chunk_h_kda_kernel<GDN_D, GDN_C>(
-      reinterpret_cast<__gm__ half *>(K),
-      reinterpret_cast<__gm__ half *>(W),
-      reinterpret_cast<__gm__ half *>(U),
-      reinterpret_cast<__gm__ float *>(G),
+      reinterpret_cast<__gm__ half *>(K), reinterpret_cast<__gm__ half *>(W),
+      reinterpret_cast<__gm__ half *>(U), reinterpret_cast<__gm__ float *>(G),
       reinterpret_cast<__gm__ half *>(S),
       reinterpret_cast<__gm__ half *>(V_corr),
       reinterpret_cast<__gm__ half *>(workspace),
-      reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, num_heads, ffts_addr);
+      reinterpret_cast<__gm__ int32_t *>(cu_seqlens), batch_size, seq_len,
+      total_tokens, num_heads, ffts_addr);
 }
 
-extern "C" void call_kernel(
-    uint32_t block_dim, void *stream,
-    uint8_t *K, uint8_t *W, uint8_t *U, uint8_t *G,
-    uint8_t *S, uint8_t *V_corr,
-    uint8_t *workspace,
-    uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint32_t num_heads)
-{
+extern "C" void call_kernel(uint32_t block_dim, void *stream, uint8_t *K,
+                            uint8_t *W, uint8_t *U, uint8_t *G, uint8_t *S,
+                            uint8_t *V_corr, uint8_t *workspace,
+                            uint8_t *cu_seqlens, int64_t batch_size,
+                            int64_t seq_len, int64_t total_tokens,
+                            uint32_t num_heads) {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
   rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
   launch_chunk_h_kda<<<block_dim, nullptr, stream>>>(
-      K, W, U, G, S, V_corr, workspace, cu_seqlens,
-      batch_size, seq_len, total_tokens,
-      static_cast<int32_t>(num_heads), fftsAddr);
+      K, W, U, G, S, V_corr, workspace, cu_seqlens, batch_size, seq_len,
+      total_tokens, static_cast<int32_t>(num_heads), fftsAddr);
 }
