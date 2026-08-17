@@ -1,0 +1,82 @@
+name: CI (A5)
+
+on:
+  push:
+    branches: [ "main" ]
+  schedule:
+    - cron: "0 2 * * *"   # runs every day at 02:00 UTC
+  workflow_dispatch:       # allows manual trigger
+  pull_request:
+
+jobs:
+  build_single_kernel_a5:
+    name: Build all kernels for A5 (x86_64, py3.12)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    container:
+      image: quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
+
+    env:
+      # One kernel per line, matching kernels/pto/<kernel>.cpp; comment a line out
+      # to skip it. tri_inverse_impl.cpp is deliberately absent: it is #included by
+      # tri_inverse.cpp and the mega kernels, not compiled on its own.
+      KERNELS: |
+        chunk_cumsum
+        chunk_h
+        chunk_h_kda
+        chunk_o
+        chunk_o_kda
+        gate_cumsum_kda
+        kkt_kda
+        mega_kernel
+        mega_kernel_kda
+        scaled_dot_kkt
+        tri_inverse
+        wy_fast
+        wy_kda
+
+    steps:
+      - name: Show OS
+        run: cat /etc/os-release
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Compile every A5 kernel
+        shell: bash
+        run: |
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source /usr/local/Ascend/nnal/atb/set_env.sh
+          # to avoid libascend_hal.so issue
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/devlib
+
+          kernels=$(echo "$KERNELS" | sed 's/#.*//' | tr -d '\r' | xargs)
+          failed=()
+
+          {
+            echo "## A5 kernel compilation"
+            echo
+            echo "| Kernel | Result | Library |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for kernel in $kernels; do
+            echo "::group::compile_a5_kernel.sh ${kernel}"
+            if scripts/compile_a5_kernel.sh "${kernel}"; then
+              lib="build/lib/libkernel_${kernel}.so"
+              ls -lh "$lib"
+              echo "| \`${kernel}\` | ✅ | $(du -h "$lib" | cut -f1) |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              failed+=("${kernel}")
+              echo "::error title=compile_a5_${kernel}::A5 compilation failed for ${kernel}.cpp"
+              echo "| \`${kernel}\` | ❌ | — |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Failed kernels: ${failed[*]}"
+            exit 1
+          fi
+          echo "All $(echo "$kernels" | wc -w) A5 kernels compiled successfully."
