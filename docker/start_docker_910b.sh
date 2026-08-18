@@ -10,7 +10,7 @@
 #   ./start_docker_910B.sh
 #
 
-DOCKER_IMAGE_TAG="quay.io/ascend/vllm-ascend:v0.19.1rc1"
+DOCKER_IMAGE_TAG="quay.io/ascend/vllm-ascend:v0.23.0rc1"
 
 drun() {
 
@@ -21,8 +21,10 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
     --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume "/scratch/model_weights/:/scratch/model_weights/:ro" \
     --name vLLM-ascend-${USER} \
-    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/ "$@"
+    --volume /var/queue_schedule:/var/queue_schedule "$@"
 }
 
 drun "$@" --env "HF_ENDPOINT=https://hf-mirror.com" ${DOCKER_IMAGE_TAG} /usr/bin/bash
+
