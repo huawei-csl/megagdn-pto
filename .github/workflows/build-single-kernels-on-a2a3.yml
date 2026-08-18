@@ -1,4 +1,4 @@
-name: CI (A2/A3)
+name: Build
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
 
 jobs:
   build_single_kernel_a2a3:
-    name: Build kernels on A2/A3 (x86_64, py3.12)
+    name: Compile kernels on A2/A3 (x86_64, py3.12)
     runs-on: ubuntu-latest
     continue-on-error: true
 
