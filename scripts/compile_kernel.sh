@@ -8,8 +8,7 @@
 # --------------------------------------------------------------------------------
 #
 # Compile one or more PTO kernels for A2/A3 (dav-2201, memory-based PTO) into
-# shared libraries, without building the whole wheel package. Useful for
-# development and debugging of individual kernels.
+# shared libraries. Useful for development and debugging of individual kernels.
 #
 # Usage:
 #   scripts/compile_kernel.sh <kernel> [<kernel> ...]
@@ -57,7 +56,7 @@ for kernel in "$@"; do
     fi
 
     out="${BUILD_DIR}/libkernel_${kernel}.so"
-    echo "[compile_kernel] ${src} -> ${out}"
+    echo "[A2A3 PTO kernel compilation] ${src} -> ${out}"
 
     "${BISHENG}" -fPIC -shared -xcce -DMEMORY_BASE -O2 -std=c++17 \
         -I"${KERNEL_DIR}" \

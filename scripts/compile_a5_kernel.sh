@@ -8,7 +8,7 @@
 # --------------------------------------------------------------------------------
 #
 # Compile one or more PTO kernels for A5 (dav-c310, register-based PTO) into
-# shared libraries, without building the whole wheel package.
+# shared libraries. Useful for debugging and CI.
 #
 # Usage:
 #   scripts/compile_a5_kernel.sh <kernel> [<kernel> ...]
@@ -56,7 +56,7 @@ for kernel in "$@"; do
     fi
 
     out="${BUILD_DIR}/libkernel_${kernel}.so"
-    echo "[compile_a5_kernel] ${src} -> ${out}"
+    echo "[A5 PTO kernel compilation] ${src} -> ${out}"
 
     "${BISHENG}" -fPIC -shared -xcce -DREGISTER_BASE -O2 -std=gnu++17 \
         -I"${KERNEL_DIR}" \
