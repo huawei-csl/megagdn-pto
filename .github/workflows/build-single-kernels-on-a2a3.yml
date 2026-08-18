@@ -10,12 +10,12 @@ on:
 
 jobs:
   build_single_kernel_a2a3:
-    name: Build kernels on A2/A3 (x86_64, py3.11)
+    name: Build kernels on A2/A3 (x86_64, py3.12)
     runs-on: ubuntu-latest
     continue-on-error: true
 
     container:
-      image: quay.io/ascend/cann:9.1.0-910b-ubuntu22.04-py3.11
+      image: quay.io/ascend/cann:9.1.0-910b-ubuntu22.04-py3.12
 
     env:
       # One kernel per line, matching kernels/pto/<kernel>.cpp; comment a line out
