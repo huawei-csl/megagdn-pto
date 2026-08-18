@@ -1,4 +1,4 @@
-name: CI (A5)
+name: CI (A2/A3)
 
 on:
   push:
@@ -9,13 +9,13 @@ on:
   pull_request:
 
 jobs:
-  build_single_kernel_a5:
-    name: Build kernels on A5 (x86_64, py3.12)
+  build_single_kernel_a2a3:
+    name: Build kernels on A2/A3 (x86_64, py3.11)
     runs-on: ubuntu-latest
     continue-on-error: true
 
     container:
-      image: quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
+      image: quay.io/ascend/cann:9.1.0-910b-ubuntu22.04-py3.11
 
     env:
       # One kernel per line, matching kernels/pto/<kernel>.cpp; comment a line out
@@ -43,11 +43,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Compile every A5 kernel
+      - name: Compile every A2/A3 kernel
         shell: bash
         run: |
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
-          source /usr/local/Ascend/nnal/atb/set_env.sh
+          if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+          fi
           # to avoid libascend_hal.so issue
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/devlib
 
@@ -55,21 +57,21 @@ jobs:
           failed=()
 
           {
-            echo "## A5 kernel compilation"
+            echo "## A2/A3 kernel compilation"
             echo
             echo "| Kernel | Result | Library |"
             echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
 
           for kernel in $kernels; do
-            echo "::group::compile_a5_kernel.sh ${kernel}"
-            if scripts/compile_a5_kernel.sh "${kernel}"; then
+            echo "::group::compile_kernel.sh ${kernel}"
+            if scripts/compile_kernel.sh "${kernel}"; then
               lib="build/lib/libkernel_${kernel}.so"
               ls -lh "$lib"
               echo "| \`${kernel}\` | ✅ | $(du -h "$lib" | cut -f1) |" >> "$GITHUB_STEP_SUMMARY"
             else
               failed+=("${kernel}")
-              echo "::error title=compile_a5_${kernel}::A5 compilation failed for ${kernel}.cpp"
+              echo "::error title=compile_a2a3_${kernel}::A2/A3 compilation failed for ${kernel}.cpp"
               echo "| \`${kernel}\` | ❌ | — |" >> "$GITHUB_STEP_SUMMARY"
             fi
             echo "::endgroup::"
@@ -79,4 +81,4 @@ jobs:
             echo "Failed kernels: ${failed[*]}"
             exit 1
           fi
-          echo "All $(echo "$kernels" | wc -w) A5 kernels compiled successfully."
+          echo "All $(echo "$kernels" | wc -w) A2/A3 kernels compiled successfully."
