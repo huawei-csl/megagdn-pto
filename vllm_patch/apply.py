@@ -5,6 +5,11 @@ Triton backend) so that the PTO wrapper replaces Triton's implementation.
 
 This file is loaded by the vllm-ascend worker hook (injected by
 ``install_hook.py``) when ``VLLM_PTO_PATCH_DIR`` points to this directory.
+
+Verified against vllm-ascend v0.18 / v0.19 / v0.23. The defining module
+``vllm_ascend.ops.triton.fla.chunk`` is patched in all of them, plus every
+module known to re-export the symbol via ``from ... import`` (those bind at
+import time, so a late import order would otherwise keep the Triton reference).
 """
 
 from __future__ import annotations
@@ -26,6 +31,26 @@ def _ensure_pto_lib_path() -> None:
     fallback = "/sources/pto-isa"
     if os.path.isdir(os.path.join(fallback, "include")):
         os.environ["PTO_LIB_PATH"] = fallback
+
+
+# Modules that do ``from ... import chunk_gated_delta_rule`` at import time. Any
+# of these already in ``sys.modules`` when the patch runs holds a stale Triton
+# reference and must be rebound; the rest pick up the patched defining modules
+# when they are imported later.
+_REBIND_TARGETS = (
+    # vllm-ascend 0.19+ GDN prefill path
+    ("vllm_ascend.ops.gdn", "chunk_gated_delta_rule"),
+    # vLLM 0.23 base layer, imported as ``fla_chunk_gated_delta_rule``
+    ("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn", "fla_chunk_gated_delta_rule"),
+)
+
+
+def _rebind_already_imported(wrapped) -> None:
+    for mod_name, attr in _REBIND_TARGETS:
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, attr):
+            setattr(mod, attr, wrapped)
+            _log.debug("PTO rebound %s.%s", mod_name, attr)
 
 
 def apply_pto_patch() -> None:
@@ -56,9 +81,7 @@ def apply_pto_patch() -> None:
         # before ``vllm.model_executor.layers.fla.ops``; patch the defining module so new imports
         # and v0.18-style ``fla.ops`` routing both see PTO.
         _ascend_chunk_mod.chunk_gated_delta_rule = wrapped
-        _gdn_mod = sys.modules.get("vllm_ascend.ops.gdn")
-        if _gdn_mod is not None and hasattr(_gdn_mod, "chunk_gated_delta_rule"):
-            _gdn_mod.chunk_gated_delta_rule = wrapped
+        _rebind_already_imported(wrapped)
         _PATCH_ACTIVE = True
 
         megakernel = os.environ.get("VLLM_PTO_MEGAKERNEL", "").strip().lower() in (
