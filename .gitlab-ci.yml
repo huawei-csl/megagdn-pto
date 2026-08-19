@@ -6,6 +6,7 @@ variables:
 
 stages:
    - test
+   - bench
 
 # Define the workflow rules manually to make sure only a single pipeline
 # is created for each MR update. Without that, GitLab creates one pipeline
@@ -56,3 +57,15 @@ test_kda_e2e:
   extends: .accuracy_test_x86_910B4
   script:
     - python3 tests/test_kda_e2e.py
+
+bench_gdn_kernels:
+  image: quay.io/ascend/vllm-ascend:v0.23.0rc1
+  stage: bench
+  tags:
+    - docker_npu_910B2 # Build and test on-device (aarch64 / 910B2)
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+  script:
+    - python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --n-seq 16 --l-seg 8192 --H-list 16
+  when: manual
+  allow_failure: true
