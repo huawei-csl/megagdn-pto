@@ -41,7 +41,7 @@ jobs:
         run: cat /etc/os-release
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
 
       - name: Compile every A5 kernel
         shell: bash
