@@ -69,3 +69,22 @@ bench_gdn_kernels:
     - python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --n-seq 16 --l-seg 8192 --H-list 16
   when: manual
   allow_failure: true
+
+
+bench_lm_eval_qwen35_0_8b:
+  image: quay.io/ascend/vllm-ascend:v0.23.0rc1
+  stage: bench
+  tags:
+    - docker_npu_910B2 # Build and test on-device (aarch64 / 910B2)
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+  script:
+    - pip install -U lm-eval
+    - mkdir -p outputs/data/eval/
+    - python benchmarks/eval_acc/run_lm_eval.py --preset qwen35_0_8b --output-json outputs/data/eval/qwen35_0_8b_pto.json
+  when: manual
+  allow_failure: true
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - outputs/data/
