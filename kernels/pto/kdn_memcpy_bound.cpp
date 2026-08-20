@@ -3,9 +3,11 @@
 // one UB tile and back to the same GM address.  There is deliberately no
 // compute, ping-pong state, or address helper in this kernel.
 
-#include <pto/pto-inst.hpp>
-#include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+
+#include <pto/pto-inst.hpp>
+
+#include "acl/acl.h"
 
 using namespace pto;
 
@@ -21,9 +23,9 @@ using namespace pto;
 
 #ifdef __CCE_AICORE__
 template <typename T, int R, int C>
-using CopyTile = pto::Tile<pto::TileType::Vec, T, R, C,
-                           pto::BLayout::RowMajor, R, C,
-                           pto::SLayout::NoneBox, 512, pto::PadValue::Null>;
+using CopyTile =
+    pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::RowMajor, R, C,
+              pto::SLayout::NoneBox, 512, pto::PadValue::Null>;
 #endif
 
 template <int KDim, int VDim, int VTile>
@@ -73,14 +75,16 @@ AICORE void kdn_memcpy_bound_kernel(__gm__ float *state_ptr, int64_t batch,
 #endif
 }
 
-extern "C" __global__ AICORE void launch_kdn_memcpy_bound(
-    __gm__ uint8_t *state, int64_t batch, int32_t heads, uint64_t ffts) {
+extern "C" __global__ AICORE void launch_kdn_memcpy_bound(__gm__ uint8_t *state,
+                                                          int64_t batch,
+                                                          int32_t heads,
+                                                          uint64_t ffts) {
   kdn_memcpy_bound_kernel<GDN_D, KDN_V, KDN_BV>(
       reinterpret_cast<__gm__ float *>(state), batch, heads, ffts);
 }
 
 extern "C" void call_kernel(uint32_t block_dim, void *stream, uint8_t *state,
-                             int64_t batch, int32_t heads) {
+                            int64_t batch, int32_t heads) {
   uint32_t len{0};
   uint64_t addr{0};
   rtGetC2cCtrlAddr(&addr, &len);

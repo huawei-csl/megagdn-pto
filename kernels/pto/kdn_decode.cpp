@@ -8,9 +8,11 @@
 // [cu_seqlens[n], cu_seqlens[n + 1]).  `l2norm` enables the reference's
 // in-kernel normalization q /= sqrt(sum(q*q)) + 1e-6 (likewise for k).
 
-#include <pto/pto-inst.hpp>
-#include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+
+#include <pto/pto-inst.hpp>
+
+#include "acl/acl.h"
 
 using namespace pto;
 
@@ -27,23 +29,23 @@ using namespace pto;
 #ifdef __CCE_AICORE__
 template <typename T, int R, int C, int RV = R, int CV = C,
           pto::PadValue P = pto::PadValue::Null>
-using UbND = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::RowMajor,
-                       RV, CV, pto::SLayout::NoneBox, 512, P>;
+using UbND = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::RowMajor, RV,
+                       CV, pto::SLayout::NoneBox, 512, P>;
 template <typename T, int R, int C, int RV = R, int CV = C>
-using UbDN = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::ColMajor,
-                       RV, CV, pto::SLayout::NoneBox, 512>;
+using UbDN = pto::Tile<pto::TileType::Vec, T, R, C, pto::BLayout::ColMajor, RV,
+                       CV, pto::SLayout::NoneBox, 512>;
 #endif
 
 template <int KDim, int VDim, int VTile>
-AICORE void kdn_decode_kernel(
-    __gm__ half *q_ptr, __gm__ half *k_ptr,
-    __gm__ half *v_ptr, __gm__ half *g_ptr,
-    __gm__ half *beta_ptr, __gm__ float *state_ptr,
-    __gm__ float *state_out_ptr,
-    __gm__ half *out_ptr, __gm__ int32_t *state_indices,
-    __gm__ int32_t *cu_seqlens, int64_t batch_size, int64_t seq_len,
-    int32_t num_heads, int32_t num_state_slots, float scale, int32_t l2norm,
-    uint64_t ffts_addr) {
+AICORE void kdn_decode_kernel(__gm__ half *q_ptr, __gm__ half *k_ptr,
+                              __gm__ half *v_ptr, __gm__ half *g_ptr,
+                              __gm__ half *beta_ptr, __gm__ float *state_ptr,
+                              __gm__ float *state_out_ptr, __gm__ half *out_ptr,
+                              __gm__ int32_t *state_indices,
+                              __gm__ int32_t *cu_seqlens, int64_t batch_size,
+                              int64_t seq_len, int32_t num_heads,
+                              int32_t num_state_slots, float scale,
+                              int32_t l2norm, uint64_t ffts_addr) {
   const int32_t cid = get_block_idx();
   const int32_t block_num = get_block_num();
   const int32_t vid = get_subblockid();
@@ -58,7 +60,8 @@ AICORE void kdn_decode_kernel(
   constexpr int NumVTiles = (VDim + VTile - 1) / VTile;
   const int worker = cid * 2 + vid;
   const int workers = block_num * 2;
-  const int64_t total = batch_size * static_cast<int64_t>(num_heads) * NumVTiles;
+  const int64_t total =
+      batch_size * static_cast<int64_t>(num_heads) * NumVTiles;
   const bool use_l2norm = l2norm != 0;
 
   // TROWSUM's scratch is a half-width binary-tree buffer, not a second copy of
@@ -96,8 +99,10 @@ AICORE void kdn_decode_kernel(
   constexpr int SqAddr = OutBfAddr1 + VTile * 2;
   constexpr int NrmTmpAddr = SqAddr + 2 * KDim * 4;
   constexpr int NrmAddr = NrmTmpAddr + 2 * KDim * 4;
-  static_assert(KAddr == QAddr + KDim * 4, "q/k must be adjacent for the [2, KDim] l2norm view");
-  static_assert(NrmAddr + 32 <= 184 * 1024, "UB overflow (TMP_UB_OFFSET at 184 KiB)");
+  static_assert(KAddr == QAddr + KDim * 4,
+                "q/k must be adjacent for the [2, KDim] l2norm view");
+  static_assert(NrmAddr + 32 <= 184 * 1024,
+                "UB overflow (TMP_UB_OFFSET at 184 KiB)");
 
   using DynShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
   using KStride = Stride<1, 1, 1, KDim, 1>;
@@ -110,7 +115,8 @@ AICORE void kdn_decode_kernel(
   // the recurrence reads `state_ptr` and writes the caller's buffer.  Only the
   // slots this kernel actually visits are written, so out-of-place callers own
   // whatever the untouched slots contain.
-  __gm__ float *state_dst = state_out_ptr == nullptr ? state_ptr : state_out_ptr;
+  __gm__ float *state_dst =
+      state_out_ptr == nullptr ? state_ptr : state_out_ptr;
   // True while an item's state TSTORE is still in flight on EVENT_ID4.
   bool state_pending = false;
 
@@ -122,7 +128,7 @@ AICORE void kdn_decode_kernel(
     const int v0 = vt * VTile;
     const int rows = (v0 + VTile <= VDim) ? VTile : (VDim - v0);
     const int slot = state_indices == nullptr ? static_cast<int>(batch)
-                                               : state_indices[batch];
+                                              : state_indices[batch];
     if (slot < 0 || slot >= num_state_slots) continue;
 
     int64_t bos, tokens;
@@ -163,22 +169,31 @@ AICORE void kdn_decode_kernel(
       DynShape ks;
       ks.shape[3] = 1;
       ks.shape[4] = KDim;
-      BfK q_gm(q_ptr + k_off, ks), k_gm(k_ptr + k_off, ks), g_gm(g_ptr + k_off, ks);
+      BfK q_gm(q_ptr + k_off, ks), k_gm(k_ptr + k_off, ks),
+          g_gm(g_ptr + k_off, ks);
       UbND<half, 1, KDim> q_bf, k_bf, g_bf;
-      TASSIGN(q_bf, QBfAddr); TASSIGN(k_bf, KBfAddr); TASSIGN(g_bf, GBfAddr);
-      TLOAD(q_bf, q_gm); TLOAD(k_bf, k_gm); TLOAD(g_bf, g_gm);
+      TASSIGN(q_bf, QBfAddr);
+      TASSIGN(k_bf, KBfAddr);
+      TASSIGN(g_bf, GBfAddr);
+      TLOAD(q_bf, q_gm);
+      TLOAD(k_bf, k_gm);
+      TLOAD(g_bf, g_gm);
       DynShape vs;
-      vs.shape[3] = 1; vs.shape[4] = rows;
+      vs.shape[3] = 1;
+      vs.shape[4] = rows;
       BfV v_gm(v_ptr + v_off, vs);
       UbND<half, 1, VTile, DYNAMIC, DYNAMIC> v_bf(1, rows);
-      TASSIGN(v_bf, VBfAddr); TLOAD(v_bf, v_gm);
+      TASSIGN(v_bf, VBfAddr);
+      TLOAD(v_bf, v_gm);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
       // v's cast is independent of q/k/g, so it rides along under the same
       // barrier instead of paying its own.
       UbND<float, 1, KDim> q, k, decay;
-      TASSIGN(q, QAddr); TASSIGN(k, KAddr); TASSIGN(decay, GAddr);
+      TASSIGN(q, QAddr);
+      TASSIGN(k, KAddr);
+      TASSIGN(decay, GAddr);
       UbND<float, 1, VTile, DYNAMIC, DYNAMIC> v_row(1, rows);
       TASSIGN(v_row, VAddr);
       TCVT(q, q_bf, pto::RoundMode::CAST_NONE);
@@ -188,7 +203,9 @@ AICORE void kdn_decode_kernel(
       pipe_barrier(PIPE_V);
       if (use_l2norm) {
         UbND<float, 2, KDim> qk, sq, nrm_tmp;
-        TASSIGN(qk, QAddr); TASSIGN(sq, SqAddr); TASSIGN(nrm_tmp, NrmTmpAddr);
+        TASSIGN(qk, QAddr);
+        TASSIGN(sq, SqAddr);
+        TASSIGN(nrm_tmp, NrmTmpAddr);
         // ColMajor tiles need a 32-byte-aligned row count, so allocate 8 rows
         // and use the two that hold the q and k norms.  Unary math needs the
         // row-major view of those same two floats.
@@ -196,13 +213,20 @@ AICORE void kdn_decode_kernel(
         TASSIGN(nrm, NrmAddr);
         UbND<float, 1, 8, 1, 2> nrm_flat;
         TRESHAPE(nrm_flat, nrm);
-        TMUL(sq, qk, qk); pipe_barrier(PIPE_V);
-        TROWSUM(nrm, sq, nrm_tmp); pipe_barrier(PIPE_V);
-        TSQRT(nrm_flat, nrm_flat); pipe_barrier(PIPE_V);
-        TADDS(nrm_flat, nrm_flat, 1e-6f); pipe_barrier(PIPE_V);
-        TROWEXPANDDIV(qk, qk, nrm); pipe_barrier(PIPE_V);
+        TMUL(sq, qk, qk);
+        pipe_barrier(PIPE_V);
+        TROWSUM(nrm, sq, nrm_tmp);
+        pipe_barrier(PIPE_V);
+        TSQRT(nrm_flat, nrm_flat);
+        pipe_barrier(PIPE_V);
+        TADDS(nrm_flat, nrm_flat, 1e-6f);
+        pipe_barrier(PIPE_V);
+        TROWEXPANDDIV(qk, qk, nrm);
+        pipe_barrier(PIPE_V);
       }
-      TMULS(q, q, scale); TEXP(decay, decay); pipe_barrier(PIPE_V);
+      TMULS(q, q, scale);
+      TEXP(decay, decay);
+      pipe_barrier(PIPE_V);
 
       UbDN<float, VTile, 1, DYNAMIC, DYNAMIC> delta(rows, 1);
       TRESHAPE(delta, v_row);
@@ -211,22 +235,32 @@ AICORE void kdn_decode_kernel(
       TRESHAPE(delta_flat, delta);
       UbND<float, VTile, KDim, DYNAMIC, DYNAMIC> work(rows, KDim);
       UbND<float, VTile, TmpCols, DYNAMIC, DYNAMIC> tmp(rows, TmpCols);
-      TASSIGN(work, WorkAddr); TASSIGN(tmp, TmpAddr);
+      TASSIGN(work, WorkAddr);
+      TASSIGN(tmp, TmpAddr);
       UbDN<float, VTile, 1, DYNAMIC, DYNAMIC> row(rows, 1);
       TASSIGN(row, RowAddr);
       TRESHAPE(row_flat, row);
 
-      TCOLEXPANDMUL(state, state, decay); pipe_barrier(PIPE_V);
-      TCOLEXPANDMUL(work, state, k); pipe_barrier(PIPE_V);
-      TROWSUM(row, work, tmp); pipe_barrier(PIPE_V);
-      TSUB(delta_flat, delta_flat, row_flat); pipe_barrier(PIPE_V);
+      TCOLEXPANDMUL(state, state, decay);
+      pipe_barrier(PIPE_V);
+      TCOLEXPANDMUL(work, state, k);
+      pipe_barrier(PIPE_V);
+      TROWSUM(row, work, tmp);
+      pipe_barrier(PIPE_V);
+      TSUB(delta_flat, delta_flat, row_flat);
+      pipe_barrier(PIPE_V);
       TMULS(delta_flat, delta_flat, static_cast<float>(beta_ptr[token_head]));
       pipe_barrier(PIPE_V);
-      TCOLEXPAND(work, k); pipe_barrier(PIPE_V);
-      TROWEXPANDMUL(work, work, delta); pipe_barrier(PIPE_V);
-      TADD(state, state, work); pipe_barrier(PIPE_V);
-      TCOLEXPANDMUL(work, state, q); pipe_barrier(PIPE_V);
-      TROWSUM(row, work, tmp); pipe_barrier(PIPE_V);
+      TCOLEXPAND(work, k);
+      pipe_barrier(PIPE_V);
+      TROWEXPANDMUL(work, work, delta);
+      pipe_barrier(PIPE_V);
+      TADD(state, state, work);
+      pipe_barrier(PIPE_V);
+      TCOLEXPANDMUL(work, state, q);
+      pipe_barrier(PIPE_V);
+      TROWSUM(row, work, tmp);
+      pipe_barrier(PIPE_V);
 
       // Alternate the staging half so the only thing that must wait for a store
       // is the token that reuses that half, two tokens later.  The cast itself
@@ -244,21 +278,29 @@ AICORE void kdn_decode_kernel(
       UbND<half, 1, VTile, DYNAMIC, DYNAMIC> out_row(1, rows);
       TRESHAPE(out_row, out_flat);
       BfV out_gm(out_ptr + v_off, vs);
-      set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1); wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+      set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+      wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
       TSTORE(out_gm, out_row);
-      if ((t & 1) == 0) set_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
-      else              set_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+      if ((t & 1) == 0)
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+      else
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
     }
     // The last two tokens set a flag nobody waited on; consume them so the
     // event state is clean for the next work item.
     if (tokens >= 2) {
-      if (((tokens - 2) & 1) == 0) wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
-      else                         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+      if (((tokens - 2) & 1) == 0)
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+      else
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
     }
-    if (((tokens - 1) & 1) == 0) wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
-    else                         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
+    if (((tokens - 1) & 1) == 0)
+      wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID2);
+    else
+      wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID3);
 
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0); wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(state_out_gm, state);
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID4);
     state_pending = true;
@@ -268,33 +310,33 @@ AICORE void kdn_decode_kernel(
 }
 
 extern "C" __global__ AICORE void launch_kdn_decode(
-    __gm__ uint8_t *q, __gm__ uint8_t *k, __gm__ uint8_t *v,
-    __gm__ uint8_t *g, __gm__ uint8_t *beta, __gm__ uint8_t *state,
-    __gm__ uint8_t *state_out,
+    __gm__ uint8_t *q, __gm__ uint8_t *k, __gm__ uint8_t *v, __gm__ uint8_t *g,
+    __gm__ uint8_t *beta, __gm__ uint8_t *state, __gm__ uint8_t *state_out,
     __gm__ uint8_t *out, __gm__ uint8_t *indices, __gm__ uint8_t *cu_seqlens,
     int64_t batch, int64_t seq, int32_t heads, int32_t slots, float scale,
     int32_t l2norm, uint64_t ffts) {
   kdn_decode_kernel<GDN_D, KDN_V, KDN_BV>(
       reinterpret_cast<__gm__ half *>(q), reinterpret_cast<__gm__ half *>(k),
       reinterpret_cast<__gm__ half *>(v), reinterpret_cast<__gm__ half *>(g),
-      reinterpret_cast<__gm__ half *>(beta), reinterpret_cast<__gm__ float *>(state),
+      reinterpret_cast<__gm__ half *>(beta),
+      reinterpret_cast<__gm__ float *>(state),
       reinterpret_cast<__gm__ float *>(state_out),
-      reinterpret_cast<__gm__ half *>(out), reinterpret_cast<__gm__ int32_t *>(indices),
-      reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch, seq, heads, slots, scale, l2norm, ffts);
+      reinterpret_cast<__gm__ half *>(out),
+      reinterpret_cast<__gm__ int32_t *>(indices),
+      reinterpret_cast<__gm__ int32_t *>(cu_seqlens), batch, seq, heads, slots,
+      scale, l2norm, ffts);
 }
 
-extern "C" void call_kernel(
-    uint32_t block_dim, void *stream, uint8_t *q, uint8_t *k, uint8_t *v,
-    uint8_t *g, uint8_t *beta, uint8_t *state, uint8_t *state_out,
-    uint8_t *out, uint8_t *indices,
-    uint8_t *cu_seqlens, int64_t batch, int64_t seq, int32_t heads,
-    int32_t slots, float scale, int32_t l2norm) {
-  uint32_t len{0}; uint64_t addr{0};
+extern "C" void call_kernel(uint32_t block_dim, void *stream, uint8_t *q,
+                            uint8_t *k, uint8_t *v, uint8_t *g, uint8_t *beta,
+                            uint8_t *state, uint8_t *state_out, uint8_t *out,
+                            uint8_t *indices, uint8_t *cu_seqlens,
+                            int64_t batch, int64_t seq, int32_t heads,
+                            int32_t slots, float scale, int32_t l2norm) {
+  uint32_t len{0};
+  uint64_t addr{0};
   rtGetC2cCtrlAddr(&addr, &len);
-  launch_kdn_decode<<<block_dim, nullptr, stream>>>(q, k, v, g, beta, state,
-                                                    state_out,
-                                                    out, indices, cu_seqlens,
-                                                    batch, seq, heads, slots,
-                                                    scale, l2norm, addr);
+  launch_kdn_decode<<<block_dim, nullptr, stream>>>(
+      q, k, v, g, beta, state, state_out, out, indices, cu_seqlens, batch, seq,
+      heads, slots, scale, l2norm, addr);
 }
