@@ -220,3 +220,40 @@ def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
     ]
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=180)
     return lib_path
+
+
+@lru_cache(maxsize=None)
+def compile_kdn_decode(cpp_mtime_ns: int = 0) -> str:
+    """Compile the fused KDA recurrent-decode vector kernel; return the ``.so`` path.
+
+    Vector-only (no Cube engine). K and V are contract-locked at 128 inside the
+    kernel and clamped at runtime, so there are no compile-time template
+    parameters -- a single ``kdn_decode.so`` serves the whole decode contract.
+    Uses the same aicore-arch/flags as the chunk-GDN vector kernels.
+    """
+    os.makedirs(_COMPILED_DIR, exist_ok=True)
+    cpp_path = os.path.join(_KERNELS_PTO, "kdn_decode.cpp")
+    lib_path = os.path.join(_COMPILED_DIR, "kdn_decode.so")
+    flags = [
+        "-fPIC", "-shared", "-xcce", "-DMEMORY_BASE", "-O2", "-std=gnu++17",
+        "--cce-aicore-arch=dav-c220",
+        "-mllvm", "-cce-aicore-stack-size=0x8000",
+        "-mllvm", "-cce-aicore-function-stack-size=0x8000",
+        "-mllvm", "-cce-aicore-record-overflow=true",
+        "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
+        "-Wno-macro-redefined", "-Wno-ignored-attributes",
+        f"-I{_KERNEL_INCLUDE}",
+        f"-I{os.path.join(PTO_LIB_PATH, 'include')}",
+        f"-I{ASCEND_TOOLKIT_HOME}/include",
+        f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc",
+        f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc/runtime",
+        f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc/profiling",
+    ]
+    if os.path.isdir(_DRIVER_INC):
+        flags.append(f"-I{_DRIVER_INC}")
+    extra = os.environ.get("PTO_DYNAMIC_EXTRA_FLAGS", "").split()
+    flags.extend(extra)
+    print("[megagdn_pto] Compiling kdn_decode …")
+    _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=300)
+    print(f"[megagdn_pto] Compiled → {lib_path}")
+    return lib_path
