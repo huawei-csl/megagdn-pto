@@ -36,7 +36,7 @@ AICORE void kdn_memcpy_bound_kernel(__gm__ float *state_ptr, int64_t batch,
   const int32_t vid = get_subblockid();
   set_ffts_base_addr(ffts_addr);
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   static_assert(KDim % 8 == 0, "KDim must be a multiple of 8");
   static_assert(VDim % VTile == 0, "VDim must be divisible by VTile");
   set_mask_norm();
