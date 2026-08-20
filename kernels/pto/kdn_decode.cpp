@@ -105,8 +105,8 @@ AICORE void kdn_decode_kernel(__gm__ half *q_ptr, __gm__ half *k_ptr,
                 "UB overflow (TMP_UB_OFFSET at 184 KiB)");
 
   using DynShape = Shape<1, 1, 1, DYNAMIC, DYNAMIC>;
-  using KStride = Stride<1, 1, 1, KDim, 1>;
-  using VStride = Stride<1, 1, 1, VDim, 1>;
+  using KStride = pto::Stride<1, 1, 1, KDim, 1>;
+  using VStride = pto::Stride<1, 1, 1, VDim, 1>;
   using BfK = GlobalTensor<half, DynShape, KStride>;
   using BfV = GlobalTensor<half, DynShape, VStride>;
   using F32K = GlobalTensor<float, DynShape, KStride>;
