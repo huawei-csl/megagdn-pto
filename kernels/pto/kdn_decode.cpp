@@ -13,6 +13,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "acl/acl.h"
+#include "kernel_utils.h"
 
 using namespace pto;
 
@@ -200,7 +201,7 @@ AICORE void kdn_decode_kernel(__gm__ half *q_ptr, __gm__ half *k_ptr,
       TCVT(k, k_bf, pto::RoundMode::CAST_NONE);
       TCVT(decay, g_bf, pto::RoundMode::CAST_NONE);
       TCVT(v_row, v_bf, pto::RoundMode::CAST_NONE);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
       if (use_l2norm) {
         UbND<float, 2, KDim> qk, sq, nrm_tmp;
         TASSIGN(qk, QAddr);
@@ -214,19 +215,19 @@ AICORE void kdn_decode_kernel(__gm__ half *q_ptr, __gm__ half *k_ptr,
         UbND<float, 1, 8, 1, 2> nrm_flat;
         TRESHAPE(nrm_flat, nrm);
         TMUL(sq, qk, qk);
-        pipe_barrier(PIPE_V);
+        kernel_utils::PipeBarrierVec();
         TROWSUM(nrm, sq, nrm_tmp);
-        pipe_barrier(PIPE_V);
+        kernel_utils::PipeBarrierVec();
         TSQRT(nrm_flat, nrm_flat);
-        pipe_barrier(PIPE_V);
+        kernel_utils::PipeBarrierVec();
         TADDS(nrm_flat, nrm_flat, 1e-6f);
-        pipe_barrier(PIPE_V);
+        kernel_utils::PipeBarrierVec();
         TROWEXPANDDIV(qk, qk, nrm);
-        pipe_barrier(PIPE_V);
+        kernel_utils::PipeBarrierVec();
       }
       TMULS(q, q, scale);
       TEXP(decay, decay);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
 
       UbDN<float, VTile, 1, DYNAMIC, DYNAMIC> delta(rows, 1);
       TRESHAPE(delta, v_row);
@@ -242,25 +243,25 @@ AICORE void kdn_decode_kernel(__gm__ half *q_ptr, __gm__ half *k_ptr,
       TRESHAPE(row_flat, row);
 
       TCOLEXPANDMUL(state, state, decay);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
       TCOLEXPANDMUL(work, state, k);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
       TROWSUM(row, work, tmp);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
       TSUB(delta_flat, delta_flat, row_flat);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
       TMULS(delta_flat, delta_flat, static_cast<float>(beta_ptr[token_head]));
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
       TCOLEXPAND(work, k);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
       TROWEXPANDMUL(work, work, delta);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
       TADD(state, state, work);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
       TCOLEXPANDMUL(work, state, q);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
       TROWSUM(row, work, tmp);
-      pipe_barrier(PIPE_V);
+      kernel_utils::PipeBarrierVec();
 
       // Alternate the staging half so the only thing that must wait for a store
       // is the token that reuses that half, two tokens later.  The cast itself
