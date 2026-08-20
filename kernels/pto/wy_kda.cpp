@@ -44,10 +44,6 @@
 //   11 : V→C reduce "ws_keff ready"
 //   12 : C→V broadcast "ws_a2 free"
 //   13 : C→V broadcast "ws_keff free"
-// Sync_all uses 6-9 (matches kkt_kda).  We pick data-flow IDs ≥ 10 so they
-// don't collide with kkt_kda / tri_inverse / gate_cumsum_kda (which all use
-// IDs 0-5 for data flow + 6-9 for sync_all).
-//
 // Layout (matches Python kda_kernel_libs convention; v cast to fp16 wrap-side):
 //   k       head-major [HV, T, K]    fp32
 //   v       BSND       [B, T, HV, V] fp16   (V == K in current setup)
@@ -63,11 +59,16 @@
 // Runtime argument: num_heads = HV.
 // ============================================================================
 
-#include <pto/pto-inst.hpp>
-#include "acl/acl.h"
 #include <runtime/rt_ffts.h>
+
+#include <pto/pto-inst.hpp>
 #include <type_traits>
+
+#include "acl/acl.h"
+#include "kernel_utils.h"
+
 using namespace pto;
+using namespace kernel_utils;
 
 #ifndef GDN_D
 #define GDN_D 128
@@ -78,27 +79,6 @@ using namespace pto;
 #endif
 
 #ifdef __CCE_AICORE__
-
-// Global barrier across ALL AI cores: drains any leftover FFTS state from
-// prior kernel launches and balances the trailing data-flow signals on
-// exit.  Uses four reserved FFTS flag IDs (6, 7, 8, 9) — distinct from the
-// data-flow flags 1-4 used by this kernel.  Pattern matches kkt_kda.cpp.
-AICORE inline void sync_all()
-{
-    pipe_barrier(PIPE_ALL);
-#if defined(__DAV_C220_CUBE__)
-    ffts_cross_core_sync(PIPE_FIX, 1 | (0 << 4) | (7 << 8));
-    wait_flag_dev(7);
-    ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (8 << 8));
-    wait_flag_dev(9);
-#elif defined(__DAV_C220_VEC__)
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (0 << 4) | (6 << 8));
-    wait_flag_dev(6);
-    ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (9 << 8));
-    wait_flag_dev(8);
-#endif
-    pipe_barrier(PIPE_ALL);
-}
 
 namespace {
 
@@ -112,22 +92,21 @@ template <typename T, int Rows, int Cols, int RowValid = Rows,
           int ColValid = Cols>
 using TileMatL1ZN = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
                               pto::BLayout::RowMajor, RowValid, ColValid,
-                              pto::SLayout::ColMajor, 512,
-                              pto::PadValue::Zero>;
+                              pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int Rows, int Cols, int RowValid = Rows,
           int ColValid = Cols>
-using TileMatL0A = pto::Tile<pto::TileType::Left, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::RowMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0A =
+    pto::Tile<pto::TileType::Left, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/true), RowValid,
+              ColValid, pto::SLayout::RowMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int Rows, int Cols, int RowValid = Rows,
           int ColValid = Cols>
-using TileMatL0B = pto::Tile<pto::TileType::Right, T, Rows, Cols,
-                             pto::BLayout::RowMajor, RowValid, ColValid,
-                             pto::SLayout::ColMajor, 512,
-                             pto::PadValue::Zero>;
+using TileMatL0B =
+    pto::Tile<pto::TileType::Right, T, Rows, Cols,
+              kernel_utils::GetOuterLayout(/*is_left=*/false), RowValid,
+              ColValid, pto::SLayout::ColMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int Rows, int Cols, int RowValid = Rows,
           int ColValid = Cols, pto::PadValue PadVal = pto::PadValue::Null>
@@ -143,15 +122,14 @@ using GmTensor2D = pto::GlobalTensor<T, GmShape2D, GmStride2D>;
 
 template <typename T, int32_t Rows, int32_t Cols>
 using DynMatL1 = pto::Tile<pto::TileType::Mat, T, Rows, Cols,
-                           pto::BLayout::ColMajor, pto::DYNAMIC,
-                           pto::DYNAMIC, pto::SLayout::RowMajor, 512,
-                           pto::PadValue::Zero>;
+                           pto::BLayout::ColMajor, pto::DYNAMIC, pto::DYNAMIC,
+                           pto::SLayout::RowMajor, 512, pto::PadValue::Zero>;
 
 template <typename T, int32_t Rows, int32_t Cols,
           pto::PadValue PadVal = pto::PadValue::Null>
-using DynVecTile = pto::Tile<pto::TileType::Vec, T, Rows, Cols,
-                             pto::BLayout::RowMajor, pto::DYNAMIC,
-                             pto::DYNAMIC, pto::SLayout::NoneBox, 512, PadVal>;
+using DynVecTile =
+    pto::Tile<pto::TileType::Vec, T, Rows, Cols, pto::BLayout::RowMajor,
+              pto::DYNAMIC, pto::DYNAMIC, pto::SLayout::NoneBox, 512, PadVal>;
 
 template <typename T, int32_t Rows, int32_t Cols>
 using DynAccTile = pto::TileAcc<T, Rows, Cols, pto::DYNAMIC, pto::DYNAMIC>;
@@ -163,13 +141,12 @@ using DynAccTile = pto::TileAcc<T, Rows, Cols, pto::DYNAMIC, pto::DYNAMIC>;
 template <typename T1, typename T2, uint32_t M, uint32_t N, uint32_t K,
           uint32_t validM = M, uint32_t validN = N, uint32_t validK = K,
           uint32_t K_tail, bool transpose_A = false, bool transpose_B = false>
-AICORE PTO_INLINE void
-gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
-                           TileMatL1<T1, M, K, validM, validK>> &A,
-        std::conditional_t<transpose_B, TileMatL1<T1, N, K, validN, validK>,
-                           TileMatL1<T1, K, N, validK, validN>> &B,
-        pto::TileAcc<T2, M, N, validM, validN> &C, bool clear)
-{
+AICORE PTO_INLINE void gemm_v0(
+    std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
+                       TileMatL1<T1, M, K, validM, validK>> &A,
+    std::conditional_t<transpose_B, TileMatL1<T1, N, K, validN, validK>,
+                       TileMatL1<T1, K, N, validK, validN>> &B,
+    pto::TileAcc<T2, M, N, validM, validN> &C, bool clear) {
   constexpr uint32_t kL0Size = 128;
   const uint32_t kL0split = (K + kL0Size - 1) / kL0Size;
 
@@ -263,21 +240,20 @@ gemm_v0(std::conditional_t<transpose_A, TileMatL1<T1, K, M, validK, validM>,
   wait_flag(PIPE_M, PIPE_FIX, war_event_id);
 }
 
-} // namespace
+}  // namespace
 
 #endif
 
 template <int32_t HiddenSize, int32_t ChunkSize>
-AICORE void wy_kda_kernel(
-    __gm__ half *K_handle, __gm__ half *V_handle,
-    __gm__ half *Beta_handle, __gm__ float *G_handle,
-    __gm__ half *A_handle,
-    __gm__ half *workspace_a2_handle, __gm__ half *workspace_keff_handle,
-    __gm__ half *U_handle, __gm__ half *W_handle,
-    __gm__ int32_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    int32_t num_heads, uint64_t ffts_addr)
-{
+AICORE void wy_kda_kernel(__gm__ half *K_handle, __gm__ half *V_handle,
+                          __gm__ half *Beta_handle, __gm__ float *G_handle,
+                          __gm__ half *A_handle,
+                          __gm__ half *workspace_a2_handle,
+                          __gm__ half *workspace_keff_handle,
+                          __gm__ half *U_handle, __gm__ half *W_handle,
+                          __gm__ int32_t *cu_seqlens, int64_t batch_size,
+                          int64_t seq_len, int64_t total_tokens,
+                          int32_t num_heads, uint64_t ffts_addr) {
   // Per-chunk math (matches ref_wy_kda):
   //   A2[r, c]    = INV[r, c] * beta[c]
   //   K_eff[c, d] = k[c, d] * exp(g_cs[c, d])
@@ -287,8 +263,7 @@ AICORE void wy_kda_kernel(
   // must be computed from ChunkSize.  This differs from wy_fast.cpp where
   // HiddenSize and ChunkSize happen to coincide (both 128) so the wrong
   // expression silently worked.
-  constexpr uint32_t KTail =
-      (ChunkSize % 128 == 0) ? 128 : (ChunkSize % 128);
+  constexpr uint32_t KTail = (ChunkSize % 128 == 0) ? 128 : (ChunkSize % 128);
 
   // Head count (HV) is a runtime argument — it only drives loop bounds and GM
   // strides, never a UB buffer size or tile shape.
@@ -305,20 +280,20 @@ AICORE void wy_kda_kernel(
   // per Vec sub-block (well under the 192 KB budget).
   //
   // Phase 1:
-  constexpr int32_t BetaUbAddr     = 0;
-  constexpr int32_t BetaRUbAddr    = 512;
-  constexpr int32_t Beta2dUbAddr   = 1024;
-  constexpr int32_t InvUbAddr      = Beta2dUbAddr + HalfChunk * ChunkSize * 4;
-  constexpr int32_t A2UbAddr       = InvUbAddr + HalfChunk * ChunkSize * 4;
-  constexpr int32_t A2HalfUbAddr   = A2UbAddr + HalfChunk * ChunkSize * 4;
+  constexpr int32_t BetaUbAddr = 0;
+  constexpr int32_t BetaRUbAddr = 512;
+  constexpr int32_t Beta2dUbAddr = 1024;
+  constexpr int32_t InvUbAddr = Beta2dUbAddr + HalfChunk * ChunkSize * 4;
+  constexpr int32_t A2UbAddr = InvUbAddr + HalfChunk * ChunkSize * 4;
+  constexpr int32_t A2HalfUbAddr = A2UbAddr + HalfChunk * ChunkSize * 4;
   // Phase 2 (overlaps with Phase 1 — addresses reused):
-  constexpr int32_t KUbAddr        = 0;
-  constexpr int32_t GcsUbAddr      = KUbAddr + HalfChunk * HiddenSize * 4;
-  constexpr int32_t KeffUbAddr     = GcsUbAddr + HalfChunk * HiddenSize * 4;
+  constexpr int32_t KUbAddr = 0;
+  constexpr int32_t GcsUbAddr = KUbAddr + HalfChunk * HiddenSize * 4;
+  constexpr int32_t KeffUbAddr = GcsUbAddr + HalfChunk * HiddenSize * 4;
   constexpr int32_t KeffHalfUbAddr = KeffUbAddr + HalfChunk * HiddenSize * 4;
 
   // ── Workspace element counts (fp16) ───────────────────────────────────────
-  constexpr int32_t WsA2Size   = ChunkSize * ChunkSize;
+  constexpr int32_t WsA2Size = ChunkSize * ChunkSize;
   constexpr int32_t WsKeffSize = ChunkSize * HiddenSize;
 
   set_ffts_base_addr(ffts_addr);
@@ -329,64 +304,50 @@ AICORE void wy_kda_kernel(
   int64_t num_seqs = batch_size;
 
   // ── UB tile declarations (TASSIGNed to fixed addresses) ──────────────────
-  TileUbDataND<half, 1, ChunkSize, 1, ChunkSize,
-               pto::PadValue::Zero> beta_ub;
+  TileUbDataND<half, 1, ChunkSize, 1, ChunkSize, pto::PadValue::Zero> beta_ub;
   TASSIGN(beta_ub, BetaUbAddr);
   TileUbDataND<float, 1, ChunkSize, 1, ChunkSize> beta_r_ub;
   TASSIGN(beta_r_ub, BetaRUbAddr);
-  TileUbDataND<float, HalfChunk, ChunkSize,
-               HalfChunk, ChunkSize> beta_2d_ub;
+  TileUbDataND<float, HalfChunk, ChunkSize, HalfChunk, ChunkSize> beta_2d_ub;
   TASSIGN(beta_2d_ub, Beta2dUbAddr);
-  TileUbDataND<float, HalfChunk, ChunkSize,
-               HalfChunk, ChunkSize, pto::PadValue::Zero> inv_ub;
+  TileUbDataND<float, HalfChunk, ChunkSize, HalfChunk, ChunkSize,
+               pto::PadValue::Zero>
+      inv_ub;
   TASSIGN(inv_ub, InvUbAddr);
-  TileUbDataND<float, HalfChunk, ChunkSize,
-               HalfChunk, ChunkSize> a2_ub;
+  TileUbDataND<float, HalfChunk, ChunkSize, HalfChunk, ChunkSize> a2_ub;
   TASSIGN(a2_ub, A2UbAddr);
-  TileUbDataND<half, HalfChunk, ChunkSize,
-               HalfChunk, ChunkSize> a2_ub_half;
+  TileUbDataND<half, HalfChunk, ChunkSize, HalfChunk, ChunkSize> a2_ub_half;
   TASSIGN(a2_ub_half, A2HalfUbAddr);
 
-  TileUbDataND<float, HalfChunk, HiddenSize,
-               HalfChunk, HiddenSize, pto::PadValue::Zero> k_ub;
+  TileUbDataND<float, HalfChunk, HiddenSize, HalfChunk, HiddenSize,
+               pto::PadValue::Zero>
+      k_ub;
   TASSIGN(k_ub, KUbAddr);
-  TileUbDataND<float, HalfChunk, HiddenSize,
-               HalfChunk, HiddenSize, pto::PadValue::Zero> gcs_ub;
+  TileUbDataND<float, HalfChunk, HiddenSize, HalfChunk, HiddenSize,
+               pto::PadValue::Zero>
+      gcs_ub;
   TASSIGN(gcs_ub, GcsUbAddr);
-  TileUbDataND<float, HalfChunk, HiddenSize,
-               HalfChunk, HiddenSize> keff_ub;
+  TileUbDataND<float, HalfChunk, HiddenSize, HalfChunk, HiddenSize> keff_ub;
   TASSIGN(keff_ub, KeffUbAddr);
-  TileUbDataND<half, HalfChunk, HiddenSize,
-               HalfChunk, HiddenSize> keff_ub_half;
+  TileUbDataND<half, HalfChunk, HiddenSize, HalfChunk, HiddenSize> keff_ub_half;
   TASSIGN(keff_ub_half, KeffHalfUbAddr);
 
   // ── L1 tiles (Cube only) ──────────────────────────────────────────────────
   // v_l1 at 0, a2_l1 at 32K, keff_l1 at 64K — fits comfortably in 256 KB L1.
-  TileMatL1<half, ChunkSize, HiddenSize,
-            ChunkSize, HiddenSize> v_l1;
+  TileMatL1<half, ChunkSize, HiddenSize, ChunkSize, HiddenSize> v_l1;
   TASSIGN(v_l1, 0);
-  TileMatL1<half, ChunkSize, ChunkSize,
-            ChunkSize, ChunkSize> a2_l1;
+  TileMatL1<half, ChunkSize, ChunkSize, ChunkSize, ChunkSize> a2_l1;
   TASSIGN(a2_l1, 32768);
-  TileMatL1<half, ChunkSize, HiddenSize,
-            ChunkSize, HiddenSize> keff_l1;
+  TileMatL1<half, ChunkSize, HiddenSize, ChunkSize, HiddenSize> keff_l1;
   TASSIGN(keff_l1, 65536);
-  TileAcc<float, ChunkSize, HiddenSize,
-          ChunkSize, HiddenSize> u_l0;
+  TileAcc<float, ChunkSize, HiddenSize, ChunkSize, HiddenSize> u_l0;
   TASSIGN(u_l0, 0);
-  TileAcc<float, ChunkSize, HiddenSize,
-          ChunkSize, HiddenSize> w_l0;
+  TileAcc<float, ChunkSize, HiddenSize, ChunkSize, HiddenSize> w_l0;
   TASSIGN(w_l0, 65536);
 
-#if defined(__DAV_C220_VEC__)
+#if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
-
-  // Global all-core barrier at kernel start: drains any stale FFTS counters
-  // left by previous launches (this kernel's Cube emits flags 3/4 N times
-  // per block while Vec only waits N-1 times, so without this entry/exit
-  // pair the trailing signal would leak into the next launch).
-  sync_all();
 
   // Vec prepares the two workspaces (ws_a2 holding A2 = INV*beta_2d, and
   // ws_keff holding K_eff = k*exp(g_cs)) that the Cube phase then consumes.
@@ -409,13 +370,14 @@ AICORE void wy_kda_kernel(
             int32_t valid_rows = static_cast<int32_t>(
                 remaining < ChunkSize ? remaining : ChunkSize);
             int64_t chunk_token_start = bos + chunk_start;
-            int32_t local_rows = valid_rows -
-                static_cast<int32_t>(vid) * HalfChunk;
+            int32_t local_rows =
+                valid_rows - static_cast<int32_t>(vid) * HalfChunk;
             if (local_rows < 0) local_rows = 0;
             if (local_rows > HalfChunk) local_rows = HalfChunk;
 
             // ─── Phase 1: build A2 = INV * beta_2d ─────────────────────────
-            // beta is pre-transposed to [HV, total_tokens] for contiguous loads.
+            // beta is pre-transposed to [HV, total_tokens] for contiguous
+            // loads.
             {
               GmShape2D beta_shape(1, valid_rows);
               GmStride2D beta_stride(1);
@@ -437,20 +399,20 @@ AICORE void wy_kda_kernel(
             // zero-padded so the Cube GEMM always sees a clean [C, C] tile.
             if (local_rows > 0) {
               int64_t a_gm_offset =
-                  ((chunk_token_start +
-                    static_cast<int64_t>(vid) * HalfChunk) *
-                   NumHeads + head_idx) *
+                  ((chunk_token_start + static_cast<int64_t>(vid) * HalfChunk) *
+                       NumHeads +
+                   head_idx) *
                   static_cast<int64_t>(ChunkSize);
               GmShape2D a_shape(local_rows, ChunkSize);
               GmStride2D a_stride(NumHeads * ChunkSize);
               GmTensor2D<half> a_global(A_handle + a_gm_offset, a_shape,
                                         a_stride);
-              TileUbDataND<half, HalfChunk, ChunkSize,
-                           HalfChunk, ChunkSize,
-                           pto::PadValue::Zero> a_stg_full;
+              TileUbDataND<half, HalfChunk, ChunkSize, HalfChunk, ChunkSize,
+                           pto::PadValue::Zero>
+                  a_stg_full;
               TASSIGN(a_stg_full, A2HalfUbAddr);
-              DynVecTile<half, HalfChunk, ChunkSize,
-                         pto::PadValue::Zero> a_load(local_rows, ChunkSize);
+              DynVecTile<half, HalfChunk, ChunkSize, pto::PadValue::Zero>
+                  a_load(local_rows, ChunkSize);
               TASSIGN(a_load, A2HalfUbAddr);
               TLOAD(a_load, a_global);
               if (local_rows != HalfChunk) {
@@ -460,7 +422,7 @@ AICORE void wy_kda_kernel(
               // Fully empty lower-half stripe: emit zeros so the workspace tile
               // for this sub-block stays well-defined.
               TEXPANDS(a2_ub, 0.0f);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TCVT(a2_ub_half, a2_ub, pto::RoundMode::CAST_NONE);
             }
 
@@ -469,12 +431,12 @@ AICORE void wy_kda_kernel(
 
             if (local_rows > 0) {
               TCVT(beta_r_ub, beta_ub, pto::RoundMode::CAST_NONE);
-              pipe_barrier(PIPE_V);
-              TileUbDataND<half, HalfChunk, ChunkSize,
-                           HalfChunk, ChunkSize> a_stg_cvt;
+              PipeBarrierVec();
+              TileUbDataND<half, HalfChunk, ChunkSize, HalfChunk, ChunkSize>
+                  a_stg_cvt;
               TASSIGN(a_stg_cvt, A2HalfUbAddr);
               TCVT(inv_ub, a_stg_cvt, pto::RoundMode::CAST_NONE);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               // Replicate beta_j across rows: beta_2d[i,j] = beta[j].
               TCOLEXPAND(beta_2d_ub, beta_r_ub);
               // A2 = INV * beta_2d (column-scale).
@@ -482,21 +444,36 @@ AICORE void wy_kda_kernel(
               TCVT(a2_ub_half, a2_ub, pto::RoundMode::CAST_NONE);
             }
 
-            if (!first_iter) wait_flag_dev(12);
+            // Wait Cube: ws_a2 slot free (flag 12).
+            // A2: Cube is a separate core → FFTS cross-core flag.
+            // A5: Cube shares the core → intra-block flag.
+            if (!first_iter) {
+#if __CCE_AICORE__ == 220
+              wait_flag_dev(12);
+#else
+              wait_intra_block(PIPE_MTE3, 12);
+              pipe_barrier(PIPE_ALL);
+#endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
               GmShape2D a2_shape(HalfChunk, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
               GmTensor2D<half> workspace_a2_global(
-                  workspace_a2_handle +
-                      static_cast<int64_t>(cid) * WsA2Size +
+                  workspace_a2_handle + static_cast<int64_t>(cid) * WsA2Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
                   a2_shape, a2_stride);
               TSTORE(workspace_a2_global, a2_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (10 << 8));
+            // Signal Cube: ws_a2 ready (flag 10)
+            // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (10 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_MTE3>(10);
+#else
+            set_intra_block(PIPE_MTE3, 10);
+#endif
 
             // ─── Phase 2: build K_eff = k * exp(g_cs) ──────────────────────
             // k and g_cs are head-major [HV, total_tokens, K] fp16; per-head
@@ -505,20 +482,19 @@ AICORE void wy_kda_kernel(
               int64_t hk_base =
                   static_cast<int64_t>(head_idx) * total_tokens *
                       static_cast<int64_t>(HiddenSize) +
-                  (chunk_token_start +
-                   static_cast<int64_t>(vid) * HalfChunk) *
+                  (chunk_token_start + static_cast<int64_t>(vid) * HalfChunk) *
                       static_cast<int64_t>(HiddenSize);
               {
                 GmShape2D k_shape(local_rows, HiddenSize);
                 GmStride2D k_stride(HiddenSize);
                 GmTensor2D<half> k_global(K_handle + hk_base, k_shape,
                                           k_stride);
-                TileUbDataND<half, HalfChunk, HiddenSize,
-                             HalfChunk, HiddenSize,
-                             pto::PadValue::Zero> k_stg_full;
+                TileUbDataND<half, HalfChunk, HiddenSize, HalfChunk, HiddenSize,
+                             pto::PadValue::Zero>
+                    k_stg_full;
                 TASSIGN(k_stg_full, KeffHalfUbAddr);
-                DynVecTile<half, HalfChunk, HiddenSize,
-                           pto::PadValue::Zero> k_load(local_rows, HiddenSize);
+                DynVecTile<half, HalfChunk, HiddenSize, pto::PadValue::Zero>
+                    k_load(local_rows, HiddenSize);
                 TASSIGN(k_load, KeffHalfUbAddr);
                 TLOAD(k_load, k_global);
                 if (local_rows != HalfChunk) {
@@ -528,23 +504,23 @@ AICORE void wy_kda_kernel(
               set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
               wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
               {
-                TileUbDataND<half, HalfChunk, HiddenSize,
-                             HalfChunk, HiddenSize> k_stg_cvt;
+                TileUbDataND<half, HalfChunk, HiddenSize, HalfChunk, HiddenSize>
+                    k_stg_cvt;
                 TASSIGN(k_stg_cvt, KeffHalfUbAddr);
                 TCVT(k_ub, k_stg_cvt, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
               }
               {
                 GmShape2D g_shape(local_rows, HiddenSize);
                 GmStride2D g_stride(HiddenSize);
                 GmTensor2D<float> g_global(G_handle + hk_base, g_shape,
                                            g_stride);
-                TileUbDataND<float, HalfChunk, HiddenSize,
-                             HalfChunk, HiddenSize,
-                             pto::PadValue::Zero> g_stg_full;
+                TileUbDataND<float, HalfChunk, HiddenSize, HalfChunk,
+                             HiddenSize, pto::PadValue::Zero>
+                    g_stg_full;
                 TASSIGN(g_stg_full, GcsUbAddr);
-                DynVecTile<float, HalfChunk, HiddenSize,
-                           pto::PadValue::Zero> g_load(local_rows, HiddenSize);
+                DynVecTile<float, HalfChunk, HiddenSize, pto::PadValue::Zero>
+                    g_load(local_rows, HiddenSize);
                 TASSIGN(g_load, GcsUbAddr);
                 TLOAD(g_load, g_global);  // g_cs fp32 → gcs_ub directly
                 if (local_rows != HalfChunk) {
@@ -555,17 +531,25 @@ AICORE void wy_kda_kernel(
               wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
               // exp(g_cs) in-place over gcs_ub, then K_eff = k * exp(g_cs).
               TEXP(gcs_ub, gcs_ub);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TMUL(keff_ub, k_ub, gcs_ub);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
             } else {
               TEXPANDS(keff_ub, 0.0f);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
             }
 
-            if (!first_iter) wait_flag_dev(13);
+            // Wait Cube: ws_keff slot free (flag 13).
+            if (!first_iter) {
+#if __CCE_AICORE__ == 220
+              wait_flag_dev(13);
+#else
+              wait_intra_block(PIPE_MTE3, 13);
+              pipe_barrier(PIPE_ALL);
+#endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -579,7 +563,13 @@ AICORE void wy_kda_kernel(
               TSTORE(workspace_keff_global, keff_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (11 << 8));
+            // Signal Cube: ws_keff ready (flag 11)
+            // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (11 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_MTE3>(11);
+#else
+            set_intra_block(PIPE_MTE3, 11);
+#endif
             first_iter = false;
           }
           gi++;
@@ -605,8 +595,8 @@ AICORE void wy_kda_kernel(
             int32_t valid_rows = static_cast<int32_t>(
                 remaining < ChunkSize ? remaining : ChunkSize);
             int64_t chunk_token_start = bos + chunk_start;
-            int32_t local_rows = valid_rows -
-                static_cast<int32_t>(vid) * HalfChunk;
+            int32_t local_rows =
+                valid_rows - static_cast<int32_t>(vid) * HalfChunk;
             if (local_rows < 0) local_rows = 0;
             if (local_rows > HalfChunk) local_rows = HalfChunk;
             int32_t head_idx = h;
@@ -630,20 +620,20 @@ AICORE void wy_kda_kernel(
 
             if (local_rows > 0) {
               int64_t a_gm_offset =
-                  ((chunk_token_start +
-                    static_cast<int64_t>(vid) * HalfChunk) *
-                   NumHeads + head_idx) *
+                  ((chunk_token_start + static_cast<int64_t>(vid) * HalfChunk) *
+                       NumHeads +
+                   head_idx) *
                   static_cast<int64_t>(ChunkSize);
               GmShape2D a_shape(local_rows, ChunkSize);
               GmStride2D a_stride(NumHeads * ChunkSize);
               GmTensor2D<half> a_global(A_handle + a_gm_offset, a_shape,
                                         a_stride);
-              TileUbDataND<half, HalfChunk, ChunkSize,
-                           HalfChunk, ChunkSize,
-                           pto::PadValue::Zero> a_stg_full;
+              TileUbDataND<half, HalfChunk, ChunkSize, HalfChunk, ChunkSize,
+                           pto::PadValue::Zero>
+                  a_stg_full;
               TASSIGN(a_stg_full, A2HalfUbAddr);
-              DynVecTile<half, HalfChunk, ChunkSize,
-                         pto::PadValue::Zero> a_load(local_rows, ChunkSize);
+              DynVecTile<half, HalfChunk, ChunkSize, pto::PadValue::Zero>
+                  a_load(local_rows, ChunkSize);
               TASSIGN(a_load, A2HalfUbAddr);
               TLOAD(a_load, a_global);
               if (local_rows != HalfChunk) {
@@ -651,7 +641,7 @@ AICORE void wy_kda_kernel(
               }
             } else {
               TEXPANDS(a2_ub, 0.0f);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TCVT(a2_ub_half, a2_ub, pto::RoundMode::CAST_NONE);
             }
 
@@ -660,52 +650,66 @@ AICORE void wy_kda_kernel(
 
             if (local_rows > 0) {
               TCVT(beta_r_ub, beta_ub, pto::RoundMode::CAST_NONE);
-              pipe_barrier(PIPE_V);
-              TileUbDataND<half, HalfChunk, ChunkSize,
-                           HalfChunk, ChunkSize> a_stg_cvt;
+              PipeBarrierVec();
+              TileUbDataND<half, HalfChunk, ChunkSize, HalfChunk, ChunkSize>
+                  a_stg_cvt;
               TASSIGN(a_stg_cvt, A2HalfUbAddr);
               TCVT(inv_ub, a_stg_cvt, pto::RoundMode::CAST_NONE);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TCOLEXPAND(beta_2d_ub, beta_r_ub);
               TMUL(a2_ub, inv_ub, beta_2d_ub);
               TCVT(a2_ub_half, a2_ub, pto::RoundMode::CAST_NONE);
             }
 
-            if (!first_iter) wait_flag_dev(12);
+            // Wait Cube: ws_a2 slot free (flag 12).
+            // A2: Cube is a separate core → FFTS cross-core flag.
+            // A5: Cube shares the core → intra-block flag.
+            if (!first_iter) {
+#if __CCE_AICORE__ == 220
+              wait_flag_dev(12);
+#else
+              wait_intra_block(PIPE_MTE3, 12);
+              pipe_barrier(PIPE_ALL);
+#endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
               GmShape2D a2_shape(HalfChunk, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
               GmTensor2D<half> workspace_a2_global(
-                  workspace_a2_handle +
-                      static_cast<int64_t>(cid) * WsA2Size +
+                  workspace_a2_handle + static_cast<int64_t>(cid) * WsA2Size +
                       static_cast<int64_t>(vid) * HalfChunk * ChunkSize,
                   a2_shape, a2_stride);
               TSTORE(workspace_a2_global, a2_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (10 << 8));
+            // Signal Cube: ws_a2 ready (flag 10)
+            // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (10 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_MTE3>(10);
+#else
+            set_intra_block(PIPE_MTE3, 10);
+#endif
 
             // ─── Phase 2: build K_eff = k * exp(g_cs) ──────────────────────
             if (local_rows > 0) {
               int64_t hk_base =
                   static_cast<int64_t>(head_idx) * total_tokens *
                       static_cast<int64_t>(HiddenSize) +
-                  (chunk_token_start +
-                   static_cast<int64_t>(vid) * HalfChunk) *
+                  (chunk_token_start + static_cast<int64_t>(vid) * HalfChunk) *
                       static_cast<int64_t>(HiddenSize);
               {
                 GmShape2D k_shape(local_rows, HiddenSize);
                 GmStride2D k_stride(HiddenSize);
                 GmTensor2D<half> k_global(K_handle + hk_base, k_shape,
                                           k_stride);
-                TileUbDataND<half, HalfChunk, HiddenSize,
-                             HalfChunk, HiddenSize,
-                             pto::PadValue::Zero> k_stg_full;
+                TileUbDataND<half, HalfChunk, HiddenSize, HalfChunk, HiddenSize,
+                             pto::PadValue::Zero>
+                    k_stg_full;
                 TASSIGN(k_stg_full, KeffHalfUbAddr);
-                DynVecTile<half, HalfChunk, HiddenSize,
-                           pto::PadValue::Zero> k_load(local_rows, HiddenSize);
+                DynVecTile<half, HalfChunk, HiddenSize, pto::PadValue::Zero>
+                    k_load(local_rows, HiddenSize);
                 TASSIGN(k_load, KeffHalfUbAddr);
                 TLOAD(k_load, k_global);
                 if (local_rows != HalfChunk) {
@@ -715,23 +719,23 @@ AICORE void wy_kda_kernel(
               set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
               wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
               {
-                TileUbDataND<half, HalfChunk, HiddenSize,
-                             HalfChunk, HiddenSize> k_stg_cvt;
+                TileUbDataND<half, HalfChunk, HiddenSize, HalfChunk, HiddenSize>
+                    k_stg_cvt;
                 TASSIGN(k_stg_cvt, KeffHalfUbAddr);
                 TCVT(k_ub, k_stg_cvt, pto::RoundMode::CAST_NONE);
-                pipe_barrier(PIPE_V);
+                PipeBarrierVec();
               }
               {
                 GmShape2D g_shape(local_rows, HiddenSize);
                 GmStride2D g_stride(HiddenSize);
                 GmTensor2D<float> g_global(G_handle + hk_base, g_shape,
                                            g_stride);
-                TileUbDataND<float, HalfChunk, HiddenSize,
-                             HalfChunk, HiddenSize,
-                             pto::PadValue::Zero> g_stg_full;
+                TileUbDataND<float, HalfChunk, HiddenSize, HalfChunk,
+                             HiddenSize, pto::PadValue::Zero>
+                    g_stg_full;
                 TASSIGN(g_stg_full, GcsUbAddr);
-                DynVecTile<float, HalfChunk, HiddenSize,
-                           pto::PadValue::Zero> g_load(local_rows, HiddenSize);
+                DynVecTile<float, HalfChunk, HiddenSize, pto::PadValue::Zero>
+                    g_load(local_rows, HiddenSize);
                 TASSIGN(g_load, GcsUbAddr);
                 TLOAD(g_load, g_global);  // g_cs fp32 → gcs_ub directly
                 if (local_rows != HalfChunk) {
@@ -741,17 +745,25 @@ AICORE void wy_kda_kernel(
               set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
               wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
               TEXP(gcs_ub, gcs_ub);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TMUL(keff_ub, k_ub, gcs_ub);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
             } else {
               TEXPANDS(keff_ub, 0.0f);
-              pipe_barrier(PIPE_V);
+              PipeBarrierVec();
               TCVT(keff_ub_half, keff_ub, pto::RoundMode::CAST_NONE);
             }
 
-            if (!first_iter) wait_flag_dev(13);
+            // Wait Cube: ws_keff slot free (flag 13).
+            if (!first_iter) {
+#if __CCE_AICORE__ == 220
+              wait_flag_dev(13);
+#else
+              wait_intra_block(PIPE_MTE3, 13);
+              pipe_barrier(PIPE_ALL);
+#endif
+            }
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             {
@@ -765,7 +777,13 @@ AICORE void wy_kda_kernel(
               TSTORE(workspace_keff_global, keff_ub_half);
             }
             pipe_barrier(PIPE_ALL);
-            ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (11 << 8));
+            // Signal Cube: ws_keff ready (flag 11)
+            // ffts_cross_core_sync(PIPE_MTE3, 1 | (2 << 4) | (11 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_MTE3>(11);
+#else
+            set_intra_block(PIPE_MTE3, 11);
+#endif
             first_iter = false;
           }
           gi++;
@@ -779,19 +797,18 @@ AICORE void wy_kda_kernel(
   // flags 3 and 4 (because the in-loop wait is gated by `!first_iter`), and
   // that stale count corrupts the next launch's first non-first-iter wait.
   if (!first_iter) {
+#if __CCE_AICORE__ == 220
     wait_flag_dev(12);
     wait_flag_dev(13);
+#else
+    wait_intra_block(PIPE_MTE3, 12);
+    wait_intra_block(PIPE_MTE3, 13);
+    pipe_barrier(PIPE_ALL);
+#endif
   }
-
-  // Global all-core barrier at kernel exit: matches the entry sync_all so
-  // the next launch starts with clean FFTS state.
-  sync_all();
 #endif
 
-#if defined(__DAV_C220_CUBE__)
-  // Global all-core barrier at kernel start (matches Vec side).
-  sync_all();
-
+#if defined(__DAV_CUBE__)
   // Cube reads V from BSND and the two Vec-produced workspaces, then issues
   // U = A2 @ V and W = A2 @ K_eff.  a2_l1 stays resident in L1 across both
   // GEMMs so the second matmul is just a different B-side load away.
@@ -811,10 +828,9 @@ AICORE void wy_kda_kernel(
             int32_t valid_rows = static_cast<int32_t>(
                 remaining < ChunkSize ? remaining : ChunkSize);
             int64_t chunk_token_start = bos + chunk_start;
-            int64_t v_off =
-                (chunk_token_start * static_cast<int64_t>(H) +
-                 static_cast<int64_t>(head_idx)) *
-                static_cast<int64_t>(HiddenSize);
+            int64_t v_off = (chunk_token_start * static_cast<int64_t>(H) +
+                             static_cast<int64_t>(head_idx)) *
+                            static_cast<int64_t>(HiddenSize);
 
             // Load V from BSND [B, T, HV, V] as fp16 (cast in Python wrapper).
             {
@@ -830,7 +846,14 @@ AICORE void wy_kda_kernel(
               }
             }
 
+            // Cube waits Vec: ws_a2 ready (flag 10).
+            // The wait must block MTE2: the consuming op is the GM->L1 TLOAD.
+#if __CCE_AICORE__ == 220
             wait_flag_dev(10);
+#else
+            WaitBothVecOnA5<PIPE_MTE2>(10);
+            pipe_barrier(PIPE_ALL);
+#endif
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
@@ -843,10 +866,9 @@ AICORE void wy_kda_kernel(
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             // U = A2 @ V.
-            gemm_v0<half, float,
-                ChunkSize, HiddenSize, ChunkSize,
-                ChunkSize, HiddenSize, ChunkSize,
-                KTail, false, false>(a2_l1, v_l1, u_l0, true);
+            gemm_v0<half, float, ChunkSize, HiddenSize, ChunkSize, ChunkSize,
+                    HiddenSize, ChunkSize, KTail, false, false>(a2_l1, v_l1,
+                                                                u_l0, true);
 
             {
               GmShape2D u_shape(valid_rows, HiddenSize);
@@ -857,9 +879,23 @@ AICORE void wy_kda_kernel(
               TASSIGN(u_store, 0);
               TSTORE(u_global, u_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (12 << 8));
+            // Cube signals Vec: ws_a2 slot free (flag 12)
+            // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (12 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_FIX>(12);
+#else
+            pipe_barrier(PIPE_ALL);
+            SignalBothVecOnA5<PIPE_FIX>(12);
+#endif
 
+            // Cube waits Vec: ws_keff ready (flag 11).
+            // The wait must block MTE2: the consuming op is the GM->L1 TLOAD.
+#if __CCE_AICORE__ == 220
             wait_flag_dev(11);
+#else
+            WaitBothVecOnA5<PIPE_MTE2>(11);
+            pipe_barrier(PIPE_ALL);
+#endif
             {
               GmShape2D keff_shape(ChunkSize, HiddenSize);
               GmStride2D keff_stride(HiddenSize);
@@ -873,10 +909,9 @@ AICORE void wy_kda_kernel(
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             // W = A2 @ K_eff — a2_l1 still resident in L1 from the U GEMM.
-            gemm_v0<half, float,
-                ChunkSize, HiddenSize, ChunkSize,
-                ChunkSize, HiddenSize, ChunkSize,
-                KTail, false, false>(a2_l1, keff_l1, w_l0, true);
+            gemm_v0<half, float, ChunkSize, HiddenSize, ChunkSize, ChunkSize,
+                    HiddenSize, ChunkSize, KTail, false, false>(a2_l1, keff_l1,
+                                                                w_l0, true);
 
             {
               GmShape2D w_shape(valid_rows, HiddenSize);
@@ -887,7 +922,14 @@ AICORE void wy_kda_kernel(
               TASSIGN(w_store, 65536);
               TSTORE(w_global, w_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (13 << 8));
+            // Cube signals Vec: ws_keff slot free (flag 13)
+            // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (13 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_FIX>(13);
+#else
+            pipe_barrier(PIPE_ALL);
+            SignalBothVecOnA5<PIPE_FIX>(13);
+#endif
           }
           gi++;
         }
@@ -911,10 +953,9 @@ AICORE void wy_kda_kernel(
                 remaining < ChunkSize ? remaining : ChunkSize);
             int64_t chunk_token_start = bos + chunk_start;
             int32_t head_idx = h;
-            int64_t v_off =
-                (chunk_token_start * static_cast<int64_t>(H) +
-                 static_cast<int64_t>(head_idx)) *
-                static_cast<int64_t>(HiddenSize);
+            int64_t v_off = (chunk_token_start * static_cast<int64_t>(H) +
+                             static_cast<int64_t>(head_idx)) *
+                            static_cast<int64_t>(HiddenSize);
 
             {
               GmShape2D v_shape(valid_rows, HiddenSize);
@@ -929,7 +970,14 @@ AICORE void wy_kda_kernel(
               }
             }
 
+            // Cube waits Vec: ws_a2 ready (flag 10).
+            // The wait must block MTE2: the consuming op is the GM->L1 TLOAD.
+#if __CCE_AICORE__ == 220
             wait_flag_dev(10);
+#else
+            WaitBothVecOnA5<PIPE_MTE2>(10);
+            pipe_barrier(PIPE_ALL);
+#endif
             {
               GmShape2D a2_shape(ChunkSize, ChunkSize);
               GmStride2D a2_stride(ChunkSize);
@@ -941,10 +989,9 @@ AICORE void wy_kda_kernel(
 
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-            gemm_v0<half, float,
-                ChunkSize, HiddenSize, ChunkSize,
-                ChunkSize, HiddenSize, ChunkSize,
-                KTail, false, false>(a2_l1, v_l1, u_l0, true);
+            gemm_v0<half, float, ChunkSize, HiddenSize, ChunkSize, ChunkSize,
+                    HiddenSize, ChunkSize, KTail, false, false>(a2_l1, v_l1,
+                                                                u_l0, true);
 
             {
               GmShape2D u_shape(valid_rows, HiddenSize);
@@ -955,9 +1002,23 @@ AICORE void wy_kda_kernel(
               TASSIGN(u_store, 0);
               TSTORE(u_global, u_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (12 << 8));
+            // Cube signals Vec: ws_a2 slot free (flag 12)
+            // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (12 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_FIX>(12);
+#else
+            pipe_barrier(PIPE_ALL);
+            SignalBothVecOnA5<PIPE_FIX>(12);
+#endif
 
+            // Cube waits Vec: ws_keff ready (flag 11).
+            // The wait must block MTE2: the consuming op is the GM->L1 TLOAD.
+#if __CCE_AICORE__ == 220
             wait_flag_dev(11);
+#else
+            WaitBothVecOnA5<PIPE_MTE2>(11);
+            pipe_barrier(PIPE_ALL);
+#endif
             {
               GmShape2D keff_shape(ChunkSize, HiddenSize);
               GmStride2D keff_stride(HiddenSize);
@@ -970,10 +1031,9 @@ AICORE void wy_kda_kernel(
 
             set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
             wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-            gemm_v0<half, float,
-                ChunkSize, HiddenSize, ChunkSize,
-                ChunkSize, HiddenSize, ChunkSize,
-                KTail, false, false>(a2_l1, keff_l1, w_l0, true);
+            gemm_v0<half, float, ChunkSize, HiddenSize, ChunkSize, ChunkSize,
+                    HiddenSize, ChunkSize, KTail, false, false>(a2_l1, keff_l1,
+                                                                w_l0, true);
 
             {
               GmShape2D w_shape(valid_rows, HiddenSize);
@@ -984,29 +1044,31 @@ AICORE void wy_kda_kernel(
               TASSIGN(w_store, 65536);
               TSTORE(w_global, w_store);
             }
-            ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (13 << 8));
+            // Cube signals Vec: ws_keff slot free (flag 13)
+            // ffts_cross_core_sync(PIPE_FIX, 1 | (2 << 4) | (13 << 8));
+#if __CCE_AICORE__ == 220
+            SetCrossFlag<PIPE_FIX>(13);
+#else
+            pipe_barrier(PIPE_ALL);
+            SignalBothVecOnA5<PIPE_FIX>(13);
+#endif
           }
           gi++;
         }
       }
     }
   }
-
-  // Global all-core barrier at kernel exit (matches Vec side).
-  sync_all();
 #endif
 }
 
 extern "C" __global__ AICORE void launch_wy_kda(
     __gm__ uint8_t *K_handle, __gm__ uint8_t *V_handle,
     __gm__ uint8_t *Beta_handle, __gm__ uint8_t *G_handle,
-    __gm__ uint8_t *A_handle,
-    __gm__ uint8_t *workspace_a2_handle, __gm__ uint8_t *workspace_keff_handle,
-    __gm__ uint8_t *U_handle, __gm__ uint8_t *W_handle,
-    __gm__ uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    int32_t num_heads, uint64_t ffts_addr)
-{
+    __gm__ uint8_t *A_handle, __gm__ uint8_t *workspace_a2_handle,
+    __gm__ uint8_t *workspace_keff_handle, __gm__ uint8_t *U_handle,
+    __gm__ uint8_t *W_handle, __gm__ uint8_t *cu_seqlens, int64_t batch_size,
+    int64_t seq_len, int64_t total_tokens, int32_t num_heads,
+    uint64_t ffts_addr) {
   wy_kda_kernel<GDN_D, GDN_C>(
       reinterpret_cast<__gm__ half *>(K_handle),
       reinterpret_cast<__gm__ half *>(V_handle),
@@ -1017,27 +1079,22 @@ extern "C" __global__ AICORE void launch_wy_kda(
       reinterpret_cast<__gm__ half *>(workspace_keff_handle),
       reinterpret_cast<__gm__ half *>(U_handle),
       reinterpret_cast<__gm__ half *>(W_handle),
-      reinterpret_cast<__gm__ int32_t *>(cu_seqlens),
-      batch_size, seq_len, total_tokens, num_heads, ffts_addr);
+      reinterpret_cast<__gm__ int32_t *>(cu_seqlens), batch_size, seq_len,
+      total_tokens, num_heads, ffts_addr);
 }
 
-extern "C" void call_kernel(
-    uint32_t block_dim, void *stream,
-    uint8_t *k, uint8_t *v, uint8_t *beta, uint8_t *g_cs, uint8_t *A,
-    uint8_t *workspace_a2, uint8_t *workspace_keff,
-    uint8_t *u, uint8_t *w,
-    uint8_t *cu_seqlens,
-    int64_t batch_size, int64_t seq_len, int64_t total_tokens,
-    uint32_t num_heads)
-{
+extern "C" void call_kernel(uint32_t block_dim, void *stream, uint8_t *k,
+                            uint8_t *v, uint8_t *beta, uint8_t *g_cs,
+                            uint8_t *A, uint8_t *workspace_a2,
+                            uint8_t *workspace_keff, uint8_t *u, uint8_t *w,
+                            uint8_t *cu_seqlens, int64_t batch_size,
+                            int64_t seq_len, int64_t total_tokens,
+                            uint32_t num_heads) {
   uint32_t fftsLen{0};
   uint64_t fftsAddr{0};
   rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
   launch_wy_kda<<<block_dim, nullptr, stream>>>(
-      k, v, beta, g_cs, A,
-      workspace_a2, workspace_keff,
-      u, w,
-      cu_seqlens,
-      batch_size, seq_len, total_tokens,
-      static_cast<int32_t>(num_heads), fftsAddr);
+      k, v, beta, g_cs, A, workspace_a2, workspace_keff, u, w, cu_seqlens,
+      batch_size, seq_len, total_tokens, static_cast<int32_t>(num_heads),
+      fftsAddr);
 }

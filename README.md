@@ -17,6 +17,7 @@ See full report [in English](blog/mega_gdn_en.md) or [in Chinese](blog/mega_gdn_
 - (2026/05/20) MegaGDN kernel is [merged to SGlang ecosystem](https://github.com/sgl-project/sgl-kernel-npu/pull/462)!
 - (2026/06/03) Various TP degrees are supported, see [this PR](https://github.com/sgl-project/sgl-kernel-npu/pull/517) and [this follow-up PR](https://github.com/sgl-project/sgl-kernel-npu/pull/533)
 - (2026/06/09) Initial support for KDA (Kimi Linear) in [this PR](https://github.com/huawei-csl/megagdn-pto/pull/9)
+- (2026/08/10) Experimental support for Ascend A5 (requires CANN >= 9.1.0), see [this PR](https://github.com/huawei-csl/megagdn-pto/pull/51)
 
 # To reproduce
 
@@ -25,11 +26,11 @@ See full report [in English](blog/mega_gdn_en.md) or [in Chinese](blog/mega_gdn_
 Recommend using [vllm-ascend docker images](https://quay.io/repository/ascend/vllm-ascend?tab=tags) with pre-installed vllm-ascend and triton-ascend (as baseline). This repo provides "plug-in" style patch compatile with vllm 0.18 and 0.19, without needing to rebuild vllm sources.
 
 ```bash
-docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1 
+docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1
 docker pull quay.io/ascend/vllm-ascend:v0.19.1rc1
 ```
 
-If only test PTO kernels (no vllm and triton), then a standard CANN installation plus torch-npu is sufficent. Recommend [CANN docker images](https://quay.io/repository/ascend/cann?tab=tags). CANN 8.5.0~9.0.0 are verified. A minimum dockerfile example:
+If only test PTO kernels (no vllm and triton), then a standard CANN installation plus torch-npu is sufficient. Recommend [CANN docker images](https://quay.io/repository/ascend/cann?tab=tags). CANN 8.5.0~9.0.0 are verified on A2/A3; the experimental Ascend A5 support requires CANN >= 9.1.0. A minimum dockerfile example:
 
 ```dockerfile
 FROM quay.io/ascend/cann:8.5.1-910b-ubuntu22.04-py3.11
@@ -52,19 +53,29 @@ cd megagdn-pto
 git submodule update --init --recursive
 
 # install `megagdn_pto` utilities, mostly just torch interface to PTO kernel call
-pip install -e '.[eval,plot]' 
+pip install -e '.[eval,plot]'
 ```
 
 ## Kernel-only unit tests and benchmarks
 
 ```bash
-# accuracy tests
-python tests/test_single_kernels.py --H-list 16,32,48,64
-python tests/test_e2e.py --no-triton
+# accuracy tests (GDN)
+python tests/test_gdn_single_kernels.py --H-list 16,32,48,64
+python tests/test_gdn_e2e.py --no-triton
+
+# accuracy tests (KDA)
+python tests/test_kda_single_kernels.py
+python tests/test_kda_e2e.py
 
 # performance benchmark
  python benchmarks/kernel/bench_gdn_kernels.py \
-    --device npu:0 --n-seq 16 --l-seg 8192 --H-list 16,32,48,64 
+    --device npu:0 --n-seq 16 --l-seg 8192 --H-list 16,32,48,64
+```
+
+To run the above on A5, prefix the commands with `PTO_MEMORY_MODEL=REGISTER_BASE`, i.e.,
+
+```bash
+PTO_MEMORY_MODEL=REGISTER_BASE python tests/test_gdn_e2e.py
 ```
 
 ## End-to-end evaluation in vLLM

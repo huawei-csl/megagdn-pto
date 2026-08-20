@@ -11,6 +11,11 @@ Environment variables:
     GDN_NPU_DEVICE          NPU device used to query ``cube_core_num`` (default ``npu:0``).
     VERBOSE_COMPILE         Set to ``1`` to print the full bisheng command.
     PTO_DYNAMIC_EXTRA_FLAGS Extra flags appended to every bisheng invocation.
+    PTO_MEMORY_MODEL        pto-isa backend macro defined for every kernel, either
+                            ``MEMORY_BASE`` (default) or ``REGISTER_BASE``. Also
+                            selects the AI Core arch and SoC version:
+                            ``dav-2201``/``Ascend910B4`` for ``MEMORY_BASE``,
+                            ``dav-3510``/``Ascend910_9599`` otherwise.
 """
 
 from __future__ import annotations
@@ -62,6 +67,26 @@ def _resolve_pto_lib_path() -> str:
 PTO_LIB_PATH: str = _resolve_pto_lib_path()
 
 # ---------------------------------------------------------------------------
+# Memory model
+# ---------------------------------------------------------------------------
+_MEMORY_MODELS = ("MEMORY_BASE", "REGISTER_BASE")
+
+MEMORY_MODEL: str = os.environ.get("PTO_MEMORY_MODEL", "MEMORY_BASE").strip()
+if MEMORY_MODEL not in _MEMORY_MODELS:
+    raise RuntimeError(
+        f"PTO_MEMORY_MODEL={MEMORY_MODEL!r} is not a valid pto-isa backend; "
+        f"expected one of {', '.join(_MEMORY_MODELS)}."
+    )
+
+# The memory-base backend targets dav-2201 (A2/A3); every other backend targets
+# dav-3510 (A5), matching the SOC_VERSION → arch mapping used by the pto-isa tests.
+# These are the driver-level ``--npu-arch`` names; bisheng expands them to the
+# AI Core archs pto-isa names directly (dav-c220 / dav-c310), keeping mix mode
+# so both __DAV_*_CUBE__ and __DAV_*_VEC__ are defined.
+_IS_MEMORY_BASE = MEMORY_MODEL == "MEMORY_BASE"
+AICORE_ARCH: str = "dav-2201" if _IS_MEMORY_BASE else "dav-3510"
+
+# ---------------------------------------------------------------------------
 # Hardware info
 # ---------------------------------------------------------------------------
 _npu_dev = os.environ.get("GDN_NPU_DEVICE", "npu:0")
@@ -80,8 +105,8 @@ except (RuntimeError, AssertionError):
 def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
     """Return bisheng flags shared by all chunk-GDN kernels."""
     flags = [
-        "-fPIC", "-shared", "-xcce", "-DMEMORY_BASE", "-O2", "-std=gnu++17",
-        "--cce-aicore-arch=dav-c220",
+        "-fPIC", "-shared", "-xcce", f"-D{MEMORY_MODEL}", "-O2", "-std=gnu++17",
+        f"--npu-arch={AICORE_ARCH}",
         "-mllvm", "-cce-aicore-stack-size=0x8000",
         "-mllvm", "-cce-aicore-function-stack-size=0x8000",
         "-mllvm", "-cce-aicore-record-overflow=true",
@@ -123,7 +148,7 @@ def compile_chunk_kernel(
     cpp_path = os.path.join(_KERNELS_PTO, cpp_basename)
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"{so_stem}_D{hidden_size}_C{chunk_size}.so",
+        f"{so_stem}_D{hidden_size}_C{chunk_size}_{MEMORY_MODEL}.so",
     )
     flags = _common_flags(hidden_size=hidden_size, chunk_size=chunk_size)
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=300)
@@ -142,7 +167,7 @@ def compile_mega_kernel(
     cpp_path = os.path.join(_KERNELS_PTO, "mega_kernel.cpp")
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"mega_kernel_D{hidden_size}_C{chunk_size}.so",
+        f"mega_kernel_D{hidden_size}_C{chunk_size}_{MEMORY_MODEL}.so",
     )
     flags = _common_flags(hidden_size=hidden_size, chunk_size=chunk_size)
     print("[megagdn_pto] Compiling mega_kernel …")
@@ -170,7 +195,7 @@ def compile_mega_kernel_kda(
     cpp_path = os.path.join(_KERNELS_PTO, "mega_kernel_kda.cpp")
     lib_path = os.path.join(
         _COMPILED_DIR,
-        f"mega_kernel_kda_D{hidden_size}_C{chunk_size}.so",
+        f"mega_kernel_kda_D{hidden_size}_C{chunk_size}_{MEMORY_MODEL}.so",
     )
     flags = _common_flags(hidden_size=hidden_size, chunk_size=chunk_size)
     print(f"[megagdn_pto] Compiling mega_kernel_kda (K={hidden_size} C={chunk_size}) …")
@@ -218,15 +243,14 @@ def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
     """Compile the triangular-inverse CubeCore kernel and return the ``.so`` path."""
     os.makedirs(_COMPILED_DIR, exist_ok=True)
     cpp_path = os.path.join(_KERNELS_PTO, "tri_inverse.cpp")
-    lib_path = os.path.join(_COMPILED_DIR, "tri_inverse_jit.so")
+    lib_path = os.path.join(_COMPILED_DIR, f"tri_inverse_jit_{MEMORY_MODEL}.so")
     if os.path.exists(lib_path):
         return lib_path
     flags = [
-        "-fPIC", "-shared", "-xcce", "-DMEMORY_BASE", "-O2", "-std=c++17",
+        "-fPIC", "-shared", "-xcce", f"-D{MEMORY_MODEL}", "-O2", "-std=c++17",
         f"-I{_KERNEL_INCLUDE}",
         f"-I{os.path.join(PTO_LIB_PATH, 'include')}",
-        "--cce-soc-version=Ascend910B4",
-        "--cce-soc-core-type=CubeCore",
+        f"--npu-arch={AICORE_ARCH}",
     ]
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=180)
     return lib_path
