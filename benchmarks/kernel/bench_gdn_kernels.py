@@ -342,7 +342,7 @@ def bench_kkt(H, HG, T, cu_seqlens, dev, stream, bd):
     return ms_pto, ms_t64, ms_t128
 
 
-def bench_solve_tril(H, T, cu_seqlens, dev, tri_inv):
+def bench_solve_tril(H, T, cu_seqlens, dev, stream, tri_inv):
     """PTO solve_tril (C=128) vs Triton solve_tril (BT=64; BT=128 unsupported).
 
     PTO timing uses :func:`megagdn_pto.fast_inverse.launch_tri_inverse_kernel` inside the loop:
@@ -366,7 +366,6 @@ def bench_solve_tril(H, T, cu_seqlens, dev, tri_inv):
     dty = dev.type
     dix = dev.index if dev.index is not None else -1
     minus_identity = precomputed_minus_identity(dty, dix, C_PTO)
-    stream_ptr = torch.npu.current_stream()._as_parameter_
 
     def run_tri_inverse_kernel():
         launch_tri_inverse_kernel(
@@ -378,7 +377,7 @@ def bench_solve_tril(H, T, cu_seqlens, dev, tri_inv):
             H,
             cu_seqlens=cu32,
             block_dim=BLOCK_DIM,
-            stream_ptr=stream_ptr,
+            stream_ptr=stream,
             is_lower=True,
         )
 
@@ -484,7 +483,7 @@ def bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd):
     return ms_pto, ms_t64, ms_t128
 
 
-def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
+def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
     """Mega-kernel vs staged PTO (aggregated)."""
     q = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
     k = F.normalize(torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2)
@@ -494,10 +493,11 @@ def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
     scale = D ** -0.5
 
     def run_mega():
-        run_mega_kernel(q, k, v, g_in, beta, cu_seqlens, stream=stream,
+        return run_mega_kernel(q, k, v, g_in, beta, cu_seqlens,
                         chunk_size=C_PTO, scale=scale, key_heads=HG)
 
-    run_mega(); torch.npu.synchronize()
+    o_scaled_mega = run_mega();
+    torch.npu.synchronize()
     ms_mega = _bench_npu(run_mega)
 
     # Staged PTO aggregated (all 6 stages)
@@ -523,7 +523,7 @@ def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
         msk_l = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
         msk_f = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
         A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
-        run_scaled_dot_kkt(k, beta, g_sum, msk_l, A, stream=stream,
+        run_scaled_dot_kkt(k, beta, g_sum, msk_l, A,
                            g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                            cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
@@ -531,30 +531,34 @@ def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
         torch.npu.synchronize()
         w = torch.empty_like(v)
         u = torch.empty_like(v)
-        run_wy_fast(k, v, beta, g_sum, A_inv, w, u, stream=stream,
+        run_wy_fast(k, v, beta, g_sum, A_inv, w, u,
                     g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
         s = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
         v_new = torch.empty_like(v)
         fs = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
-        run_chunk_h(k, w, u, g_sum, s, v_new, fs, stream=stream,
+        run_chunk_h(k, w, u, g_sum, s, v_new, fs,
                     g_t=g_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
         o = torch.empty_like(v)
-        run_chunk_o(q, k, v_new, s, g_sum, msk_f, o, stream=stream,
+        run_chunk_o(q, k, v_new, s, g_sum, msk_f, o,
                     g_t=g_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
 
-    run_staged()
+        return o * scale
+
+    o_scaled_staged = run_staged()
+    frob_rel = torch.linalg.norm(o_scaled_mega.float() - o_scaled_staged.float()) / torch.linalg.norm(o_scaled_staged.float())
     ms_staged = _bench_npu(run_staged)
 
     print(f"\n  mega_kernel vs staged PTO  (H={H} Hg={HG})")
     print(f"    Mega:   {ms_mega:.3f} ms")
     print(f"    Staged: {ms_staged:.3f} ms  →  mega speedup {_ratio(ms_staged, ms_mega)}")
-    return ms_mega, ms_staged
+    print(f"  mega vs staged PTO relative Frobenius error: {frob_rel:.3e}")
+    return ms_mega, ms_staged, frob_rel
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +656,7 @@ def main() -> None:
             row["kkt_speedup_vs128"] = ms_t128 / ms_pto if ms_t128 else None
             gc.collect()
         if "solve_tril" in stages:
-            ms_pto, ms_t64, ms_t128 = bench_solve_tril(H, T, cu_seqlens, dev, tri_inv)
+            ms_pto, ms_t64, ms_t128 = bench_solve_tril(H, T, cu_seqlens, dev, stream, tri_inv)
             row["solve_tril_pto_ms"] = ms_pto
             row["solve_tril_triton64_ms"] = ms_t64
             row["solve_tril_triton128_ms"] = ms_t128  # always None
