@@ -550,7 +550,7 @@ def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
         return o * scale
 
     o_scaled_staged = run_staged()
-    frob_rel = torch.linalg.norm(o_scaled_mega.float() - o_scaled_staged.float()) / torch.linalg.norm(o_scaled_staged.float())
+    frob_rel = torch.linalg.norm(o_scaled_mega - o_scaled_staged) / torch.linalg.norm(o_scaled_staged)
     ms_staged = _bench_npu(run_staged)
 
     print(f"\n  mega_kernel vs staged PTO  (H={H} Hg={HG})")
