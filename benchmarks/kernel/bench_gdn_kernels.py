@@ -514,6 +514,7 @@ def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
     msk_l = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
     msk_f = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
     A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
+    ws_tri = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float32)
     A_inv = torch.empty(1, T, H, C_PTO, device=dev, dtype=torch.float16)
     w = torch.empty_like(v)
     u = torch.empty_like(v)
@@ -528,36 +529,55 @@ def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
                          cu_seqlens=cu_seqlens, batch_size_override=N_seq)
         g_t = transpose_gates(g_sum)
         beta_t = transpose_beta(beta)
-        torch.npu.synchronize()
         run_scaled_dot_kkt(k, beta, g_sum, msk_l, A,
                            g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                            cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
-        torch.npu.synchronize()
-        torch.npu.synchronize()
+        solve_tril(A, cu_seqlens, C_PTO, H, tri_inv, workspace_fp32=ws_tri, out_fp16=A_inv)
         run_wy_fast(k, v, beta, g_sum, A_inv, w, u,
                     g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
-        torch.npu.synchronize()
         run_chunk_h(k, w, u, g_sum, s, v_new, fs,
                     g_t=g_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
-        torch.npu.synchronize()
         run_chunk_o(q, k, v_new, s, g_sum, msk_f, o,
                     g_t=g_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
-        torch.npu.synchronize()
 
         return o * scale
 
-    o_scaled_staged = run_staged()
-    frob_rel = torch.linalg.norm(o_scaled_mega - o_scaled_staged) / torch.linalg.norm(o_scaled_staged)
+    # ── Correctness gate (before any timing) ─────────────────────────────────
+    # Never report a staged-vs-fused speedup without verifying the two paths agree.
+    # A fast-but-wrong pipeline (miswired launch, missing scale, uninitialised
+    # workspace, a non-deterministic kernel) is otherwise invisible to timing.
+    o_mega = run_mega(); torch.npu.synchronize(); o_mega = o_mega.float().clone()
+    o_staged = run_staged(); torch.npu.synchronize(); o_staged = o_staged.float().clone()
+    frob_rel = (o_staged - o_mega).norm().item() / o_mega.norm().item()
+
+    if frob_rel >= 1e-2:
+        # Disagreement. Re-run the mega-kernel on identical input to tell a *bug in
+        # one path* apart from a *non-deterministic kernel* (run-to-run instability
+        # — e.g. an accumulation-order race — shows up as the mega path disagreeing
+        # with itself). The staged path is a deterministic six-launch reference.
+        o_mega2 = run_mega(); torch.npu.synchronize(); o_mega2 = o_mega2.float().clone()
+        mega_self = (o_mega2 - o_mega).norm().item() / o_mega.norm().item()
+        print(f"\n  ⚠ CORRECTNESS GATE FAILED  (H={H} Hg={HG})")
+        print(f"    staged vs mega        : frob_rel={frob_rel:.3e}  (≥ 1e-2)")
+        print(f"    mega vs mega (re-run) : frob_rel={mega_self:.3e}  "
+              f"({'NON-DETERMINISTIC mega-kernel' if mega_self >= 1e-2 else 'mega stable → staged path suspect'})")
+        print(f"    → skipping timing for H={H} (would compare against an unreliable reference)")
+        del o_mega, o_staged, o_mega2
+        gc.collect(); torch.npu.empty_cache()
+        return None, None, frob_rel
+
+    del o_mega, o_staged
+    gc.collect(); torch.npu.empty_cache()
+
     ms_staged = _bench_npu(run_staged)
 
     print(f"\n  mega_kernel vs staged PTO  (H={H} Hg={HG})")
     print(f"    Mega:   {ms_mega:.3f} ms")
     print(f"    Staged: {ms_staged:.3f} ms  →  mega speedup {_ratio(ms_staged, ms_mega)}")
     print(f"  mega vs staged PTO relative Frobenius error: {frob_rel:.3e}")
-    print(f"  staged output norm: {o_scaled_staged.float().norm():.3e}")
     return ms_mega, ms_staged, frob_rel
 
 
