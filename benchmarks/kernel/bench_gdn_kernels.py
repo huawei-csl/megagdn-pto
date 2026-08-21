@@ -294,10 +294,10 @@ def _print_stage(name, ms_pto, ms_t64, ms_t128):
     sp64 = _ratio(ms_t64, ms_pto)
     sp128 = _ratio(ms_t128, ms_pto)
     print(f"\n  {name}  (PTO C={C_PTO})")
-    print(f"    PTO        : {ms_pto:.2f} ms")
-    print(f"    Triton BT=64 : {ms_t64:.2f} ms  → {sp64}" if ms_t64 else
+    print(f"    PTO        : {ms_pto:.3f} ms")
+    print(f"    Triton BT=64 : {ms_t64:.3f} ms  → {sp64}" if ms_t64 else
           f"    Triton BT=64 : fail")
-    print(f"    Triton BT=128: {ms_t128:.2f} ms  → {sp128}" if ms_t128 else
+    print(f"    Triton BT=128: {ms_t128:.3f} ms  → {sp128}" if ms_t128 else
           f"    Triton BT=128: n/a")
 
 
@@ -552,8 +552,8 @@ def bench_mega(H, HG, T, cu_seqlens, dev, stream, tri_inv):
     ms_staged = _bench_npu(run_staged)
 
     print(f"\n  mega_kernel vs staged PTO  (H={H} Hg={HG})")
-    print(f"    Mega:   {ms_mega:.2f} ms")
-    print(f"    Staged: {ms_staged:.2f} ms  →  mega speedup {_ratio(ms_staged, ms_mega)}")
+    print(f"    Mega:   {ms_mega:.3f} ms")
+    print(f"    Staged: {ms_staged:.3f} ms  →  mega speedup {_ratio(ms_staged, ms_mega)}")
     return ms_mega, ms_staged
 
 
