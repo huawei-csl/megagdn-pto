@@ -26,5 +26,5 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --volume /var/queue_schedule:/var/queue_schedule "$@"
 }
 
-drun "$@" --env "HF_ENDPOINT=https://hf-mirror.com" ${DOCKER_IMAGE_TAG} /usr/bin/bash
+drun "$@" ${DOCKER_IMAGE_TAG} /usr/bin/bash
 
