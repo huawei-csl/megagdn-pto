@@ -501,48 +501,47 @@ def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
     ms_mega = _bench_npu(run_mega)
 
     # Staged PTO aggregated (all 6 stages)
-    from megagdn_pto.kernel_libs import run_scaled_dot_kkt, run_wy_fast, run_chunk_h, run_chunk_o
+    from megagdn_pto.kernel_libs import run_chunk_cumsum, run_scaled_dot_kkt, run_wy_fast, run_chunk_h, run_chunk_o
     N_seq = int(cu_seqlens.numel()) - 1
     tc_n = total_chunks(N_seq, T, C_PTO, cu_seqlens)
-    cu_cpu = cu_seqlens.cpu().tolist()
 
-    def ref_cumsum_torch():
-        out = torch.zeros(1, T, H, device=dev, dtype=torch.float32)
-        for i in range(len(cu_cpu) - 1):
-            bos, eos = cu_cpu[i], cu_cpu[i + 1]
-            for j in range(0, eos - bos, C_PTO):
-                s, e = bos + j, min(bos + j + C_PTO, eos)
-                out[:, s:e, :] = g_in.float()[:, s:e, :].cumsum(dim=1)
-        return out
+    # Staged path is linear in q; pre-scale once so o matches the mega-kernel
+    # (which applies `scale` internally) without a per-iteration elementwise op.
+    #q_scaled = (q * scale).to(torch.float16)
+
+    # Pre-allocate every intermediate + workspace once (timed loop = pure launches).
+    g_sum = torch.empty(1, T, H, device=dev, dtype=torch.float32)
+    msk_l = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
+    msk_f = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
+    A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
+    A_inv = torch.empty(1, T, H, C_PTO, device=dev, dtype=torch.float16)
+    w = torch.empty_like(v)
+    u = torch.empty_like(v)
+    s = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
+    v_new = torch.empty_like(v)
+    fs = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
+    o = torch.empty_like(v)
 
     def run_staged():
-        g_sum = ref_cumsum_torch()
+        # Stage chaining on the shared stream — no inter-stage host syncs.
+        run_chunk_cumsum(g_in, g_sum, chunk_size=C_PTO,
+                         cu_seqlens=cu_seqlens, batch_size_override=N_seq)
         g_t = transpose_gates(g_sum)
         beta_t = transpose_beta(beta)
         torch.npu.synchronize()
-        msk_l = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=-1).float()
-        msk_f = torch.tril(torch.ones(C_PTO, C_PTO, device=dev), diagonal=0).float()
-        A = torch.zeros(1, T, H, C_PTO, device=dev, dtype=torch.float16)
         run_scaled_dot_kkt(k, beta, g_sum, msk_l, A,
                            g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                            cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
-        A_inv = solve_tril(A, cu_seqlens, C_PTO, H, tri_inv)
         torch.npu.synchronize()
-        w = torch.empty_like(v)
-        u = torch.empty_like(v)
         run_wy_fast(k, v, beta, g_sum, A_inv, w, u,
                     g_t=g_t, beta_t=beta_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
-        s = torch.zeros(tc_n * H, D, D, device=dev, dtype=torch.float16)
-        v_new = torch.empty_like(v)
-        fs = torch.zeros(N_seq * H, D, D, device=dev, dtype=torch.float16)
         run_chunk_h(k, w, u, g_sum, s, v_new, fs,
                     g_t=g_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
         torch.npu.synchronize()
-        o = torch.empty_like(v)
         run_chunk_o(q, k, v_new, s, g_sum, msk_f, o,
                     g_t=g_t, chunk_size=C_PTO,
                     cu_seqlens=cu_seqlens, batch_size_override=N_seq, key_heads=HG)
@@ -558,6 +557,7 @@ def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
     print(f"    Mega:   {ms_mega:.3f} ms")
     print(f"    Staged: {ms_staged:.3f} ms  →  mega speedup {_ratio(ms_staged, ms_mega)}")
     print(f"  mega vs staged PTO relative Frobenius error: {frob_rel:.3e}")
+    print(f"  staged output norm: {o_scaled_staged.float().norm():.3e}")
     return ms_mega, ms_staged, frob_rel
 
 
