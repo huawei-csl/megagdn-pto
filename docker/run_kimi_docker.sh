@@ -38,6 +38,11 @@ DEVICES=(
 
 MOUNTS=(
     -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
+    -v /sys/fs/cgroup:/sys/fs/cgroup:ro
+    -v /usr/local/dcmi:/usr/local/dcmi
+    -v /usr/local/sbin:/usr/local/sbin
+    -v /etc/hccn.conf:/etc/hccn.conf
     -v /etc/ascend_install.info:/etc/ascend_install.info:ro
     -v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware
     -v /var/queue_schedule:/var/queue_schedule
