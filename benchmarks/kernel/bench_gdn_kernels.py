@@ -644,7 +644,35 @@ def bench_chunk_o(H, HG, T, tc, cu_seqlens, dev, stream, bd):
 
 
 def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
-    """Mega-kernel vs staged PTO (aggregated)."""
+    """Mega-kernel vs a competently-written staged PTO pipeline.
+
+    This is a *fusion* benchmark: it measures whether collapsing the six GDN
+    stages into one mega-kernel beats running them as six separate PTO kernel
+    launches. For that to be a fair fight, the staged baseline must be written the
+    way a real deployment would write it. Three things matter, and all three were
+    wrong in the original version of this benchmark (making the staged path look
+    artificially slow / the mega-kernel look artificially good):
+
+    1. **Use the real cumsum kernel.** The staged path here runs the PTO
+       ``chunk_cumsum`` kernel (~0.03 ms), not a torch ``cumsum`` reference in a
+       Python double-loop (~21 ms) — the latter dominated the staged time and is
+       not what anyone would ship.
+
+    2. **No redundant inter-stage syncs.** Kernels launched on the same stream are
+       serialized by the stream (stage N+1 observes stage N's writes), so the
+       ``torch.npu.synchronize()`` barriers between stages are *not needed for
+       correctness* — they are a legacy precaution. Dropping them is verified
+       bit-exact below and the no-sync path is what we time.
+
+    3. **Pre-allocate, don't malloc in the timed loop.** All intermediates and
+       workspaces are allocated once; the timed region is pure kernel launches.
+
+    A correctness gate (``frob_rel < 1e-2`` vs the mega-kernel output) runs *before*
+    any timing, so a fast-but-wrong staged pipeline can never be reported as a win.
+    The mega-kernel applies ``scale`` internally; the staged path is linear in ``q``
+    so we fold ``scale`` into ``q`` once (pre-scaled ``q`` ⇒ scaled ``o``), matching
+    the mega output without a per-iteration elementwise pass.
+    """
     q = F.normalize(
         torch.randn(1, T, HG, D, device=dev, dtype=torch.float16), dim=-1, p=2
     )
