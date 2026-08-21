@@ -492,14 +492,6 @@ def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
     beta = torch.rand(1, T, H, device=dev, dtype=torch.float16)
     scale = D ** -0.5
 
-    def run_mega():
-        return run_mega_kernel(q, k, v, g_in, beta, cu_seqlens,
-                        chunk_size=C_PTO, scale=scale, key_heads=HG)
-
-    o_scaled_mega = run_mega();
-    torch.npu.synchronize()
-    ms_mega = _bench_npu(run_mega)
-
     # Staged PTO aggregated (all 6 stages)
     from megagdn_pto.kernel_libs import run_chunk_cumsum, run_scaled_dot_kkt, run_wy_fast, run_chunk_h, run_chunk_o
     N_seq = int(cu_seqlens.numel()) - 1
@@ -549,9 +541,22 @@ def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
     # Never report a staged-vs-fused speedup without verifying the two paths agree.
     # A fast-but-wrong pipeline (miswired launch, missing scale, uninitialised
     # workspace, a non-deterministic kernel) is otherwise invisible to timing.
-    o_mega = run_mega(); torch.npu.synchronize(); o_mega = o_mega.float().clone()
-    o_staged = run_staged(); torch.npu.synchronize(); o_staged = o_staged.float().clone()
+    torch.npu.synchronize();
+    def run_mega():
+            return run_mega_kernel(q, k, v, g_in, beta, cu_seqlens,
+                            chunk_size=C_PTO, scale=scale, key_heads=HG)
+
+    o_mega = run_mega();
+    torch.npu.synchronize()
+    ms_mega = _bench_npu(run_mega)
+
+    torch.npu.synchronize();
+    o_staged = run_staged();
+    torch.npu.synchronize();
     frob_rel = (o_staged - o_mega).norm().item() / o_mega.norm().item()
+    del o_mega, o_staged
+    gc.collect(); torch.npu.empty_cache()
+    torch.npu.synchronize();
 
     if frob_rel >= 1e-2:
         # Disagreement. Re-run the mega-kernel on identical input to tell a *bug in
@@ -568,9 +573,6 @@ def bench_mega(H, HG, T, cu_seqlens, dev, tri_inv):
         del o_mega, o_staged, o_mega2
         gc.collect(); torch.npu.empty_cache()
         return None, None, frob_rel
-
-    del o_mega, o_staged
-    gc.collect(); torch.npu.empty_cache()
 
     ms_staged = _bench_npu(run_staged)
 
