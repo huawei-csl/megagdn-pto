@@ -13,10 +13,17 @@ Two execution modes (controlled by ``VLLM_PTO_MEGAKERNEL`` env var):
     ``megagdn_pto.mega_kernel``.
 
 GQA is supported: if ``v.shape[2] > q.shape[2]``, the GQA path is taken.
+
+The signature tracks vllm-ascend v0.23, which added ``chunk_indices``,
+``chunk_offsets`` and ``core_attn_out`` for API parity with vLLM's
+``qwen_gdn_linear_attn``. Upstream ignores all three; we forward the first two
+to the Triton fallback when its signature accepts them, and fill
+``core_attn_out`` (a pre-allocated output buffer) whenever a caller passes one.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
 from functools import lru_cache
 
@@ -68,6 +75,40 @@ def _head_dims_compatible(q: torch.Tensor, v: torch.Tensor) -> bool:
 
 def _megakernel_enabled() -> bool:
     return os.environ.get("VLLM_PTO_MEGAKERNEL", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# vllm-ascend v0.23 API-parity arguments
+# ---------------------------------------------------------------------------
+
+_V023_EXTRA_ARGS = ("chunk_indices", "chunk_offsets")
+
+
+@lru_cache(maxsize=4)
+def _triton_accepts(fn, *names: str) -> tuple[str, ...]:
+    """Subset of ``names`` that ``fn`` accepts (all of them if it takes **kwargs)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return ()
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return names
+    return tuple(n for n in names if n in params)
+
+
+def _fill_core_attn_out(core_attn_out: torch.Tensor | None, o: torch.Tensor) -> None:
+    """Copy ``o`` into the caller's pre-allocated output buffer, if any.
+
+    Mirrors what vLLM's own ``fi_chunk_gated_delta_rule`` wrapper does: the
+    buffer, not the return value, is what the output projection reads on the
+    paths that pass it.
+    """
+    if core_attn_out is None:
+        return
+    o_flat = o.reshape(-1)
+    co_flat = core_attn_out.reshape(-1)
+    if o_flat.numel() <= co_flat.numel():
+        co_flat[: o_flat.numel()].copy_(o_flat)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +232,9 @@ def chunk_gated_delta_rule_pto(
     prebuilt_meta=None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
+    core_attn_out: torch.Tensor | None = None,
     *,
     _triton_impl,
 ):
@@ -209,13 +253,22 @@ def chunk_gated_delta_rule_pto(
         from vllm_ascend.ops.triton.fla.l2norm import l2norm_fwd
         q, k = l2norm_fwd(q), l2norm_fwd(k)
 
-    def _triton(*args, **kw):
-        return _triton_impl(
+    # v0.23-only arguments; older Triton implementations reject them outright.
+    _extra = {"chunk_indices": chunk_indices, "chunk_offsets": chunk_offsets}
+    _extra = {n: _extra[n] for n in _triton_accepts(_triton_impl, *_V023_EXTRA_ARGS)}
+
+    def _triton():
+        out = _triton_impl(
             q, k, v, g, beta,
             scale=scale, initial_state=initial_state,
             output_final_state=output_final_state, cu_seqlens=cu_seqlens,
             prebuilt_meta=prebuilt_meta, head_first=False, use_qk_l2norm_in_kernel=False,
+            **_extra,
         )
+        # Upstream accepts ``core_attn_out`` but never writes it; do it here so
+        # callers that read the buffer instead of the return value still work.
+        _fill_core_attn_out(core_attn_out, out[0])
+        return out
 
     # --- Triton fallback conditions ---
     if q.device.type != "npu":
@@ -256,21 +309,27 @@ def chunk_gated_delta_rule_pto(
     o = o.to(q.dtype)
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
+    _fill_core_attn_out(core_attn_out, o)
     return o, final_state
 
 
 def bind_triton(_triton_impl):
     """Return a callable matching the vLLM public API with the Triton fallback bound."""
 
+    # Argument order matches vllm-ascend v0.23; callers pass the trailing three
+    # by keyword, but keep the order so positional calls stay correct too.
     def _bound(
         q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False,
         cu_seqlens=None, prebuilt_meta=None, head_first=False, use_qk_l2norm_in_kernel=False,
+        chunk_indices=None, chunk_offsets=None, core_attn_out=None,
     ):
         return chunk_gated_delta_rule_pto(
             q, k, v, g, beta,
             scale=scale, initial_state=initial_state, output_final_state=output_final_state,
             cu_seqlens=cu_seqlens, prebuilt_meta=prebuilt_meta,
             head_first=head_first, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            chunk_indices=chunk_indices, chunk_offsets=chunk_offsets,
+            core_attn_out=core_attn_out,
             _triton_impl=_triton_impl,
         )
 

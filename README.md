@@ -23,12 +23,19 @@ See full report [in English](blog/mega_gdn_en.md) or [in Chinese](blog/mega_gdn_
 
 ## NPU Environment
 
-Recommend using [vllm-ascend docker images](https://quay.io/repository/ascend/vllm-ascend?tab=tags) with pre-installed vllm-ascend and triton-ascend (as baseline). This repo provides "plug-in" style patch compatile with vllm 0.18 and 0.19, without needing to rebuild vllm sources.
+Recommend using [vllm-ascend docker images](https://quay.io/repository/ascend/vllm-ascend?tab=tags) with pre-installed vllm-ascend and triton-ascend (as baseline). This repo provides "plug-in" style patch compatile with vllm-ascend 0.18, 0.19 and 0.23, without needing to rebuild vllm sources.
 
 ```bash
 docker pull quay.io/ascend/vllm-ascend:v0.18.0rc1
 docker pull quay.io/ascend/vllm-ascend:v0.19.1rc1
+docker pull quay.io/ascend/vllm-ascend:v0.23.0
 ```
+
+`python vllm_patch/install_hook.py` adapts to the layout of the installed
+vllm-ascend, so the same command covers all three releases. On 0.19 and 0.23 the
+per-model edits are reported as skipped — those releases route GDN prefill
+through `vllm_ascend.ops.gdn`, which the runtime patch in `vllm_patch/apply.py`
+covers instead.
 
 If only test PTO kernels (no vllm and triton), then a standard CANN installation plus torch-npu is sufficient. Recommend [CANN docker images](https://quay.io/repository/ascend/cann?tab=tags). CANN 8.5.0~9.0.0 are verified on A2/A3; the experimental Ascend A5 support requires CANN >= 9.1.0. A minimum dockerfile example:
 

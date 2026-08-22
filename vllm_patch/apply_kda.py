@@ -4,7 +4,9 @@ Two patches applied here:
 
 1. **chunk_kda patch** — replaces the Triton ``chunk_kda`` used by
    ``KimiDeltaAttention`` with the PTO megakernel for prefill, falling back
-   to Triton for decode.
+   to Triton for decode. vLLM 0.23 routes KimiLinear prefill through
+   ``chunk_kda_with_fused_gate`` instead, so that entry point is wrapped too
+   when present; whichever exists gets patched.
 
 2. **Page alignment bypass** — vllm-ascend v0.18.0rc1 requires the KDA
    recurrent-state page size (mamba_page_size_padded) to be a multiple of
@@ -245,21 +247,45 @@ def apply_kda_patch() -> None:
             "is vllm-ascend installed and does it support KimiLinear?"
         ) from e
 
-    triton_impl = _kda_mod.chunk_kda
+    from chunk_kda_pto import bind_triton, bind_triton_fused_gate  # type: ignore[import]
 
-    from chunk_kda_pto import bind_triton  # type: ignore[import]
+    # ``chunk_kda`` is the pre-0.23 entry point; ``chunk_kda_with_fused_gate`` is
+    # what vLLM 0.23 KimiLinear calls. Patch whichever the installed vLLM has.
+    patched: dict[str, object] = {}
+    for attr, binder in (
+        ("chunk_kda", bind_triton),
+        ("chunk_kda_with_fused_gate", bind_triton_fused_gate),
+    ):
+        impl = getattr(_kda_mod, attr, None)
+        if impl is None:
+            continue
+        wrapped = binder(impl)
+        setattr(_kda_mod, attr, wrapped)
+        patched[attr] = wrapped
 
-    wrapped = bind_triton(triton_impl)
-    _kda_mod.chunk_kda = wrapped
+    if not patched:
+        raise RuntimeError(
+            "neither chunk_kda nor chunk_kda_with_fused_gate found in "
+            "vllm.model_executor.layers.fla.ops.kda"
+        )
 
-    # Also patch the importing module (vllm.model_executor.layers.kda) which
-    # imports chunk_kda at the top level.
-    _kda_layer_mod = sys.modules.get("vllm.model_executor.layers.kda")
-    if _kda_layer_mod is not None and hasattr(_kda_layer_mod, "chunk_kda"):
-        _kda_layer_mod.chunk_kda = wrapped
+    # Modules that re-export these at import time hold a stale Triton reference
+    # if they were imported first; rebind them. (``layers.kda`` up to vLLM 0.22,
+    # ``layers.mamba.gdn.kimi_gdn_linear_attn`` from 0.23 on.)
+    for mod_name in (
+        "vllm.model_executor.layers.kda",
+        "vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        for attr, wrapped in patched.items():
+            if hasattr(mod, attr):
+                setattr(mod, attr, wrapped)
 
     _PATCH_ACTIVE = True
-    _log.warning("KDA PTO patch active: fused megakernel (C=%d).", 128)
+    _log.warning("KDA PTO patch active: fused megakernel (C=%d), entry points: %s.",
+                 128, ", ".join(sorted(patched)))
 
 
 def is_kda_patch_active() -> bool:
