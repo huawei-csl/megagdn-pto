@@ -85,7 +85,7 @@ bench_gdn_kernels_mega_kernel:
 
 
 bench_sglang_mmlu_qwen35_0_8b:
-  image: quay.io/ascend/vllm-ascend:v0.23.0rc1
+  image: quay.io/ascend/sglang:v0.5.18-cann9.0.0-910b
   stage: bench
   tags:
     - docker_npu_910B2 # Build and test on-device (aarch64 / 910B2)
