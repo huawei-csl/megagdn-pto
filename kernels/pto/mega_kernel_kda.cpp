@@ -135,9 +135,11 @@ namespace mk_kkt {
 }
 #undef call_kernel
 
+#define call_kernel _mk_unused_kda_solve
 namespace mk_solve {
-#include "tri_inverse_impl.cpp"
+#include "tri_inverse.cpp"
 }
+#undef call_kernel
 
 #define call_kernel _mk_unused_kda_wy
 namespace mk_wy {
