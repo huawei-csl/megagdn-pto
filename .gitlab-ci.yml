@@ -71,6 +71,70 @@ bench_gdn_kernels:
   allow_failure: true
 
 
+bench_gdn_kernels_mega_kernel:
+  image: quay.io/ascend/vllm-ascend:v0.23.0rc1
+  stage: bench
+  tags:
+    - docker_npu_910B2 # Build and test on-device (aarch64 / 910B2)
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+  script:
+    - python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --mega
+  when: manual
+  allow_failure: true
+
+
+bench_sglang_mmlu_qwen35_0_8b:
+  image: quay.io/ascend/sglang:v0.5.18-cann9.0.0-910b
+  stage: bench
+  tags:
+    - docker_npu_910B2 # Build and test on-device (aarch64 / 910B2)
+  variables:
+    GDN_USE_MEGA_GDN: "1" # Set to 0 to run the triton kernels instead
+    SGLANG_PORT: "30000"
+    SGLANG_MODEL: Qwen/Qwen3.5-0.8B
+    SGLANG_BENCH_VERSION: v0.5.18
+  before_script:
+    - source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    - curl -fsSL -o bench_sglang.py
+      "https://raw.githubusercontent.com/sgl-project/sglang/refs/tags/${SGLANG_BENCH_VERSION}/benchmark/mmlu/bench_sglang.py"
+  script:
+    # Launch the server in the background and keep its logs as an artifact
+    - mkdir -p outputs/logs/
+    - python -m sglang.launch_server --model-path "$SGLANG_MODEL" --port "$SGLANG_PORT"
+      > outputs/logs/sglang_server.log 2>&1 &
+    - echo $! > sglang_server.pid
+    # Wait for the server to be up (fail fast if it dies or never becomes healthy)
+    - |
+      for i in $(seq 1 120); do
+        if ! kill -0 "$(cat sglang_server.pid)" 2>/dev/null; then
+          echo "sglang server exited before becoming healthy"
+          tail -n 100 outputs/logs/sglang_server.log
+          exit 1
+        fi
+        if curl -fsS "http://127.0.0.1:${SGLANG_PORT}/health_generate" >/dev/null 2>&1; then
+          echo "sglang server is up after ${i} attempt(s)"
+          break
+        fi
+        if [ "$i" -eq 120 ]; then
+          echo "timed out waiting for the sglang server on port ${SGLANG_PORT}"
+          tail -n 100 outputs/logs/sglang_server.log
+          exit 1
+        fi
+        sleep 5
+      done
+    # Test megaGDN-pto kernel
+    - python3 bench_sglang.py --nsub 10
+  after_script:
+    - if [ -f sglang_server.pid ]; then kill "$(cat sglang_server.pid)" 2>/dev/null || true; fi
+  when: manual
+  allow_failure: true
+  artifacts:
+    when: always
+    expire_in: 1 day
+    paths:
+      - outputs/logs/
+
 bench_lm_eval_qwen35_0_8b:
   image: quay.io/ascend/vllm-ascend:v0.23.0rc1
   stage: bench
