@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start an interactive sglang-ascend container on all 8 NPUs of the host.
+# Start an interactive vllm-ascend container on all 8 NPUs of the host.
 #
 # The container is disposable (--rm) but the model weights are not: the host
 # directory /scratch/model_weights is mounted read-only at the same path inside
@@ -7,18 +7,18 @@
 #
 # Mounts the host Ascend driver, firmware and queue-schedule paths so the
 # in-container CANN stack talks to the host NPUs. The container is named
-# sglang-ascend-$USER to avoid collisions between users on a shared host.
+# vLLM-ascend-$USER to avoid collisions between users on a shared host.
 #
 # Usage (run from the repo root):
-#   bash docker/start_sglang_ascend.sh [EXTRA_DOCKER_ARGS...]
-#   bash docker/start_sglang_ascend.sh -v "$PWD:/sources" -w /sources
+#   bash docker/start_vllm_ascend.sh [EXTRA_DOCKER_ARGS...]
+#   bash docker/start_vllm_ascend.sh -v "$PWD:/sources" -w /sources
 #
 # Extra arguments are passed to `docker run` (not to the shell in the
 # container), which lands you at a bash prompt inside the image.
 #
-# To use a different image, edit DOCKER_IMAGE_TAG below.
+# To use a different image, edit DOCKER_IMAGE_TAG below. 
 
-DOCKER_IMAGE_TAG="quay.io/ascend/sglang:v0.5.18-cann9.0.0-910b"
+DOCKER_IMAGE_TAG="quay.io/ascend/vllm-ascend:v0.23.0"
 
 drun() {
 
@@ -30,9 +30,10 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
     --volume /etc/ascend_install.info:/etc/ascend_install.info \
     --volume "/scratch/model_weights/:/scratch/model_weights/:ro" \
-    --name "sglang-ascend-${USER}" \
+    --name vLLM-ascend-${USER} \
     --volume /var/queue_schedule:/var/queue_schedule "$@"
 }
 
 drun "$@" ${DOCKER_IMAGE_TAG} /usr/bin/bash
+
 
