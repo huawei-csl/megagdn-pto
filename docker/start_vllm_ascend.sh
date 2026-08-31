@@ -16,7 +16,7 @@
 # Extra arguments are passed to `docker run` (not to the shell in the
 # container), which lands you at a bash prompt inside the image.
 #
-# To use a different image, edit DOCKER_IMAGE_TAG below. 
+# To use a different image, edit DOCKER_IMAGE_TAG below.
 
 DOCKER_IMAGE_TAG="quay.io/ascend/vllm-ascend:v0.23.0"
 
