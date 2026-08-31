@@ -81,7 +81,6 @@ import ctypes
 
 C_PTO = 128
 D = 128
-PTO_ONLY = (os.getenv("GDN_BENCH_PTO_ONLY", "0")) == "1"
 
 WARM_UP = int(os.getenv("GDN_BENCH_WARMUP", "5"))
 BENCH_ITERS = int(os.getenv("GDN_BENCH_ITERS", "15"))
