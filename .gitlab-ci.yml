@@ -59,7 +59,7 @@ test_kda_e2e:
     - python3 tests/test_kda_e2e.py
 
 bench_gdn_kernels:
-  image: quay.io/ascend/vllm-ascend:v0.23.0rc1
+  image: quay.io/ascend/vllm-ascend:v0.23.0
   stage: bench
   tags:
     - docker_npu_910B2 # Build and test on-device (aarch64 / 910B2)
@@ -72,14 +72,14 @@ bench_gdn_kernels:
 
 
 bench_gdn_kernels_mega_kernel:
-  image: quay.io/ascend/vllm-ascend:v0.23.0rc1
+  image: quay.io/ascend/vllm-ascend:v0.23.0
   stage: bench
   tags:
     - docker_npu_910B2 # Build and test on-device (aarch64 / 910B2)
   before_script:
     - source /usr/local/Ascend/ascend-toolkit/set_env.sh
   script:
-    - python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --mega
+    - python benchmarks/kernel/bench_gdn_kernels.py --device npu:0 --mega --with-triton-baseline
   when: manual
   allow_failure: true
 
