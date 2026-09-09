@@ -11,6 +11,11 @@ for the full License text.
 
 #include "kernel_utils.h"
 
+// Block size that the doubling phase builds up to; see DoublingBlockSize.
+#ifndef TRI_INV_DOUBLING_BLOCK
+#define TRI_INV_DOUBLING_BLOCK 16
+#endif
+
 using namespace pto;
 using namespace kernel_utils;
 
@@ -62,45 +67,6 @@ AICORE inline BSNDVarlenTileInfo GetBSNDVarlenTileInfoFromCuSeqlens(
     }
     accumulated_chunks += seq_num_chunks;
     seq_start = seq_end;
-  }
-}
-
-/**
- * @brief: Takes as input two matrices of size MatrixSize * MatrixSize each.
- * The src matrix lies in L1, while the dst matrix lies either in L0A or L0B.
- * This kernel copies only the diagonal blocks (fractals) of size FractalSize *
- * FractalSize from the src matrix to the dst matrix.
- *
- * @tparam InputT Input data type (fp16).
- * @tparam FractalSize Size of each fractal matrix (diagonal block).
- * @tparam MatrixSize Size of the entire input/output matrices.
- * @tparam SrcL1TileT The actual tile type of the src matrix.
- * @tparam DstL0TileT The actual tile type of the dst matrix.
- *
- * @param src Tile in L1 memory.
- * @param dst Tile in L0A or L0B memory.
- */
-template <typename InputT, uint32_t FractalSize, uint32_t MatrixSize,
-          typename SrcL1TileT, typename DstL0TileT>
-AICORE inline void CopyDiagonalFractalsL1ToL0(SrcL1TileT src, DstL0TileT dst) {
-  constexpr uint32_t NumFractals = MatrixSize / FractalSize;
-  constexpr bool is_left =
-      std::is_same_v<DstL0TileT, TileLeft<InputT, MatrixSize, MatrixSize>>;
-  constexpr TileType LeftOrRight = is_left ? TileType::Left : TileType::Right;
-  constexpr SLayout InnerLayout =
-      is_left ? SLayout::RowMajor : SLayout::ColMajor;
-  constexpr BLayout OuterLayout = kernel_utils::GetOuterLayout(is_left);
-
-  Tile<LeftOrRight, InputT, FractalSize, FractalSize, OuterLayout, FractalSize,
-       FractalSize, InnerLayout, TileConfig::fractalABSize>
-      fractals[NumFractals];
-  const std::uintptr_t starting_address =
-      reinterpret_cast<std::uintptr_t>(dst.data());
-  for (uint32_t i = 0; i < NumFractals; ++i) {
-    TASSIGN(fractals[i], starting_address + i * FractalSize *
-                                                (MatrixSize + FractalSize) *
-                                                sizeof(InputT));
-    TEXTRACT(fractals[i], src, i * FractalSize, i * FractalSize);
   }
 }
 
@@ -178,6 +144,38 @@ AICORE inline void CopyOddOrEvenBlocksL1ToL0(SrcL1TileT src, DstL0TileT dst,
 }
 
 /**
+ * @brief Copies the diagonal blocks of `block_size` from src to dst.
+ *
+ * Both parities of CopyOddOrEvenBlocksL1ToL0 together are exactly the
+ * diagonal blocks. At block_size == MatrixSize the whole matrix is one
+ * block, and the fractal path would issue (MatrixSize/FractalSize)^2
+ * TEXTRACTs to copy what a single TMOV covers.
+ *
+ * @tparam InputT Data type of the input matrix.
+ * @tparam FractalSize Size of matrix fractals.
+ * @tparam MatrixSize Size of the entire input/output matrices.
+ * @tparam SrcL1TileT The type of the source tile in L1.
+ * @tparam DstL0TileT The type of the destination tile in L0.
+ *
+ * @param src Source tile in L1.
+ * @param dst Destination tile in L0.
+ * @param block_size Size of the diagonal blocks to copy.
+ */
+template <typename InputT, uint32_t FractalSize, uint32_t MatrixSize,
+          typename SrcL1TileT, typename DstL0TileT>
+AICORE inline void CopyDiagonalBlocksL1ToL0(SrcL1TileT src, DstL0TileT dst,
+                                            uint32_t block_size) {
+  if (block_size >= MatrixSize) {
+    TMOV(dst, src);
+    return;
+  }
+  CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(src, dst,
+                                                             block_size, false);
+  CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(src, dst,
+                                                             block_size, true);
+}
+
+/**
  * @brief: Prepares Identity and Zeros matrix.
  *
  * @tparam TileL1AB The type of the input tiles in L1.
@@ -237,6 +235,8 @@ AICORE inline void PrepareAuxiliaryMatrices(
  * @tparam TileL0C The type of the input tiles in L0C.
  * @tparam MatrixSize Size of the entire input/output matrices.
  * @tparam FractalSize Size of matrix fractals.
+ * @tparam DoublingBlockSize Block size that the doubling phase builds up
+ * to before the unrolled recursion takes over.
  * @tparam NumTilesPerCubeIter How many matrices to load and invert in a single
  * cube iteration.
  *
@@ -257,7 +257,8 @@ AICORE inline void PrepareAuxiliaryMatrices(
  */
 template <typename InputT, typename TileL1AB, typename TileL0A,
           typename TileL0B, typename TileL0C, uint32_t MatrixSize,
-          uint32_t FractalSize, uint32_t NumTilesPerCubeIter>
+          uint32_t FractalSize, uint32_t DoublingBlockSize,
+          uint32_t NumTilesPerCubeIter>
 AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
                                     TileL1AB I_neg_l1_tile,
                                     TileL1AB M_neg_l1_tile,
@@ -277,10 +278,10 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
   wait_flag(PIPE_MTE1, PIPE_M, event_1);
   set_flag(PIPE_M, PIPE_MTE1, event_1);
   wait_flag(PIPE_M, PIPE_MTE1, event_1);
-  CopyDiagonalFractalsL1ToL0<InputT, FractalSize, MatrixSize>(
-      Y_l1_tile, a_l0_tile[1]);  // a_l0[1] = diag_fractals(M)
-  CopyDiagonalFractalsL1ToL0<InputT, FractalSize, MatrixSize>(
-      Y_l1_tile, b_l0_tile[1]);  // b_l0[1] = diag_fractals(M)
+  CopyDiagonalBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+      Y_l1_tile, a_l0_tile[1], DoublingBlockSize);  // a_l0[1] = diag_blocks(M)
+  CopyDiagonalBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+      Y_l1_tile, b_l0_tile[1], DoublingBlockSize);  // b_l0[1] = diag_blocks(M)
   set_flag(PIPE_MTE1, PIPE_M, event_1);
 
   /* First Matmul: event_0 */
@@ -343,7 +344,8 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
   set_flag(PIPE_FIX, PIPE_M, event_1);     // only for update Y
   set_flag(PIPE_M, PIPE_MTE1, event_1);    // only for update Y
   set_flag(PIPE_FIX, PIPE_MTE1, event_1);  // only for update Y
-  for (uint32_t block_size = 1; block_size < FractalSize / 2; block_size *= 2) {
+  for (uint32_t block_size = 1; block_size < DoublingBlockSize / 2;
+       block_size *= 2) {
     wait_flag(PIPE_M, PIPE_MTE1, event_0);
     TMOV(b_l0_tile[0], I_l1_tile);
     wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
@@ -356,13 +358,13 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
 
     wait_flag(PIPE_FIX, PIPE_M, event_0);   // from previous iter
     wait_flag(PIPE_MTE1, PIPE_M, event_0);  // from loading a_l0[0], b_l0[0]
-    TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);  // c_l0[0] contains X
-    set_flag(PIPE_M, PIPE_FIX, event_0);
-    wait_flag(PIPE_M, PIPE_FIX, event_0);
-    set_flag(PIPE_FIX, PIPE_M, event_0);
-    wait_flag(PIPE_FIX, PIPE_M, event_0);
+    // c_l0[0] already holds X: the previous level's TMATMUL_ACC left it
+    // there and the TMOV to X_l1 only reads it, so X @ Y accumulates
+    // straight onto it. X also stays in the FP32 accumulator across levels
+    // instead of round-tripping through the FP16 X_l1 copy.
 
-    if (block_size < FractalSize / 4) {  // Update Y except in last iteration
+    if (block_size <
+        DoublingBlockSize / 4) {  // Update Y except in last iteration
       wait_flag(PIPE_M, PIPE_MTE1, event_1);  // from previous iter
       TMOV(a_l0_tile[1], Y_l1_tile);
       wait_flag(PIPE_MTE1, PIPE_M, event_1);
@@ -420,14 +422,14 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
   TMOV(b_l0_tile[1], M_neg_l1_tile);  // b_l0[1] contains M_neg
   TMOV(a_l0_tile[0], I_l1_tile);      // a_l0[0] contains I
 
-  if constexpr (MatrixSize > FractalSize) {
+  if constexpr (MatrixSize > DoublingBlockSize) {
     set_flag(PIPE_FIX, PIPE_M, event_1);
   }
   set_flag(PIPE_M, PIPE_MTE1, event_1);
   set_flag(PIPE_M, PIPE_MTE1, event_0);
   set_flag(PIPE_FIX, PIPE_MTE1, event_1);
   set_flag(PIPE_FIX, PIPE_M, event_0);
-  for (uint32_t block_size = FractalSize; block_size < MatrixSize;
+  for (uint32_t block_size = DoublingBlockSize; block_size < MatrixSize;
        block_size *= 2) {
     wait_flag(PIPE_M, PIPE_MTE1, event_0);  // Wait for last iter a_l0[1]
     TMOV(a_l0_tile[1], Zero_l1_tile);
@@ -531,6 +533,22 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
   /* Initializations */
   constexpr uint32_t TileLen = MatrixSize * MatrixSize;
   constexpr uint32_t FractalSize = 16;  // fractal size for half /bf16
+  // How far the doubling phase builds up before the unrolled recursion takes
+  // over. Independent of FractalSize, which the hardware fixes for the input
+  // type: covering more of the matrix here costs recursion levels below, and
+  // at MatrixSize it removes the recursion entirely.
+  //
+  // It costs dynamic range, so the default matches FractalSize and callers opt
+  // in. Phase 1 forms the powers A^(2^j) inside a block and holds them in
+  // fp16: for a strictly triangular matrix of ones the largest intermediate is
+  // 3.4e3 at a block of 16 but 6.0e36 at 128, and fp16 stops at 65504. In
+  // terms of the input, the largest dense same-sign entry that still fits is
+  // 1.45 at 16, 0.62 at 32, 0.27 at 64 and 0.13 at 128.
+  // megagdn_pto/compile.py sets 128 for the GDN kernels, where A is a decayed,
+  // beta-scaled K K^T measuring 0.243 at its largest and whose powers shrink
+  // rather than grow.
+  constexpr uint32_t DoublingBlockSize =
+      MatrixSize < TRI_INV_DOUBLING_BLOCK ? MatrixSize : TRI_INV_DOUBLING_BLOCK;
   constexpr uint32_t NumFractalsRowWise = MatrixSize / FractalSize;
   constexpr uint32_t NumL0Buffers = 2;
 
@@ -677,7 +695,8 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
       set_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(tile_id));
     }
 
-    constexpr uint32_t final_c_buffer_index = MatrixSize > FractalSize ? 1 : 0;
+    constexpr uint32_t final_c_buffer_index =
+        MatrixSize > DoublingBlockSize ? 1 : 0;
     for (uint32_t tile_id = 0; (tile_id < NumTilesPerCubeIter) &&
                                (global_index + tile_id < total_tiles);
          ++tile_id) {
@@ -687,7 +706,7 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
       wait_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(tile_id));
 
       InvertSingleTile<InputT, TileL1AB, TileL0A, TileL0B, TileL0C, MatrixSize,
-                       FractalSize, NumTilesPerCubeIter>(
+                       FractalSize, DoublingBlockSize, NumTilesPerCubeIter>(
           X_l1_tile, I_l1_tile, I_neg_l1_tile, M_neg_l1_tile, Zero_l1_tile,
           Y_l1_tile[tile_id], a_l0_tile, b_l0_tile, c_l0_tile, tile_id,
           is_lower != 0);
