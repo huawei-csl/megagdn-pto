@@ -234,10 +234,18 @@ def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
         return lib_path
     flags = [
         "-fPIC", "-shared", "-xcce", f"-D{MEMORY_MODEL}", "-O2", "-std=c++17",
+        "-Wno-macro-redefined",
         f"-I{_KERNEL_INCLUDE}",
         f"-I{os.path.join(PTO_LIB_PATH, 'include')}",
         f"--npu-arch={AICORE_ARCH}",
         f"-DTRI_INV_DOUBLING_BLOCK={TRI_INV_DOUBLING_BLOCK}",
     ]
+    # _common_flags() (used by the chunk/mega kernels that also compile
+    # tri_inverse_impl.cpp) appends PTO_DYNAMIC_EXTRA_FLAGS after its own
+    # -DTRI_INV_DOUBLING_BLOCK; this path skipped that, so overriding the
+    # macro here -- e.g. for a caller whose input needs a different dynamic
+    # range than GDN's -- silently left the standalone stage on the default
+    # while the fused kernels picked up the override.
+    flags.extend(os.environ.get("PTO_DYNAMIC_EXTRA_FLAGS", "").split())
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=180)
     return lib_path
