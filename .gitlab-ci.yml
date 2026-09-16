@@ -84,7 +84,7 @@ bench_gdn_kernels_mega_kernel:
   allow_failure: true
 
 
-bench_sglang_mmlu_qwen35_0_8b:
+bench_sglang_mmlu_qwen35:
   image: quay.io/ascend/sglang:v0.5.18-cann9.0.0-910b
   stage: bench
   tags:
@@ -93,6 +93,7 @@ bench_sglang_mmlu_qwen35_0_8b:
     GDN_USE_MEGA_GDN: "1" # Set to 0 to run the triton kernels instead
     SGLANG_PORT: "30000"
     SGLANG_MODEL: Qwen/Qwen3.5-0.8B
+    NUM_NPUS: 1
     SGLANG_BENCH_VERSION: v0.5.18
   before_script:
     - source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -101,12 +102,12 @@ bench_sglang_mmlu_qwen35_0_8b:
   script:
     # Launch the server in the background and keep its logs as an artifact
     - mkdir -p outputs/logs/
-    - python -m sglang.launch_server --model-path "$SGLANG_MODEL" --port "$SGLANG_PORT"
+    - python -m sglang.launch_server --model-path "$SGLANG_MODEL" --port "$SGLANG_PORT" --attention-backend ascend --disable-cuda-graph --disable-radix-cache --tp-size "$NUM_NPUS" --mem-fraction-static 0.8
       > outputs/logs/sglang_server.log 2>&1 &
     - echo $! > sglang_server.pid
     # Wait for the server to be up (fail fast if it dies or never becomes healthy)
     - |
-      for i in $(seq 1 120); do
+      for i in $(seq 1 240); do
         if ! kill -0 "$(cat sglang_server.pid)" 2>/dev/null; then
           echo "sglang server exited before becoming healthy"
           tail -n 100 outputs/logs/sglang_server.log
