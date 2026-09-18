@@ -542,8 +542,7 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
   // block. The cross-block matrix is nilpotent in MatrixSize / block steps, so
   // the second doubling phase is bounded independently of the input norm.
   constexpr uint32_t DiagonalBlockSize =
-      MatrixSize < TRI_INV_DIAGONAL_BLOCK ? MatrixSize
-                                          : TRI_INV_DIAGONAL_BLOCK;
+      MatrixSize < TRI_INV_DIAGONAL_BLOCK ? MatrixSize : TRI_INV_DIAGONAL_BLOCK;
   static_assert(DiagonalBlockSize >= FractalSize);
   static_assert((DiagonalBlockSize & (DiagonalBlockSize - 1)) == 0);
   static_assert(MatrixSize % DiagonalBlockSize == 0);
