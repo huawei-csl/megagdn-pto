@@ -102,23 +102,11 @@ except (RuntimeError, AssertionError):
 # Compilation helpers
 # ---------------------------------------------------------------------------
 
-# The triangular-inverse kernel's doubling block. Its default is 16, matching
-# the fp16 fractal size. At 128 the doubling covers a whole chunk and the
-# unrolled recursion drops out entirely, taking solve_tril from 516.9 to
-# 422.6 us.
-#
-# It costs dynamic range, because phase 1 holds the powers A^(2^j) of each
-# block in fp16, and that is why the kernel does not default to it: a strictly
-# triangular matrix of ones reaches 6.0e36 at a block of 128 against fp16's
-# 65504. GDN's A is not that shape -- a decayed, beta-scaled K K^T whose
-# largest entry measures 0.243, and whose powers shrink rather than grow, so
-# the largest intermediate stays 0.243 at every block size.
-#
-# Accuracy on real A improves as well, 3.6e-06 at 16 to 2.3e-07 at 128, since
-# fewer levels mean fewer fp16 round trips between them. That is the opposite
-# of what a badly scaled input does, so the margin is worth re-checking if the
-# beta scaling or the gate distribution ever changes materially.
-TRI_INV_DOUBLING_BLOCK = 128
+# The triangular inverse writes A = D + N. Doubling is confined to D's small
+# diagonal blocks; the remaining Xd N is nilpotent in chunk/block steps. Keep
+# this at the fp16 fractal size so the intermediate range does not depend on a
+# model-specific bound for ||A||.
+TRI_INV_DIAGONAL_BLOCK = 16
 
 
 def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
@@ -139,7 +127,7 @@ def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
         f"-I{ASCEND_TOOLKIT_HOME}/pkg_inc/profiling",
         f"-DGDN_D={hidden_size}",
         f"-DGDN_C={chunk_size}",
-        f"-DTRI_INV_DOUBLING_BLOCK={TRI_INV_DOUBLING_BLOCK}",
+        f"-DTRI_INV_DIAGONAL_BLOCK={TRI_INV_DIAGONAL_BLOCK}",
     ]
     if os.path.isdir(_DRIVER_INC):
         flags.append(f"-I{_DRIVER_INC}")
@@ -238,14 +226,10 @@ def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
         f"-I{_KERNEL_INCLUDE}",
         f"-I{os.path.join(PTO_LIB_PATH, 'include')}",
         f"--npu-arch={AICORE_ARCH}",
-        f"-DTRI_INV_DOUBLING_BLOCK={TRI_INV_DOUBLING_BLOCK}",
+        f"-DTRI_INV_DIAGONAL_BLOCK={TRI_INV_DIAGONAL_BLOCK}",
     ]
-    # _common_flags() (used by the chunk/mega kernels that also compile
-    # tri_inverse_impl.cpp) appends PTO_DYNAMIC_EXTRA_FLAGS after its own
-    # -DTRI_INV_DOUBLING_BLOCK; this path skipped that, so overriding the
-    # macro here -- e.g. for a caller whose input needs a different dynamic
-    # range than GDN's -- silently left the standalone stage on the default
-    # while the fused kernels picked up the override.
+    # Keep standalone and fused compilation consistent when a developer
+    # overrides the diagonal block for an experiment.
     flags.extend(os.environ.get("PTO_DYNAMIC_EXTRA_FLAGS", "").split())
     _run_bisheng(["bisheng", *flags, cpp_path, "-o", lib_path], timeout=180)
     return lib_path

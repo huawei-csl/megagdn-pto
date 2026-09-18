@@ -11,9 +11,9 @@ for the full License text.
 
 #include "kernel_utils.h"
 
-// Block size that the doubling phase builds up to; see DoublingBlockSize.
-#ifndef TRI_INV_DOUBLING_BLOCK
-#define TRI_INV_DOUBLING_BLOCK 16
+// Diagonal block size for the D+N split; see DiagonalBlockSize.
+#ifndef TRI_INV_DIAGONAL_BLOCK
+#define TRI_INV_DIAGONAL_BLOCK 16
 #endif
 
 using namespace pto;
@@ -89,10 +89,7 @@ AICORE inline BSNDVarlenTileInfo GetBSNDVarlenTileInfoFromCuSeqlens(
  * @param src Tile in L1 memory.
  * @param dst Tile in L0A or L0B memory.
  * @param block_size Size of diagonal blocks. Needs: block_size >= FractalSize.
- * @param swap_parity If true, then the parity of copied blocks is swapped: left
- * tile gets odd blocks, while right tile gets even blocks. This is used in the
- * unrolled recursion part of the algorithm, where we need to copy alternating
- * blocks of X in each iteration.
+ * @param swap_parity If true, swap which parity of diagonal blocks is copied.
  */
 template <typename InputT, uint32_t FractalSize, uint32_t MatrixSize,
           typename SrcL1TileT, typename DstL0TileT>
@@ -224,9 +221,10 @@ AICORE inline void PrepareAuxiliaryMatrices(
 
 /**
  * @brief: Inverts a single matrix / tile of the global tensor.
- * The first part of the algorithm inverts the FractalSize * FractalSize
- * diagonal blocks of the input matrix (inv_trick part). The second phase
- * assembles the partial inverses using the cube unig (recursive part).
+ * Writes M = D + N, where D is block diagonal and N is strictly block
+ * triangular. The first phase obtains Xd = (I + D)^-1 by doubling inside D's
+ * small diagonal blocks. The second phase obtains (I + Xd N)^-1 by doubling
+ * in block steps, then multiplies it by Xd.
  *
  * @tparam InputT The type of the input elements.
  * @tparam TileL1AB The type of the input tiles in L1.
@@ -235,8 +233,7 @@ AICORE inline void PrepareAuxiliaryMatrices(
  * @tparam TileL0C The type of the input tiles in L0C.
  * @tparam MatrixSize Size of the entire input/output matrices.
  * @tparam FractalSize Size of matrix fractals.
- * @tparam DoublingBlockSize Block size that the doubling phase builds up
- * to before the unrolled recursion takes over.
+ * @tparam DiagonalBlockSize Side length of D's diagonal blocks.
  * @tparam NumTilesPerCubeIter How many matrices to load and invert in a single
  * cube iteration.
  *
@@ -250,22 +247,18 @@ AICORE inline void PrepareAuxiliaryMatrices(
  * @param b_l0_tile* Array of two tiles in L0B (for double-buffering).
  * @param c_l0_tile* Tile in L0C for matmuls.
  * @param tile_id Index of the current tile (used for sync).
- * @param swap_parity If true, then the parity of copied blocks is swapped: left
- * tile gets odd blocks, while right tile gets even blocks. This is used in the
- * unrolled recursion part of the algorithm, where we need to copy alternating
- * blocks of X in each iteration.
  */
 template <typename InputT, typename TileL1AB, typename TileL0A,
           typename TileL0B, typename TileL0C, uint32_t MatrixSize,
-          uint32_t FractalSize, uint32_t DoublingBlockSize,
+          uint32_t FractalSize, uint32_t DiagonalBlockSize,
           uint32_t NumTilesPerCubeIter>
 AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
                                     TileL1AB I_neg_l1_tile,
                                     TileL1AB M_neg_l1_tile,
                                     TileL1AB Zero_l1_tile, TileL1AB Y_l1_tile,
                                     TileL0A* a_l0_tile, TileL0B* b_l0_tile,
-                                    TileL0C* c_l0_tile, const uint32_t tile_id,
-                                    const bool swap_parity = false) {
+                                    TileL0C* c_l0_tile,
+                                    const uint32_t tile_id) {
   const event_t event_0 = static_cast<event_t>(tile_id);
   const event_t event_1 = static_cast<event_t>(tile_id + NumTilesPerCubeIter);
 
@@ -279,9 +272,9 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
   set_flag(PIPE_M, PIPE_MTE1, event_1);
   wait_flag(PIPE_M, PIPE_MTE1, event_1);
   CopyDiagonalBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
-      Y_l1_tile, a_l0_tile[1], DoublingBlockSize);  // a_l0[1] = diag_blocks(M)
+      Y_l1_tile, a_l0_tile[1], DiagonalBlockSize);  // a_l0[1] = diag_blocks(M)
   CopyDiagonalBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
-      Y_l1_tile, b_l0_tile[1], DoublingBlockSize);  // b_l0[1] = diag_blocks(M)
+      Y_l1_tile, b_l0_tile[1], DiagonalBlockSize);  // b_l0[1] = diag_blocks(M)
   set_flag(PIPE_MTE1, PIPE_M, event_1);
 
   /* First Matmul: event_0 */
@@ -330,12 +323,12 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
 
   /*
    * Inv Trick part:
-   * X = I - M
-   * Y = M
+   * X = I - D
+   * Y = D^2
    * block_size = 1
-   * while block_size < FractalSize / 2:
-   *     Y = Y @ Y
+   * while block_size < DiagonalBlockSize / 2:
    *     X = X + X @ Y
+   *     Y = Y @ Y
    *     block_size *= 2
    */
   set_flag(PIPE_FIX, PIPE_M, event_0);   // store c
@@ -344,7 +337,7 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
   set_flag(PIPE_FIX, PIPE_M, event_1);     // only for update Y
   set_flag(PIPE_M, PIPE_MTE1, event_1);    // only for update Y
   set_flag(PIPE_FIX, PIPE_MTE1, event_1);  // only for update Y
-  for (uint32_t block_size = 1; block_size < DoublingBlockSize / 2;
+  for (uint32_t block_size = 1; block_size < DiagonalBlockSize / 2;
        block_size *= 2) {
     wait_flag(PIPE_M, PIPE_MTE1, event_0);
     TMOV(b_l0_tile[0], I_l1_tile);
@@ -364,7 +357,7 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
     // instead of round-tripping through the FP16 X_l1 copy.
 
     if (block_size <
-        DoublingBlockSize / 4) {  // Update Y except in last iteration
+        DiagonalBlockSize / 4) {  // Update Y except in last iteration
       wait_flag(PIPE_M, PIPE_MTE1, event_1);  // from previous iter
       TMOV(a_l0_tile[1], Y_l1_tile);
       wait_flag(PIPE_MTE1, PIPE_M, event_1);
@@ -401,98 +394,110 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
   wait_flag(PIPE_M, PIPE_MTE1, event_0);
   wait_flag(PIPE_FIX, PIPE_M, event_0);
 
-  /*
-   * Unrolled recursion part:
-   * block_size = FractalSize
-   * while block_size < MatrixSize:
-   *     LX = even_blocks(X, block_size)
-   *     RX = odd_blocks(X, block_size)
-   *     Y = LX @ (-M) + I
-   *     X = Y @ RX + LX
-   *     block_size *= 2
-   *
-   * Comments:
-   * Upper-tri (swap_parity=false):
-   *   LX = even_blocks(X), RX = odd_blocks(X)
-   *   Y = LX @ (-M) + I, X = Y @ RX + LX
-   * Lower-tri (swap_parity=true):
-   *   RX = even→L0A(odd via swap), LX = odd→L0B(even via swap)
-   *   Y = RX @ (-M) + I, X = Y @ LX + RX
-   */
-  TMOV(b_l0_tile[1], M_neg_l1_tile);  // b_l0[1] contains M_neg
-  TMOV(a_l0_tile[0], I_l1_tile);      // a_l0[0] contains I
+  if constexpr (MatrixSize > DiagonalBlockSize) {
+    constexpr uint32_t NumDiagonalBlocks = MatrixSize / DiagonalBlockSize;
 
-  if constexpr (MatrixSize > DoublingBlockSize) {
-    set_flag(PIPE_FIX, PIPE_M, event_1);
-  }
-  set_flag(PIPE_M, PIPE_MTE1, event_1);
-  set_flag(PIPE_M, PIPE_MTE1, event_0);
-  set_flag(PIPE_FIX, PIPE_MTE1, event_1);
-  set_flag(PIPE_FIX, PIPE_M, event_0);
-  for (uint32_t block_size = DoublingBlockSize; block_size < MatrixSize;
-       block_size *= 2) {
-    wait_flag(PIPE_M, PIPE_MTE1, event_0);  // Wait for last iter a_l0[1]
-    TMOV(a_l0_tile[1], Zero_l1_tile);
-
-    wait_flag(PIPE_M, PIPE_MTE1, event_1);
-    TMOV(b_l0_tile[0], I_l1_tile);
+    // b_l0[0] = -N: start from -M and zero D's diagonal blocks.
+    TMOV(a_l0_tile[0], X_l1_tile);      // rounded Xd
+    TMOV(b_l0_tile[0], M_neg_l1_tile);  // -M
+    CopyDiagonalBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+        Zero_l1_tile, b_l0_tile[0], DiagonalBlockSize);
     set_flag(PIPE_MTE1, PIPE_M, event_0);
-
-    wait_flag(PIPE_FIX, PIPE_MTE1, event_1);  // Wait to write last X
-    CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
-        X_l1_tile, a_l0_tile[1], block_size,
-        swap_parity);  // a_l0[1]: even(LX) or odd(RX)
-    set_flag(PIPE_MTE1, PIPE_M, event_1);
-
     wait_flag(PIPE_MTE1, PIPE_M, event_0);
-    wait_flag(PIPE_FIX, PIPE_M, event_0);  // Wait c_l0[0] from previous iter
-    TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);  // c_l0[0] has I
-
-    wait_flag(PIPE_MTE1, PIPE_M, event_1);
-    wait_flag(PIPE_FIX, PIPE_M, event_1);  // Wait c_l0[1] from previous iter
-    TMATMUL(c_l0_tile[1], a_l0_tile[1], b_l0_tile[0]);  // c_l0[1] contains LX
-    set_flag(PIPE_M, PIPE_MTE1, event_1);  // allow to load RX on b_l0[0]
-
-    TMATMUL_ACC(c_l0_tile[0], c_l0_tile[0], a_l0_tile[1],
-                b_l0_tile[1]);  // c_l0[0] <- LX * M_neg + I
+    TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);  // -Xd N
     set_flag(PIPE_M, PIPE_FIX, event_0);
     set_flag(PIPE_M, PIPE_MTE1, event_0);
-
     wait_flag(PIPE_M, PIPE_FIX, event_0);
-    TMOV(Y_l1_tile, c_l0_tile[0]);  // Y_l1 contains LX * M_neg + I
+    wait_flag(PIPE_M, PIPE_MTE1, event_0);
+    TMOV(M_neg_l1_tile, c_l0_tile[0]);  // rounded -Xd N
     set_flag(PIPE_FIX, PIPE_MTE1, event_0);
     set_flag(PIPE_FIX, PIPE_M, event_0);
+    wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
+    wait_flag(PIPE_FIX, PIPE_M, event_0);
 
-    /* Load complementary blocks of X in L0B. If swap_parity = fase, "Load Odd
-     * Blocks Of X In L0B" */
-    wait_flag(PIPE_M, PIPE_MTE1, event_1);
-    TMOV(b_l0_tile[0], Zero_l1_tile);
-    CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
-        X_l1_tile, b_l0_tile[0], block_size,
-        swap_parity);  // b_l0[0]: odd(RX) or even(LX)
-
-    wait_flag(PIPE_M, PIPE_MTE1, event_0);  // Wait for previous use of a_l0[1]
-    wait_flag(PIPE_FIX, PIPE_MTE1, event_0);  // Wait for Y_l1
-    TMOV(a_l0_tile[1], Y_l1_tile);            // a_l0[1] contains LX * M_neg + I
+    // X = I - Xd N. The negative is already in the accumulator, so the
+    // identity needs only one accumulated matmul.
+    TMOV(a_l0_tile[0], I_neg_l1_tile);
+    TMOV(b_l0_tile[0], I_neg_l1_tile);
     set_flag(PIPE_MTE1, PIPE_M, event_0);
-
     wait_flag(PIPE_MTE1, PIPE_M, event_0);
-    TMATMUL_ACC(c_l0_tile[1], c_l0_tile[1], a_l0_tile[1], b_l0_tile[0]);
-    set_flag(PIPE_M, PIPE_MTE1, event_0);  // next iter can read on a_l0[1]
-    set_flag(PIPE_M, PIPE_MTE1, event_1);  // next iter can read on b_l0[0]
+    TMATMUL_ACC(c_l0_tile[0], c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);
     set_flag(PIPE_M, PIPE_FIX, event_0);
+    set_flag(PIPE_M, PIPE_MTE1, event_0);
     wait_flag(PIPE_M, PIPE_FIX, event_0);
+    wait_flag(PIPE_M, PIPE_MTE1, event_0);
+    TMOV(Y_l1_tile, c_l0_tile[0]);
+    set_flag(PIPE_FIX, PIPE_MTE1, event_0);
+    set_flag(PIPE_FIX, PIPE_M, event_0);
+    wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
+    wait_flag(PIPE_FIX, PIPE_M, event_0);
 
-    if (block_size < MatrixSize / 2) {  // Update X_l1 except in last iteration
-      TMOV(X_l1_tile, c_l0_tile[1]);
-      set_flag(PIPE_FIX, PIPE_M, event_1);  // release c_l0[1] for next iter
+    if constexpr (NumDiagonalBlocks > 2) {
+      // Y = (Xd N)^2. Squaring -Xd N removes its sign.
+      TMOV(a_l0_tile[1], M_neg_l1_tile);
+      TMOV(b_l0_tile[1], M_neg_l1_tile);
+      set_flag(PIPE_MTE1, PIPE_M, event_1);
+      wait_flag(PIPE_MTE1, PIPE_M, event_1);
+      TMATMUL(c_l0_tile[1], a_l0_tile[1], b_l0_tile[1]);
+      set_flag(PIPE_M, PIPE_FIX, event_1);
+      set_flag(PIPE_M, PIPE_MTE1, event_1);
+      wait_flag(PIPE_M, PIPE_FIX, event_1);
+      wait_flag(PIPE_M, PIPE_MTE1, event_1);
+      TMOV(M_neg_l1_tile, c_l0_tile[1]);
+      set_flag(PIPE_FIX, PIPE_MTE1, event_1);
+      set_flag(PIPE_FIX, PIPE_M, event_1);
+      wait_flag(PIPE_FIX, PIPE_MTE1, event_1);
+      wait_flag(PIPE_FIX, PIPE_M, event_1);
+
+      // X = (I - Xd N)(I + (Xd N)^2)(I + (Xd N)^4)... . Xd N
+      // is strictly block triangular, so its NumDiagonalBlocks-th power is 0.
+      for (uint32_t block_step = 1; block_step < NumDiagonalBlocks / 2;
+           block_step *= 2) {
+        TMOV(a_l0_tile[0], Y_l1_tile);
+        TMOV(b_l0_tile[0], M_neg_l1_tile);
+        set_flag(PIPE_MTE1, PIPE_M, event_0);
+        wait_flag(PIPE_MTE1, PIPE_M, event_0);
+        TMATMUL_ACC(c_l0_tile[0], c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);
+        set_flag(PIPE_M, PIPE_FIX, event_0);
+        set_flag(PIPE_M, PIPE_MTE1, event_0);
+        wait_flag(PIPE_M, PIPE_FIX, event_0);
+        wait_flag(PIPE_M, PIPE_MTE1, event_0);
+        TMOV(Y_l1_tile, c_l0_tile[0]);
+        set_flag(PIPE_FIX, PIPE_MTE1, event_0);
+        set_flag(PIPE_FIX, PIPE_M, event_0);
+        wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
+        wait_flag(PIPE_FIX, PIPE_M, event_0);
+
+        if (block_step < NumDiagonalBlocks / 4) {
+          TMOV(a_l0_tile[1], M_neg_l1_tile);
+          TMOV(b_l0_tile[1], M_neg_l1_tile);
+          set_flag(PIPE_MTE1, PIPE_M, event_1);
+          wait_flag(PIPE_MTE1, PIPE_M, event_1);
+          TMATMUL(c_l0_tile[1], a_l0_tile[1], b_l0_tile[1]);
+          set_flag(PIPE_M, PIPE_FIX, event_1);
+          set_flag(PIPE_M, PIPE_MTE1, event_1);
+          wait_flag(PIPE_M, PIPE_FIX, event_1);
+          wait_flag(PIPE_M, PIPE_MTE1, event_1);
+          TMOV(M_neg_l1_tile, c_l0_tile[1]);
+          set_flag(PIPE_FIX, PIPE_MTE1, event_1);
+          set_flag(PIPE_FIX, PIPE_M, event_1);
+          wait_flag(PIPE_FIX, PIPE_MTE1, event_1);
+          wait_flag(PIPE_FIX, PIPE_M, event_1);
+        }
+      }
     }
-    set_flag(PIPE_FIX, PIPE_MTE1, event_1);
+
+    // (I + M)^-1 Xd, M = Xd N.
+    TMOV(a_l0_tile[0], Y_l1_tile);
+    TMOV(b_l0_tile[0], X_l1_tile);
+    set_flag(PIPE_MTE1, PIPE_M, event_0);
+    wait_flag(PIPE_MTE1, PIPE_M, event_0);
+    TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);
+    set_flag(PIPE_M, PIPE_FIX, event_0);
+    set_flag(PIPE_M, PIPE_MTE1, event_0);
+    wait_flag(PIPE_M, PIPE_FIX, event_0);
+    wait_flag(PIPE_M, PIPE_MTE1, event_0);
   }
-  wait_flag(PIPE_M, PIPE_MTE1, event_0);
-  wait_flag(PIPE_M, PIPE_MTE1, event_1);
-  wait_flag(PIPE_FIX, PIPE_M, event_0);
-  wait_flag(PIPE_FIX, PIPE_MTE1, event_1);  // Write c_l0[1] to X_l1
 }
 
 /**
@@ -533,22 +538,15 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
   /* Initializations */
   constexpr uint32_t TileLen = MatrixSize * MatrixSize;
   constexpr uint32_t FractalSize = 16;  // fractal size for half /bf16
-  // How far the doubling phase builds up before the unrolled recursion takes
-  // over. Independent of FractalSize, which the hardware fixes for the input
-  // type: covering more of the matrix here costs recursion levels below, and
-  // at MatrixSize it removes the recursion entirely.
-  //
-  // It costs dynamic range, so the default matches FractalSize and callers opt
-  // in. Phase 1 forms the powers A^(2^j) inside a block and holds them in
-  // fp16: for a strictly triangular matrix of ones the largest intermediate is
-  // 3.4e3 at a block of 16 but 6.0e36 at 128, and fp16 stops at 65504. In
-  // terms of the input, the largest dense same-sign entry that still fits is
-  // 1.45 at 16, 0.62 at 32, 0.27 at 64 and 0.13 at 128.
-  // megagdn_pto/compile.py sets 128 for the GDN kernels, where A is a decayed,
-  // beta-scaled K K^T measuring 0.243 at its largest and whose powers shrink
-  // rather than grow.
-  constexpr uint32_t DoublingBlockSize =
-      MatrixSize < TRI_INV_DOUBLING_BLOCK ? MatrixSize : TRI_INV_DOUBLING_BLOCK;
+  // The fp16 doubling operands only contain powers within a small diagonal
+  // block. The cross-block matrix is nilpotent in MatrixSize / block steps, so
+  // the second doubling phase is bounded independently of the input norm.
+  constexpr uint32_t DiagonalBlockSize =
+      MatrixSize < TRI_INV_DIAGONAL_BLOCK ? MatrixSize
+                                          : TRI_INV_DIAGONAL_BLOCK;
+  static_assert(DiagonalBlockSize >= FractalSize);
+  static_assert((DiagonalBlockSize & (DiagonalBlockSize - 1)) == 0);
+  static_assert(MatrixSize % DiagonalBlockSize == 0);
   constexpr uint32_t NumFractalsRowWise = MatrixSize / FractalSize;
   constexpr uint32_t NumL0Buffers = 2;
 
@@ -695,8 +693,7 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
       set_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(tile_id));
     }
 
-    constexpr uint32_t final_c_buffer_index =
-        MatrixSize > DoublingBlockSize ? 1 : 0;
+    constexpr uint32_t final_c_buffer_index = 0;
     for (uint32_t tile_id = 0; (tile_id < NumTilesPerCubeIter) &&
                                (global_index + tile_id < total_tiles);
          ++tile_id) {
@@ -706,10 +703,9 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
       wait_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(tile_id));
 
       InvertSingleTile<InputT, TileL1AB, TileL0A, TileL0B, TileL0C, MatrixSize,
-                       FractalSize, DoublingBlockSize, NumTilesPerCubeIter>(
+                       FractalSize, DiagonalBlockSize, NumTilesPerCubeIter>(
           X_l1_tile, I_l1_tile, I_neg_l1_tile, M_neg_l1_tile, Zero_l1_tile,
-          Y_l1_tile[tile_id], a_l0_tile, b_l0_tile, c_l0_tile, tile_id,
-          is_lower != 0);
+          Y_l1_tile[tile_id], a_l0_tile, b_l0_tile, c_l0_tile, tile_id);
 
       // Allow next cube_iter to proceed for this tile_id
       set_flag(PIPE_M, PIPE_MTE2, static_cast<event_t>(tile_id));
