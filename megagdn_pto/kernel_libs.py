@@ -23,6 +23,7 @@ import torch
 
 from megagdn_pto.compile import (
     BLOCK_DIM,
+    CHUNK_O_SLOTS,
     _KERNELS_PTO,
     compile_chunk_kernel,
 )
@@ -454,9 +455,10 @@ def run_chunk_o(
     batch = q.shape[0] if batch_size_override is None else batch_size_override
     cu32 = _ensure_int32(cu_seqlens)
     T = g_sum.shape[1]
-    ws_qk = torch.zeros(bd, chunk_size, chunk_size, device=q.device, dtype=torch.float16)
-    ws_qs = torch.zeros(bd, chunk_size, D, device=q.device, dtype=torch.float16)
-    ws_gated = torch.zeros(bd, chunk_size, chunk_size, device=q.device, dtype=torch.float16)
+    slots = bd * CHUNK_O_SLOTS
+    ws_qk = torch.zeros(slots, chunk_size, chunk_size, device=q.device, dtype=torch.float16)
+    ws_qs = torch.zeros(2 * slots, chunk_size, D, device=q.device, dtype=torch.float16)
+    ws_gated = torch.zeros(slots, chunk_size, chunk_size, device=q.device, dtype=torch.float16)
     lib = load_chunk_o(D, chunk_size)
     stream = torch.npu.current_stream()._as_parameter_
     lib.call_kernel(

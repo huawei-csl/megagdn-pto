@@ -120,6 +120,12 @@ except (RuntimeError, AssertionError):
 # beta scaling or the gate distribution ever changes materially.
 TRI_INV_DOUBLING_BLOCK = 128
 
+# chunk_o's Cube/Vec pipeline depth: how many work items the Cube runs ahead
+# of the Vec. Mirrors GDN_O_PRE_LAUNCH in kernels/pto/chunk_o.cpp, and decides
+# how many mailbox slots the host allocates. 0 is the lock-step form.
+CHUNK_O_PRE_LAUNCH = 1
+CHUNK_O_SLOTS = 2 * CHUNK_O_PRE_LAUNCH + 2
+
 
 def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
     """Return bisheng flags shared by all chunk-GDN kernels."""
@@ -140,6 +146,7 @@ def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
         f"-DGDN_D={hidden_size}",
         f"-DGDN_C={chunk_size}",
         f"-DTRI_INV_DOUBLING_BLOCK={TRI_INV_DOUBLING_BLOCK}",
+        f"-DGDN_O_PRE_LAUNCH={CHUNK_O_PRE_LAUNCH}",
     ]
     if os.path.isdir(_DRIVER_INC):
         flags.append(f"-I{_DRIVER_INC}")
