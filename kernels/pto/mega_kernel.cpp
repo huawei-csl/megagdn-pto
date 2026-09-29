@@ -463,19 +463,8 @@ AICORE inline void mega_kernel_impl(
       reinterpret_cast<__gm__ int32_t*>(cu_seqlens_ptr), batch_size, seq_len,
       total_tokens, static_cast<uint32_t>(H), num_key_heads, ffts_addr);
 
-// Drain the chunk_o handshake: Vec's final "workspace free" (flag 3) is never
-// consumed by Cube's loop, so consume it here.
-#if defined(__DAV_CUBE__)
-  if (get_block_idx() < num_matrices) {
-    pipe_barrier(PIPE_ALL);
-#if __CCE_AICORE__ == 220
-    wait_flag_dev(3);
-#else
-    WaitBothVecOnA5<PIPE_MTE2>(3);
-    pipe_barrier(PIPE_ALL);
-#endif
-  }
-#endif
+  // chunk_o's handshake is self-balancing: every flag it sets is waited for
+  // inside its own loop, so there is nothing left to drain here.
 }
 
 extern "C" __global__ AICORE void launch_mega_kernel(
