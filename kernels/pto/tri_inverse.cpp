@@ -223,8 +223,9 @@ AICORE inline void PrepareAuxiliaryMatrices(
  * @brief: Inverts a single matrix / tile of the global tensor.
  * Writes M = D + N, where D is block diagonal and N is strictly block
  * triangular. The first phase obtains Xd = (I + D)^-1 by doubling inside D's
- * small diagonal blocks. The second phase obtains (I + Xd N)^-1 by doubling
- * in block steps, then multiplies it by Xd.
+ * small diagonal blocks. The second phase applies (I + Xd N)^-1 to Xd by
+ * doubling in block steps, starting from (I - Xd N) Xd so that Xd needs no
+ * multiply of its own.
  *
  * @tparam InputT The type of the input elements.
  * @tparam TileL1AB The type of the input tiles in L1.
@@ -415,88 +416,89 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
     wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
     wait_flag(PIPE_FIX, PIPE_M, event_0);
 
-    // X = I - Xd N. The negative is already in the accumulator, so the
-    // identity needs only one accumulated matmul.
-    TMOV(a_l0_tile[0], I_neg_l1_tile);
-    TMOV(b_l0_tile[0], I_neg_l1_tile);
+    // W = (I - Xd N) Xd on event_0, and the first squaring (Xd N)^2 on
+    // event_1. Both read -Xd N and neither reads the other's result, so the
+    // second matmul's operand loads and the first one's store overlap with
+    // the cube.
+    TMOV(a_l0_tile[0], M_neg_l1_tile);
+    CopyDiagonalBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+        I_l1_tile, a_l0_tile[0], DiagonalBlockSize);  // I - Xd N, no matmul
+    TMOV(b_l0_tile[0], X_l1_tile);
     set_flag(PIPE_MTE1, PIPE_M, event_0);
-    wait_flag(PIPE_MTE1, PIPE_M, event_0);
-    TMATMUL_ACC(c_l0_tile[0], c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);
-    set_flag(PIPE_M, PIPE_FIX, event_0);
-    set_flag(PIPE_M, PIPE_MTE1, event_0);
-    wait_flag(PIPE_M, PIPE_FIX, event_0);
-    wait_flag(PIPE_M, PIPE_MTE1, event_0);
-    TMOV(Y_l1_tile, c_l0_tile[0]);
-    set_flag(PIPE_FIX, PIPE_MTE1, event_0);
-    set_flag(PIPE_FIX, PIPE_M, event_0);
-    wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
-    wait_flag(PIPE_FIX, PIPE_M, event_0);
-
     if constexpr (NumDiagonalBlocks > 2) {
-      // Y = (Xd N)^2. Squaring -Xd N removes its sign.
       TMOV(a_l0_tile[1], M_neg_l1_tile);
       TMOV(b_l0_tile[1], M_neg_l1_tile);
       set_flag(PIPE_MTE1, PIPE_M, event_1);
+    }
+    wait_flag(PIPE_MTE1, PIPE_M, event_0);
+    TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);  // W
+    set_flag(PIPE_M, PIPE_FIX, event_0);
+    set_flag(PIPE_M, PIPE_MTE1, event_0);
+    if constexpr (NumDiagonalBlocks > 2) {
       wait_flag(PIPE_MTE1, PIPE_M, event_1);
-      TMATMUL(c_l0_tile[1], a_l0_tile[1], b_l0_tile[1]);
+      TMATMUL(c_l0_tile[1], a_l0_tile[1], b_l0_tile[1]);  // (Xd N)^2
       set_flag(PIPE_M, PIPE_FIX, event_1);
       set_flag(PIPE_M, PIPE_MTE1, event_1);
+    }
+    wait_flag(PIPE_M, PIPE_FIX, event_0);
+    wait_flag(PIPE_M, PIPE_MTE1, event_0);
+
+    if constexpr (NumDiagonalBlocks > 2) {
+      TMOV(Y_l1_tile, c_l0_tile[0]);  // rounded W
+      set_flag(PIPE_FIX, PIPE_MTE1, event_0);
+      set_flag(PIPE_FIX, PIPE_M, event_0);
       wait_flag(PIPE_M, PIPE_FIX, event_1);
       wait_flag(PIPE_M, PIPE_MTE1, event_1);
-      TMOV(M_neg_l1_tile, c_l0_tile[1]);
+      TMOV(M_neg_l1_tile, c_l0_tile[1]);  // rounded (Xd N)^2
       set_flag(PIPE_FIX, PIPE_MTE1, event_1);
       set_flag(PIPE_FIX, PIPE_M, event_1);
+      wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
+      wait_flag(PIPE_FIX, PIPE_M, event_0);
       wait_flag(PIPE_FIX, PIPE_MTE1, event_1);
       wait_flag(PIPE_FIX, PIPE_M, event_1);
 
-      // X = (I - Xd N)(I + (Xd N)^2)(I + (Xd N)^4)... . Xd N
-      // is strictly block triangular, so its NumDiagonalBlocks-th power is 0.
-      for (uint32_t block_step = 1; block_step < NumDiagonalBlocks / 2;
-           block_step *= 2) {
-        TMOV(a_l0_tile[0], Y_l1_tile);
-        TMOV(b_l0_tile[0], M_neg_l1_tile);
+      // (I + A)^-1 = ... (I + (Xd N)^4)(I + (Xd N)^2) W. Xd N is strictly
+      // block triangular, so its NumDiagonalBlocks-th power is zero. The
+      // factors multiply on the left of W, which keeps Xd rightmost, and each
+      // step runs beside the squaring that prepares the next one.
+      for (uint32_t power = 2; power < NumDiagonalBlocks; power *= 2) {
+        const bool another_factor = power * 2 < NumDiagonalBlocks;
+        TMOV(a_l0_tile[0], M_neg_l1_tile);
+        TMOV(b_l0_tile[0], Y_l1_tile);
         set_flag(PIPE_MTE1, PIPE_M, event_0);
+        if (another_factor) {
+          TMOV(a_l0_tile[1], M_neg_l1_tile);
+          TMOV(b_l0_tile[1], M_neg_l1_tile);
+          set_flag(PIPE_MTE1, PIPE_M, event_1);
+        }
         wait_flag(PIPE_MTE1, PIPE_M, event_0);
         TMATMUL_ACC(c_l0_tile[0], c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);
         set_flag(PIPE_M, PIPE_FIX, event_0);
         set_flag(PIPE_M, PIPE_MTE1, event_0);
-        wait_flag(PIPE_M, PIPE_FIX, event_0);
-        wait_flag(PIPE_M, PIPE_MTE1, event_0);
-        TMOV(Y_l1_tile, c_l0_tile[0]);
-        set_flag(PIPE_FIX, PIPE_MTE1, event_0);
-        set_flag(PIPE_FIX, PIPE_M, event_0);
-        wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
-        wait_flag(PIPE_FIX, PIPE_M, event_0);
-
-        if (block_step < NumDiagonalBlocks / 4) {
-          TMOV(a_l0_tile[1], M_neg_l1_tile);
-          TMOV(b_l0_tile[1], M_neg_l1_tile);
-          set_flag(PIPE_MTE1, PIPE_M, event_1);
+        if (another_factor) {
           wait_flag(PIPE_MTE1, PIPE_M, event_1);
           TMATMUL(c_l0_tile[1], a_l0_tile[1], b_l0_tile[1]);
           set_flag(PIPE_M, PIPE_FIX, event_1);
           set_flag(PIPE_M, PIPE_MTE1, event_1);
+        }
+        wait_flag(PIPE_M, PIPE_FIX, event_0);
+        wait_flag(PIPE_M, PIPE_MTE1, event_0);
+        if (another_factor) {
+          TMOV(Y_l1_tile, c_l0_tile[0]);
+          set_flag(PIPE_FIX, PIPE_MTE1, event_0);
+          set_flag(PIPE_FIX, PIPE_M, event_0);
           wait_flag(PIPE_M, PIPE_FIX, event_1);
           wait_flag(PIPE_M, PIPE_MTE1, event_1);
           TMOV(M_neg_l1_tile, c_l0_tile[1]);
           set_flag(PIPE_FIX, PIPE_MTE1, event_1);
           set_flag(PIPE_FIX, PIPE_M, event_1);
+          wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
+          wait_flag(PIPE_FIX, PIPE_M, event_0);
           wait_flag(PIPE_FIX, PIPE_MTE1, event_1);
           wait_flag(PIPE_FIX, PIPE_M, event_1);
         }
       }
     }
-
-    // (I + M)^-1 Xd, M = Xd N.
-    TMOV(a_l0_tile[0], Y_l1_tile);
-    TMOV(b_l0_tile[0], X_l1_tile);
-    set_flag(PIPE_MTE1, PIPE_M, event_0);
-    wait_flag(PIPE_MTE1, PIPE_M, event_0);
-    TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);
-    set_flag(PIPE_M, PIPE_FIX, event_0);
-    set_flag(PIPE_M, PIPE_MTE1, event_0);
-    wait_flag(PIPE_M, PIPE_FIX, event_0);
-    wait_flag(PIPE_M, PIPE_MTE1, event_0);
   }
 }
 
