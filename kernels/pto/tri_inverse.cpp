@@ -341,7 +341,6 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
   for (uint32_t block_size = 1; block_size < DiagonalBlockSize / 2;
        block_size *= 2) {
     wait_flag(PIPE_M, PIPE_MTE1, event_0);
-    TMOV(b_l0_tile[0], I_l1_tile);
     wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
     TMOV(a_l0_tile[0], X_l1_tile);
     set_flag(PIPE_MTE1, PIPE_M, event_0);
