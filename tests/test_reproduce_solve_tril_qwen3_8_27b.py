@@ -58,24 +58,18 @@ def _doubling_float64(a: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pypto-lib", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--seq-len", type=int, default=512)
-    args = parser.parse_args()
-
-    config, reference = _load_pypto_reference(args.pypto_lib.resolve())
+def run(pypto_lib: Path, checkpoint: Path, device: str, seq_len: int) -> bool:
+    """Invert a trained layer's ``A`` on device and check it against fp64."""
+    config, reference = _load_pypto_reference(pypto_lib.resolve())
     cfg = config.QWEN3_8_27B
     chunk = config.GDN_TILING.chunk
     heads = cfg.linear_num_value_heads
-    if args.seq_len % chunk:
+    if seq_len % chunk:
         raise ValueError(f"--seq-len must be divisible by chunk={chunk}")
 
-    weights = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    weights = torch.load(checkpoint, map_location="cpu", weights_only=True)
     quantized_weights = reference.quantize_weights(weights)
-    hidden = reference.make_block_inputs(args.seq_len, cfg)
+    hidden = reference.make_block_inputs(seq_len, cfg)
     a = reference.block(
         hidden,
         quantized_weights,
@@ -99,10 +93,10 @@ def main() -> None:
             "check the [T,H,chunk] matrix reshape"
         )
 
-    torch.npu.set_device(args.device)
-    device = torch.device(args.device)
+    torch.npu.set_device(device)
+    dev = torch.device(device)
     actual_bsnd = solve_tril(
-        a_fp16.unsqueeze(0).contiguous().to(device),
+        a_fp16.unsqueeze(0).contiguous().to(dev),
         None,
         chunk,
         heads,
@@ -117,7 +111,7 @@ def main() -> None:
     a_inf = float(a_matrices.double().abs().sum(dim=-1).max())
     max_diff = float(diff.abs().max())
     print(
-        f"Qwen3.8-27B layer 0: T={args.seq_len} H={heads} chunk={chunk} "
+        f"Qwen3.8-27B layer 0: T={seq_len} H={heads} chunk={chunk} "
         f"matrices={a_matrices.shape[0] * heads}"
     )
     print(f"A infinity norm={a_inf:.6g}; float64 control frob={float(control_frob):.3e}")
@@ -127,6 +121,37 @@ def main() -> None:
     )
     ok = finite and ACCURACY.stats_ok(actual, expected, chunk_size=chunk)
     print("ACCURACY.stats_ok: " + ("PASS" if ok else "FAIL"))
+    return ok
+
+
+def test_qwen3_8_27b_layer0_solve_tril() -> None:
+    """Collectible form of the check above.
+
+    It needs a Qwen3.8-27B layer-0 checkpoint and an NPU, so it skips rather
+    than fails when either is missing. Point it at them with ``PYPTO_LIB`` and
+    ``QWEN3_8_27B_CHECKPOINT``, or run this file directly with the flags below.
+    """
+    import pytest
+
+    pypto_lib = Path(os.environ.get("PYPTO_LIB", ""))
+    checkpoint = Path(os.environ.get("QWEN3_8_27B_CHECKPOINT", ""))
+    if not (pypto_lib / "models" / "qwen3_8_27b" / "reference.py").is_file():
+        pytest.skip("set PYPTO_LIB to a pypto-lib checkout")
+    if not checkpoint.is_file():
+        pytest.skip("set QWEN3_8_27B_CHECKPOINT to a layer-0 checkpoint")
+    if not torch.npu.is_available():
+        pytest.skip("no NPU available")
+    assert run(pypto_lib, checkpoint, os.environ.get("GDN_NPU_DEVICE", "npu:0"), 512)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pypto-lib", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--seq-len", type=int, default=512)
+    args = parser.parse_args()
+    ok = run(args.pypto_lib, args.checkpoint, args.device, args.seq_len)
     raise SystemExit(0 if ok else 1)
 
 
