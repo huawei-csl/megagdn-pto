@@ -108,6 +108,37 @@ except (RuntimeError, AssertionError):
 # model-specific bound for ||A||.
 TRI_INV_DIAGONAL_BLOCK = 16
 
+# Which finish the triangular inverse runs after that diagonal phase.
+#
+#   "split"          the D+N split. Its second phase doubles on Xd N, which is
+#                    nilpotent in chunk / block steps, so no power of the full
+#                    matrix is formed and the range does not depend on ||A||.
+#   "recursion"      the unrolled Bunch-Hopcroft recursion used before #72.
+#                    With the diagonal phase this is the MXR algorithm of
+#                    arXiv:2605.21325, which that paper proves polylog(n)-stable
+#                    -- kept selectable as the configuration with a published
+#                    stability proof.
+#   "split_refined"  "split" plus one round of the same paper's iterative
+#                    refinement. Only worth it for a caller that reads the fp32
+#                    output: the fused GDN path narrows the inverse to fp16,
+#                    whose representation floor it already reaches.
+#
+# Measured on one 910B2 at T=8192, H=48, chunk 128, with the relative Frobenius
+# error of the fp32 output against the fp64 inverse of a trained Qwen3.8-27B
+# layer-0 input (||A||inf = 37.3):
+#
+#   split          1124.9 us   2.264e-04
+#   recursion      1427.6 us   9.306e-05
+#   split_refined  1452.0 us   1.369e-07
+TRI_INV_FINISH = "split"
+
+_TRI_INV_FINISH_VALUES = {"recursion": 0, "split": 1, "split_refined": 2}
+if TRI_INV_FINISH not in _TRI_INV_FINISH_VALUES:
+    raise ValueError(
+        f"TRI_INV_FINISH must be one of {sorted(_TRI_INV_FINISH_VALUES)}, "
+        f"got {TRI_INV_FINISH!r}"
+    )
+
 
 def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
     """Return bisheng flags shared by all chunk-GDN kernels."""
@@ -128,6 +159,7 @@ def _common_flags(*, hidden_size: int, chunk_size: int) -> list[str]:
         f"-DGDN_D={hidden_size}",
         f"-DGDN_C={chunk_size}",
         f"-DTRI_INV_DIAGONAL_BLOCK={TRI_INV_DIAGONAL_BLOCK}",
+        f"-DTRI_INV_FINISH={_TRI_INV_FINISH_VALUES[TRI_INV_FINISH]}",
     ]
     if os.path.isdir(_DRIVER_INC):
         flags.append(f"-I{_DRIVER_INC}")
@@ -227,6 +259,7 @@ def compile_tri_inverse(cpp_mtime_ns: int = 0) -> str:
         f"-I{os.path.join(PTO_LIB_PATH, 'include')}",
         f"--npu-arch={AICORE_ARCH}",
         f"-DTRI_INV_DIAGONAL_BLOCK={TRI_INV_DIAGONAL_BLOCK}",
+        f"-DTRI_INV_FINISH={_TRI_INV_FINISH_VALUES[TRI_INV_FINISH]}",
     ]
     # Keep standalone and fused compilation consistent when a developer
     # overrides the diagonal block for an experiment.

@@ -16,6 +16,25 @@ for the full License text.
 #define TRI_INV_DIAGONAL_BLOCK 16
 #endif
 
+// Which finish runs after the diagonal phase; see InvertSingleTile.
+//
+//   RECURSION      the unrolled Bunch-Hopcroft block recursion used before #72.
+//                  With the diagonal phase it is the MXR algorithm of
+//                  arXiv:2605.21325, proven polylog(n)-stable there.
+//   SPLIT          the D+N split (default). Its second phase is a doubling on
+//                  Xd N, which is nilpotent in MatrixSize / DiagonalBlockSize
+//                  block steps, so no power of the full matrix is ever formed.
+//   SPLIT_REFINED  SPLIT plus one round of that paper's iterative refinement,
+//                  for a caller that needs the fp32 output to be exact rather
+//                  than merely inside the pipeline's fp16 hand-off.
+#define TRI_INV_FINISH_RECURSION 0
+#define TRI_INV_FINISH_SPLIT 1
+#define TRI_INV_FINISH_SPLIT_REFINED 2
+#ifndef TRI_INV_FINISH
+#define TRI_INV_FINISH TRI_INV_FINISH_SPLIT
+#endif
+#define TRI_INV_SPLIT_SELECTED (TRI_INV_FINISH != TRI_INV_FINISH_RECURSION)
+
 using namespace pto;
 using namespace kernel_utils;
 
@@ -253,13 +272,17 @@ template <typename InputT, typename TileL1AB, typename TileL0A,
           typename TileL0B, typename TileL0C, uint32_t MatrixSize,
           uint32_t FractalSize, uint32_t DiagonalBlockSize,
           uint32_t NumTilesPerCubeIter>
-AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
-                                    TileL1AB I_neg_l1_tile,
-                                    TileL1AB M_neg_l1_tile,
-                                    TileL1AB Zero_l1_tile, TileL1AB Y_l1_tile,
-                                    TileL0A* a_l0_tile, TileL0B* b_l0_tile,
-                                    TileL0C* c_l0_tile,
-                                    const uint32_t tile_id) {
+AICORE inline void InvertSingleTile(
+    TileL1AB X_l1_tile, TileL1AB I_l1_tile, TileL1AB I_neg_l1_tile,
+    TileL1AB M_neg_l1_tile, TileL1AB Zero_l1_tile, TileL1AB Y_l1_tile,
+#if TRI_INV_FINISH == TRI_INV_FINISH_SPLIT_REFINED
+    TileL1AB A_neg_l1_tile, TileL1AB TwoI_l1_tile,
+#endif
+    TileL0A* a_l0_tile, TileL0B* b_l0_tile, TileL0C* c_l0_tile,
+    const uint32_t tile_id, const bool swap_parity = false) {
+#if TRI_INV_SPLIT_SELECTED
+  (void)swap_parity;  // the split's finish is parity-agnostic
+#endif
   const event_t event_0 = static_cast<event_t>(tile_id);
   const event_t event_1 = static_cast<event_t>(tile_id + NumTilesPerCubeIter);
 
@@ -286,6 +309,9 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
 
   wait_flag(PIPE_M, PIPE_FIX, event_0);
   TMOV(M_neg_l1_tile, c_l0_tile[0]);  // M_neg_l1 now contains M_neg
+#if TRI_INV_FINISH == TRI_INV_FINISH_SPLIT_REFINED
+  TMOV(A_neg_l1_tile, c_l0_tile[0]);  // kept for the refinement's residual
+#endif
   set_flag(PIPE_FIX, PIPE_M, event_0);
 
   /* Second Matmul: event_1 */
@@ -395,6 +421,8 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
   wait_flag(PIPE_FIX, PIPE_M, event_0);
 
   if constexpr (MatrixSize > DiagonalBlockSize) {
+#if TRI_INV_SPLIT_SELECTED
+
     constexpr uint32_t NumDiagonalBlocks = MatrixSize / DiagonalBlockSize;
 
     // b_l0[0] = -N: start from -M and zero D's diagonal blocks.
@@ -498,6 +526,149 @@ AICORE inline void InvertSingleTile(TileL1AB X_l1_tile, TileL1AB I_l1_tile,
         }
       }
     }
+#if TRI_INV_FINISH == TRI_INV_FINISH_SPLIT_REFINED
+    // One round of the iterative refinement of arXiv:2605.21325:
+    //   R = I - Y(I+A),  X = Y + R Y   ==   X = 2Y - Y(I+A)Y
+    // written in the second form because this kernel has no vector unit, so an
+    // identity add would otherwise cost a matmul of its own. The base is the
+    // fp16 copy of Y rather than the fp32 accumulator: the correction is exact
+    // for the operand it was computed from, which is the difference between
+    // 4.7e-05 and 1.4e-07 on a trained layer.
+    TMOV(X_l1_tile, c_l0_tile[0]);  // Y, rounded to fp16
+    set_flag(PIPE_FIX, PIPE_MTE1, event_0);
+    set_flag(PIPE_FIX, PIPE_M, event_0);
+    wait_flag(PIPE_FIX, PIPE_MTE1, event_0);
+    wait_flag(PIPE_FIX, PIPE_M, event_0);
+
+    TMOV(a_l0_tile[1], X_l1_tile);      // Y
+    TMOV(b_l0_tile[1], A_neg_l1_tile);  // -A
+    TMOV(a_l0_tile[0], I_neg_l1_tile);
+    TMOV(b_l0_tile[0], X_l1_tile);  // Y
+    set_flag(PIPE_MTE1, PIPE_M, event_1);
+    wait_flag(PIPE_MTE1, PIPE_M, event_1);
+    TMATMUL(c_l0_tile[1], a_l0_tile[1], b_l0_tile[1]);  // -Y A
+    TMATMUL_ACC(c_l0_tile[1], c_l0_tile[1], a_l0_tile[0],
+                b_l0_tile[0]);  // S = -Y - Y A
+    set_flag(PIPE_M, PIPE_FIX, event_1);
+    set_flag(PIPE_M, PIPE_MTE1, event_1);
+    wait_flag(PIPE_M, PIPE_FIX, event_1);
+    wait_flag(PIPE_M, PIPE_MTE1, event_1);
+    TMOV(M_neg_l1_tile, c_l0_tile[1]);  // S
+    set_flag(PIPE_FIX, PIPE_MTE1, event_1);
+    set_flag(PIPE_FIX, PIPE_M, event_1);
+    wait_flag(PIPE_FIX, PIPE_MTE1, event_1);
+    wait_flag(PIPE_FIX, PIPE_M, event_1);
+
+    TMOV(a_l0_tile[0], X_l1_tile);      // Y
+    TMOV(b_l0_tile[0], TwoI_l1_tile);   // 2I
+    TMOV(a_l0_tile[1], M_neg_l1_tile);  // S
+    TMOV(b_l0_tile[1], X_l1_tile);      // Y
+    set_flag(PIPE_MTE1, PIPE_M, event_0);
+    wait_flag(PIPE_MTE1, PIPE_M, event_0);
+    TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);  // 2Y
+    TMATMUL_ACC(c_l0_tile[0], c_l0_tile[0], a_l0_tile[1],
+                b_l0_tile[1]);  // 2Y - Y(I+A)Y
+    set_flag(PIPE_M, PIPE_FIX, event_0);
+    set_flag(PIPE_M, PIPE_MTE1, event_0);
+    wait_flag(PIPE_M, PIPE_FIX, event_0);
+    wait_flag(PIPE_M, PIPE_MTE1, event_0);
+#endif
+#else
+    /*
+     * Unrolled recursion part:
+     * block_size = FractalSize
+     * while block_size < MatrixSize:
+     *     LX = even_blocks(X, block_size)
+     *     RX = odd_blocks(X, block_size)
+     *     Y = LX @ (-M) + I
+     *     X = Y @ RX + LX
+     *     block_size *= 2
+     *
+     * Comments:
+     * Upper-tri (swap_parity=false):
+     *   LX = even_blocks(X), RX = odd_blocks(X)
+     *   Y = LX @ (-M) + I, X = Y @ RX + LX
+     * Lower-tri (swap_parity=true):
+     *   RX = even→L0A(odd via swap), LX = odd→L0B(even via swap)
+     *   Y = RX @ (-M) + I, X = Y @ LX + RX
+     */
+    TMOV(b_l0_tile[1], M_neg_l1_tile);  // b_l0[1] contains M_neg
+    TMOV(a_l0_tile[0], I_l1_tile);      // a_l0[0] contains I
+
+    if constexpr (MatrixSize > DiagonalBlockSize) {
+      set_flag(PIPE_FIX, PIPE_M, event_1);
+    }
+    set_flag(PIPE_M, PIPE_MTE1, event_1);
+    set_flag(PIPE_M, PIPE_MTE1, event_0);
+    set_flag(PIPE_FIX, PIPE_MTE1, event_1);
+    set_flag(PIPE_FIX, PIPE_M, event_0);
+    for (uint32_t block_size = DiagonalBlockSize; block_size < MatrixSize;
+         block_size *= 2) {
+      wait_flag(PIPE_M, PIPE_MTE1, event_0);  // Wait for last iter a_l0[1]
+      TMOV(a_l0_tile[1], Zero_l1_tile);
+
+      wait_flag(PIPE_M, PIPE_MTE1, event_1);
+      TMOV(b_l0_tile[0], I_l1_tile);
+      set_flag(PIPE_MTE1, PIPE_M, event_0);
+
+      wait_flag(PIPE_FIX, PIPE_MTE1, event_1);  // Wait to write last X
+      CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+          X_l1_tile, a_l0_tile[1], block_size,
+          swap_parity);  // a_l0[1]: even(LX) or odd(RX)
+      set_flag(PIPE_MTE1, PIPE_M, event_1);
+
+      wait_flag(PIPE_MTE1, PIPE_M, event_0);
+      wait_flag(PIPE_FIX, PIPE_M, event_0);  // Wait c_l0[0] from previous iter
+      TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);  // c_l0[0] has I
+
+      wait_flag(PIPE_MTE1, PIPE_M, event_1);
+      wait_flag(PIPE_FIX, PIPE_M, event_1);  // Wait c_l0[1] from previous iter
+      TMATMUL(c_l0_tile[1], a_l0_tile[1], b_l0_tile[0]);  // c_l0[1] contains LX
+      set_flag(PIPE_M, PIPE_MTE1, event_1);  // allow to load RX on b_l0[0]
+
+      TMATMUL_ACC(c_l0_tile[0], c_l0_tile[0], a_l0_tile[1],
+                  b_l0_tile[1]);  // c_l0[0] <- LX * M_neg + I
+      set_flag(PIPE_M, PIPE_FIX, event_0);
+      set_flag(PIPE_M, PIPE_MTE1, event_0);
+
+      wait_flag(PIPE_M, PIPE_FIX, event_0);
+      TMOV(Y_l1_tile, c_l0_tile[0]);  // Y_l1 contains LX * M_neg + I
+      set_flag(PIPE_FIX, PIPE_MTE1, event_0);
+      set_flag(PIPE_FIX, PIPE_M, event_0);
+
+      /* Load complementary blocks of X in L0B. If swap_parity = fase, "Load Odd
+       * Blocks Of X In L0B" */
+      wait_flag(PIPE_M, PIPE_MTE1, event_1);
+      TMOV(b_l0_tile[0], Zero_l1_tile);
+      CopyOddOrEvenBlocksL1ToL0<InputT, FractalSize, MatrixSize>(
+          X_l1_tile, b_l0_tile[0], block_size,
+          swap_parity);  // b_l0[0]: odd(RX) or even(LX)
+
+      wait_flag(PIPE_M, PIPE_MTE1,
+                event_0);  // Wait for previous use of a_l0[1]
+      wait_flag(PIPE_FIX, PIPE_MTE1, event_0);  // Wait for Y_l1
+      TMOV(a_l0_tile[1], Y_l1_tile);  // a_l0[1] contains LX * M_neg + I
+      set_flag(PIPE_MTE1, PIPE_M, event_0);
+
+      wait_flag(PIPE_MTE1, PIPE_M, event_0);
+      TMATMUL_ACC(c_l0_tile[1], c_l0_tile[1], a_l0_tile[1], b_l0_tile[0]);
+      set_flag(PIPE_M, PIPE_MTE1, event_0);  // next iter can read on a_l0[1]
+      set_flag(PIPE_M, PIPE_MTE1, event_1);  // next iter can read on b_l0[0]
+      set_flag(PIPE_M, PIPE_FIX, event_0);
+      wait_flag(PIPE_M, PIPE_FIX, event_0);
+
+      if (block_size <
+          MatrixSize / 2) {  // Update X_l1 except in last iteration
+        TMOV(X_l1_tile, c_l0_tile[1]);
+        set_flag(PIPE_FIX, PIPE_M, event_1);  // release c_l0[1] for next iter
+      }
+      set_flag(PIPE_FIX, PIPE_MTE1, event_1);
+    }
+    wait_flag(PIPE_M, PIPE_MTE1, event_0);
+    wait_flag(PIPE_M, PIPE_MTE1, event_1);
+    wait_flag(PIPE_FIX, PIPE_M, event_0);
+    wait_flag(PIPE_FIX, PIPE_MTE1, event_1);  // Write c_l0[1] to X_l1
+#endif
   }
 }
 
@@ -597,6 +768,10 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
   GlobalTileINeg I_neg_global_in(I_neg);
 
   TileL1AB X_l1_tile;
+#if TRI_INV_FINISH == TRI_INV_FINISH_SPLIT_REFINED
+  TileL1AB A_neg_l1_tile;
+  TileL1AB TwoI_l1_tile;
+#endif
   TileL1AB I_l1_tile;
   TileL1AB I_neg_l1_tile;
   TileL1AB M_neg_l1_tile;
@@ -615,6 +790,14 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
   for (uint32_t tile_id = 0; tile_id < NumTilesPerCubeIter; ++tile_id) {
     TASSIGN(Y_l1_tile[tile_id], 0x0 + (5 + tile_id) * TileLen * sizeof(InputT));
   }
+#if TRI_INV_FINISH == TRI_INV_FINISH_SPLIT_REFINED
+  // After the Y tiles, so no existing offset moves -- the varlen path below
+  // assigns its dynamic view at the Y base by literal.
+  TASSIGN(A_neg_l1_tile,
+          0x0 + (5 + NumTilesPerCubeIter) * TileLen * sizeof(InputT));
+  TASSIGN(TwoI_l1_tile,
+          0x0 + (6 + NumTilesPerCubeIter) * TileLen * sizeof(InputT));
+#endif
 
   for (uint32_t buffer_num = 0; buffer_num < NumL0Buffers; ++buffer_num) {
     TASSIGN(a_l0_tile[buffer_num], 0x0 + buffer_num * TileLen * sizeof(InputT));
@@ -628,6 +811,22 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
   PrepareAuxiliaryMatrices<TileL1AB, TileL0A, TileL0B, TileL0C>(
       I_neg_l1_tile, Zero_l1_tile, I_l1_tile, a_l0_tile[0], b_l0_tile[0],
       c_l0_tile[0]);
+
+#if TRI_INV_FINISH == TRI_INV_FINISH_SPLIT_REFINED
+  // 2I, once per kernel, so the refinement can rebase onto its own fp16
+  // operand in a single matmul rather than two.
+  TMOV(a_l0_tile[0], I_l1_tile);
+  TMOV(b_l0_tile[0], I_l1_tile);
+  set_flag(PIPE_MTE1, PIPE_M, static_cast<event_t>(0));
+  wait_flag(PIPE_MTE1, PIPE_M, static_cast<event_t>(0));
+  TMATMUL(c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);
+  TMATMUL_ACC(c_l0_tile[0], c_l0_tile[0], a_l0_tile[0], b_l0_tile[0]);
+  set_flag(PIPE_M, PIPE_FIX, static_cast<event_t>(0));
+  wait_flag(PIPE_M, PIPE_FIX, static_cast<event_t>(0));
+  TMOV(TwoI_l1_tile, c_l0_tile[0]);
+  set_flag(PIPE_FIX, PIPE_MTE1, static_cast<event_t>(0));
+  wait_flag(PIPE_FIX, PIPE_MTE1, static_cast<event_t>(0));
+#endif
 
   const uint32_t max_iters_per_aic =
       CeilDiv(total_tiles, (uint32_t)(NumTilesPerCubeIter * get_block_num()));
@@ -693,7 +892,12 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
       set_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(tile_id));
     }
 
+#if TRI_INV_SPLIT_SELECTED
     constexpr uint32_t final_c_buffer_index = 0;
+#else
+    constexpr uint32_t final_c_buffer_index =
+        MatrixSize > DiagonalBlockSize ? 1 : 0;
+#endif
     for (uint32_t tile_id = 0; (tile_id < NumTilesPerCubeIter) &&
                                (global_index + tile_id < total_tiles);
          ++tile_id) {
@@ -705,7 +909,11 @@ AICORE inline void TriInvRecUnrollKernel(__gm__ OutputT* M_inv,
       InvertSingleTile<InputT, TileL1AB, TileL0A, TileL0B, TileL0C, MatrixSize,
                        FractalSize, DiagonalBlockSize, NumTilesPerCubeIter>(
           X_l1_tile, I_l1_tile, I_neg_l1_tile, M_neg_l1_tile, Zero_l1_tile,
-          Y_l1_tile[tile_id], a_l0_tile, b_l0_tile, c_l0_tile, tile_id);
+          Y_l1_tile[tile_id],
+#if TRI_INV_FINISH == TRI_INV_FINISH_SPLIT_REFINED
+          A_neg_l1_tile, TwoI_l1_tile,
+#endif
+          a_l0_tile, b_l0_tile, c_l0_tile, tile_id, is_lower != 0);
 
       // Allow next cube_iter to proceed for this tile_id
       set_flag(PIPE_M, PIPE_MTE2, static_cast<event_t>(tile_id));
