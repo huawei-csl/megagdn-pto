@@ -329,7 +329,6 @@ AICORE inline void InvertSingleTile(
   /* Third Matmul: event_0*/
   wait_flag(PIPE_M, PIPE_MTE1, event_0);
   TMOV(b_l0_tile[0], I_neg_l1_tile);  // b_l0[0] contains I_neg
-  TMOV(a_l0_tile[0], I_neg_l1_tile);  // a_l0[0] contains I_neg
   set_flag(PIPE_MTE1, PIPE_M, event_0);
 
   wait_flag(PIPE_MTE1, PIPE_M, event_0);
