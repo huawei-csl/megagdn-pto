@@ -968,6 +968,9 @@ AICORE void chunk_h_kernel(
       }
       set_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
       wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID0);
+      // Finish the final-state DMA before the next work item rewrites S_UB_HALF.
+      set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+      wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     }
   }
 #endif
