@@ -307,6 +307,9 @@ def test_chunk_h_final_state_reuse(dev: torch.device) -> bool:
     k[0, ::C, :, 0] = 1
     u[0, ::C, :, 0] = 1
     g_t = transpose_gates(g_sum)
+    # The inputs are packed as [1, batch*C, ...]; without explicit boundaries
+    # the kernel would treat them as `batch` sequences of length batch*C.
+    cu = torch.arange(0, (batch + 1) * C, C, dtype=torch.int32, device=dev)
 
     s_out = torch.empty(batch * H, D, D, dtype=torch.float16, device=dev)
     v_out = torch.empty_like(u)
@@ -325,6 +328,7 @@ def test_chunk_h_final_state_reuse(dev: torch.device) -> bool:
             final_state,
             g_t=g_t,
             chunk_size=C,
+            cu_seqlens=cu,
             batch_size_override=batch,
             block_dim=core_count,
             key_heads=HG,
