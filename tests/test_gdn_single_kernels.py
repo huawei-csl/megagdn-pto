@@ -334,7 +334,8 @@ def test_chunk_h_final_state_reuse(dev: torch.device) -> bool:
             key_heads=HG,
         )
         torch.npu.synchronize()
-        torch.testing.assert_close(final_state.cpu(), expected, rtol=0, atol=0)
+        if not torch.equal(final_state.cpu(), expected):
+            return False
     return True
 
 
