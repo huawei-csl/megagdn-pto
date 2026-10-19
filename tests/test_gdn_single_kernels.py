@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 import torch
 
+from megagdn_pto import BLOCK_DIM
 from megagdn_pto.fast_inverse import load_tri_inverse, solve_tril
 from megagdn_pto.kernel_libs import (
     run_chunk_cumsum,
@@ -291,6 +292,53 @@ def test_chunk_h(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     return ok_h and ok_v and ok_fs
 
 
+def test_chunk_h_final_state_reuse(dev: torch.device) -> bool:
+    H = 16
+    HG = 16
+    core_count = int(
+        getattr(torch.npu.get_device_properties(dev), "cube_core_num", BLOCK_DIM)
+    )
+    batch = core_count // H + 1
+
+    k = torch.zeros(1, batch * C, HG, D, dtype=torch.float16, device=dev)
+    w = torch.zeros(1, batch * C, H, D, dtype=torch.float16, device=dev)
+    u = torch.zeros_like(w)
+    g_sum = torch.zeros(1, batch * C, H, dtype=torch.float32, device=dev)
+    k[0, ::C, :, 0] = 1
+    u[0, ::C, :, 0] = 1
+    g_t = transpose_gates(g_sum)
+    # The inputs are packed as [1, batch*C, ...]; without explicit boundaries
+    # the kernel would treat them as `batch` sequences of length batch*C.
+    cu = torch.arange(0, (batch + 1) * C, C, dtype=torch.int32, device=dev)
+
+    s_out = torch.empty(batch * H, D, D, dtype=torch.float16, device=dev)
+    v_out = torch.empty_like(u)
+    final_state = torch.empty(batch, H, D, D, dtype=torch.float16, device=dev)
+    expected = torch.zeros(batch, H, D, D, dtype=torch.float16)
+    expected[:, :, 0, 0] = 1
+
+    for _ in range(100):
+        run_chunk_h(
+            k,
+            w,
+            u,
+            g_sum,
+            s_out,
+            v_out,
+            final_state,
+            g_t=g_t,
+            chunk_size=C,
+            cu_seqlens=cu,
+            batch_size_override=batch,
+            block_dim=core_count,
+            key_heads=HG,
+        )
+        torch.npu.synchronize()
+        if not torch.equal(final_state.cpu(), expected):
+            return False
+    return True
+
+
 def test_chunk_o(tc: TestCase, dev: torch.device, H: int, HG: int) -> bool:
     T = tc.T
     cu = (
@@ -454,6 +502,14 @@ def main() -> None:
                 if not ok:
                     all_pass = False
                 print(f"    [{i+1:2d}/{len(cases)}] {status}  {tc.label}  ({dt:.2f}s)")
+        if stage == "chunk_h":
+            t0 = time.time()
+            ok = test_chunk_h_final_state_reuse(dev)
+            dt = time.time() - t0
+            status = "PASS" if ok else "FAIL"
+            if not ok:
+                all_pass = False
+            print(f"    {status}  final-state reuse regression  ({dt:.2f}s)")
 
     print(f"\n{'ALL PASS' if all_pass else 'SOME FAILED'}")
     sys.exit(0 if all_pass else 1)
