@@ -35,6 +35,7 @@ jobs:
         tri_inverse
         wy_fast
         wy_kda
+        kdn_decode
 
     steps:
       - name: Show OS
