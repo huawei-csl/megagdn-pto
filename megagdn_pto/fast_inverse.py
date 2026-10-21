@@ -1,7 +1,7 @@
 """Triangular-inverse CubeCore kernel (``tri_inverse``).
 
-Inverts lower-triangular (or upper-triangular with transposed load/store) matrices
-of size 16 / 32 / 64 / 128 in fp16 → fp32, using a recursive unrolled algorithm.
+Inverts lower- or upper-triangular matrices of size 16 / 32 / 64 / 128 in
+fp16 → fp32, using block-diagonal doubling followed by a nilpotent D+N finish.
 Used as the ``solve_tril`` stage in the GDN pipeline.
 """
 
