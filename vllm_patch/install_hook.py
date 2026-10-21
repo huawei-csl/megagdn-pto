@@ -15,11 +15,20 @@ runtime to activate the PTO patch.
 
 3. ``patch/worker/patch_qwen3_next.py`` — same for the MoE / Next path.
 
-**v0.19+:** the worker hook is unchanged. Qwen patch files may be missing or no
-longer import ``chunk_gated_delta_rule`` (GDN prefill uses ``vllm_ascend.ops.gdn``);
+**v0.19+:** Qwen patch files may be missing or no longer import
+``chunk_gated_delta_rule`` (GDN prefill uses ``vllm_ascend.ops.gdn``);
 ``install_hook.py`` skips those edits. Runtime routing is handled in
 ``apply.py`` (patches ``vllm.model_executor.layers.fla.ops`` and
 ``vllm_ascend.ops.triton.fla.chunk``).
+
+**v0.23:** ``patch/worker/__init__.py`` was restructured — the ``# isort: off``
+marker is gone and ``patch_v2.patch_triton`` moved behind a
+``_V2_MODEL_RUNNER_SUPPORTED`` guard. The hook is therefore anchored on the
+``patch_triton`` import (which is what installs Triton's
+``chunk_gated_delta_rule``) and written at module level immediately after the
+enclosing ``if HAS_TRITON:`` block, which works for v0.18/v0.19/v0.23 alike.
+``patch_qwen3_next.py`` no longer exists and ``patch_qwen3_5.py`` no longer
+imports ``chunk_gated_delta_rule``, so both edits are skipped.
 
 Usage::
 
@@ -31,27 +40,29 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
 _HOOK = '''
-    # PTO kernel swap: MUST run before patch_qwen3_next / patch_qwen3_5 import
-    # chunk_gated_delta_rule (those modules cache the reference at import time).
-    try:
-        import os as _pto_os
-        import sys as _pto_sys
+# PTO kernel swap: MUST run after patch_triton installs the Triton
+# chunk_gated_delta_rule, and before the model patch modules import it (those
+# modules cache the reference at import time).
+try:
+    import os as _pto_os
+    import sys as _pto_sys
 
-        _pto_dir = _pto_os.environ.get("VLLM_PTO_PATCH_DIR")
-        if _pto_dir and _pto_os.path.isdir(_pto_dir):
-            if _pto_dir not in _pto_sys.path:
-                _pto_sys.path.insert(0, _pto_dir)
-            from apply import apply_pto_patch  # type: ignore  # noqa: E402
+    _pto_dir = _pto_os.environ.get("VLLM_PTO_PATCH_DIR")
+    if _pto_dir and _pto_os.path.isdir(_pto_dir):
+        if _pto_dir not in _pto_sys.path:
+            _pto_sys.path.insert(0, _pto_dir)
+        from apply import apply_pto_patch  # type: ignore  # noqa: E402
 
-            apply_pto_patch()
-    except Exception as _pto_exc:
-        import warnings as _pto_warnings
+        apply_pto_patch()
+except Exception as _pto_exc:
+    import warnings as _pto_warnings
 
-        _pto_warnings.warn(f"VLLM_PTO_PATCH_DIR apply_pto_patch failed: {_pto_exc!r}", stacklevel=1)
+    _pto_warnings.warn(f"VLLM_PTO_PATCH_DIR apply_pto_patch failed: {_pto_exc!r}", stacklevel=1)
 
 '''
 
@@ -84,18 +95,35 @@ def _remove_old_trailing_hook(text: str) -> str:
     return text[:idx].rstrip() + "\n"
 
 
+# ``import vllm_ascend.patch.worker.patch_triton`` — the module that installs
+# Triton's ``chunk_gated_delta_rule``. Must not match ``patch_v2.patch_triton``.
+_TRITON_IMPORT_RE = re.compile(r"^\s*import vllm_ascend\.patch\.worker\.patch_triton\b")
+
+
 def _insert_worker_hook(text: str) -> str:
-    anchor = "    import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa\n"
-    i = text.find(anchor)
-    if i == -1:
-        raise RuntimeError("Anchor 'patch_v2.patch_triton' not found in worker/__init__.py")
-    j = i + len(anchor)
-    while j < len(text) and text[j] == "\n":
-        j += 1
-    insert_at = text.find("# isort: off", j)
-    if insert_at == -1:
-        raise RuntimeError("'# isort: off' not found after anchor in worker/__init__.py")
-    return text[:insert_at] + _HOOK + "\n" + text[insert_at:]
+    """Insert the hook at module level, right after the ``if HAS_TRITON:`` block.
+
+    The layout of this block differs across releases (v0.18/v0.19 end it with a
+    ``# isort: off`` marker, v0.23 dropped that and guards ``patch_v2`` behind
+    ``_V2_MODEL_RUNNER_SUPPORTED``), so instead of matching a literal we anchor
+    on the ``patch_triton`` import and walk forward to the first line that is
+    back at column 0 — the end of the enclosing block.
+    """
+    lines = text.splitlines(keepends=True)
+
+    anchor = next((i for i, line in enumerate(lines) if _TRITON_IMPORT_RE.match(line)), None)
+    if anchor is None:
+        raise RuntimeError("Anchor 'patch_worker.patch_triton' import not found in worker/__init__.py")
+
+    insert_at = next(
+        (
+            j
+            for j in range(anchor + 1, len(lines))
+            if lines[j].strip() and not lines[j][0].isspace()
+        ),
+        len(lines),
+    )
+    return "".join(lines[:insert_at]) + _HOOK + "\n" + "".join(lines[insert_at:])
 
 
 def _patch_qwen_file(text: str, *, path: Path) -> str | None:
@@ -155,7 +183,8 @@ def main() -> int:
                 print(f"OK: worker hook written → {target}")
 
     # 2. Qwen model patches (v0.18: static ``chunk_gated_delta_rule`` import in these files;
-    # v0.19+: GDN uses ``vllm_ascend.ops.gdn`` + ``apply_pto_patch`` on the Ascend chunk module.)
+    # v0.19+: GDN uses ``vllm_ascend.ops.gdn`` + ``apply_pto_patch`` on the Ascend chunk module.
+    # v0.23 additionally dropped ``patch_qwen3_next.py``, so both files are skipped there.)
     if not args.skip_qwen_patch:
         for name in ("patch_qwen3_5.py", "patch_qwen3_next.py"):
             p = root / "patch" / "worker" / name
