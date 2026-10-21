@@ -15,7 +15,12 @@ import os
 
 import torch
 
-from megagdn_pto.compile import BLOCK_DIM, _KERNELS_PTO, compile_mega_kernel
+from megagdn_pto.compile import (
+    BLOCK_DIM,
+    CHUNK_O_SLOTS,
+    _KERNELS_PTO,
+    compile_mega_kernel,
+)
 from megagdn_pto.kernel_libs import (
     _check_supported_heads,
     chunk_gdn_causal_masks,
@@ -124,9 +129,10 @@ def run_mega_kernel(
     wy_ws_a1  = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
     wy_ws_a2  = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
     h_ws      = torch.zeros(bd * 4, D, D, device=dev, dtype=torch.float16)
-    o_ws_qk   = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
-    o_ws_qs   = torch.zeros(bd, C, D, device=dev, dtype=torch.float16)
-    o_ws_gated = torch.zeros(bd, C, C, device=dev, dtype=torch.float16)
+    o_slots   = bd * CHUNK_O_SLOTS
+    o_ws_qk   = torch.zeros(o_slots, C, C, device=dev, dtype=torch.float16)
+    o_ws_qs   = torch.zeros(2 * o_slots, C, D, device=dev, dtype=torch.float16)
+    o_ws_gated = torch.zeros(o_slots, C, C, device=dev, dtype=torch.float16)
     o_out     = torch.empty_like(v)
 
     mtime = os.stat(os.path.join(_KERNELS_PTO, "mega_kernel.cpp")).st_mtime_ns
